@@ -48,6 +48,10 @@ public:
     // A parked image, written after write_delay (or at flush).  Files it supersedes (the same conversation, older)
     // are deleted once it is on disk.
     void write(std::shared_ptr<const SavedConversation> image);
+    // Low RAM: write a conversation NOW from streamed sources (no host copy of its K/V: conversation_snapshot_sources;
+    // one list per stage image in stage_kv), on the caller's thread; indexed and superseding like a parked image.
+    bool write_now(const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
+                   const std::vector<std::vector<SessionKvSource>>& stage_kv, size_t& bytes, std::string& error);
     // Before the caller moves `image` out (take): a queued write of it is dropped, a running one is waited for.
     void claim(const SavedConversation* image);
     // The images the preload has read, for the caller's cache (each file's image once).
@@ -83,6 +87,8 @@ private:
     };
 
     void say(const std::string& m) const;
+    void add_written_locked(const std::string& path, const SavedConversation& image, size_t written, double s,
+                            const char* what);
     void writer_loop();
     void preload_loop();
     bool read_file(const std::string& path, SavedConversation& image, std::string& error) const;
