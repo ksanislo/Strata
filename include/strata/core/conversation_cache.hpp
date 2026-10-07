@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -221,7 +222,7 @@ public:
     // the longest parked conversation, in tokens (--kv-grow keeps the K/V that long while it could be restored)
     int64_t longest_tokens() const {
         int64_t n = 0;
-        for (const auto& e : entries_) n = std::max<int64_t>(n, (int64_t) e.live.ids.size());
+        for (const auto& e : entries_) n = std::max<int64_t>(n, (int64_t) e->live.ids.size());
         return n;
     }
 
@@ -253,7 +254,7 @@ public:
         // Ties prefer the most recently parked branch. The caller prefers its
         // already-active state when that offers the same prefix length.
         for (size_t i = entries_.size(); i-- > 0;) {
-            const auto& e = entries_[i];
+            const auto& e = *entries_[i];
             if (e.cvec != cvec) continue;
             auto consider = [&](const ConversationCheckpoint& c, bool live) {
                 const int64_t n = conversation_prefix(c, prompt, images);
@@ -265,12 +266,16 @@ public:
         return best;
     }
 
+    // The caller makes sure nobody else reads the entry (a session-file writer holding it is waited for first).
     SavedConversation take(size_t index) {
-        SavedConversation out = std::move(entries_.at(index));
-        bytes_ -= out.bytes();
+        std::shared_ptr<SavedConversation> e = entries_.at(index);
+        bytes_ -= e->bytes();
         erase(index);
-        return out;
+        return std::move(*e);
     }
+    // Shared access for a background reader (session files): an entry evicted meanwhile stays alive while held.
+    std::shared_ptr<const SavedConversation> shared(size_t index) const { return entries_.at(index); }
+    std::shared_ptr<const SavedConversation> newest() const { return entries_.empty() ? nullptr : entries_.back(); }
 
     // A checkpoint inside a parked conversation that a NEW conversation starts with - a sibling subagent sharing the
     // system prompt and tool list, a compacted history - is borrowed: restored from the entry, which stays parked.
@@ -283,7 +288,7 @@ public:
     bool borrows(const Match& m) const {
         if (m.tokens <= 0 || m.live || m.index >= entries_.size() || serials_[m.index] != m.serial) return false;
         size_t deepest = 0;
-        for (const auto& c : entries_[m.index].checkpoints) {
+        for (const auto& c : entries_[m.index]->checkpoints) {
             if (c.pinned && (int64_t) c.ids.size() <= m.tokens) return false;
             deepest = std::max(deepest, c.ids.size());
         }
@@ -298,7 +303,7 @@ public:
     }
     const SavedConversation* find(uint64_t serial) const {
         const size_t i = index_of(serial);
-        return i == SIZE_MAX ? nullptr : &entries_[i];
+        return i == SIZE_MAX ? nullptr : entries_[i].get();
     }
     // While a borrowed entry (the donor) is being restored, parking the outgoing conversation must not evict or drop
     // it: guard() it.  When the outgoing image fits only without it, make_room refuses before evicting anything and
@@ -314,13 +319,13 @@ public:
     // with take() but still alive during the exchange; count it against RAM too.
     bool make_room(size_t incoming, size_t held = 0) {
         if (!enabled() || held > budget_ || incoming > budget_ - held) return false;
-        auto stays = [&](size_t i) { return entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_); };
+        auto stays = [&](size_t i) { return entries_[i]->pinned() || (guarded_ != 0 && serials_[i] == guarded_); };
         if (guarded_ != 0 && index_of(guarded_) != SIZE_MAX) {
             // with everything else gone, would it fit beside the entries that stay (the guarded donor and any pinned
             // shared prefix)?  If not, evict nothing
             size_t kept = 0, kept_bytes = 0;
             for (size_t i = 0; i < entries_.size(); ++i)
-                if (stays(i)) { ++kept; kept_bytes += entries_[i].bytes(); }
+                if (stays(i)) { ++kept; kept_bytes += entries_[i]->bytes(); }
             if (kept >= slots_ || kept_bytes > budget_ - held - incoming) { guard_blocked_ = true; return false; }
         }
         if (bytes() > budget_ - held - incoming) reuse_ = {};
@@ -341,8 +346,8 @@ public:
     bool evict_oldest() {
         // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
         for (size_t i = 0; i < entries_.size(); ++i) {
-            if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
-            bytes_ -= entries_[i].bytes();
+            if (entries_[i]->pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
+            bytes_ -= entries_[i]->bytes();
             erase(i);
             ++evictions_;
             return true;
@@ -381,7 +386,7 @@ public:
         };
         size_t dropped = 0;
         for (size_t i = 0; i < entries_.size();) {
-            const auto& e = entries_[i];
+            const auto& e = *entries_[i];
             const ConversationCheckpoint* deepest = nullptr;
             for (const auto& c : e.checkpoints)
                 if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
@@ -405,7 +410,8 @@ public:
     size_t parked_prefix_tokens(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
                                 const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) const {
         size_t longest = 0;
-        for (const auto& e : entries_) {
+        for (const auto& ep : entries_) {
+            const auto& e = *ep;
             if (e.cvec != cvec) continue;
             const ConversationCheckpoint* deepest = nullptr;
             for (const auto& c : e.checkpoints)
@@ -424,7 +430,7 @@ public:
         if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
         drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
         if (!make_room(n, held)) return false;
-        entries_.push_back(std::move(image));
+        entries_.push_back(std::make_shared<SavedConversation>(std::move(image)));
         serials_.push_back(next_serial_++);
         bytes_ += n;
         return true;
@@ -437,7 +443,7 @@ private:
     }
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0, borrowed_ = 0;
     int64_t min_tokens_ = 0;   // --conversation-cache-min-tokens: 0 parks every conversation, whatever its size
-    std::deque<SavedConversation> entries_; // least recently active first
+    std::deque<std::shared_ptr<SavedConversation>> entries_; // least recently active first
     std::deque<uint64_t> serials_;          // entries_[i]'s identity, never reused
     uint64_t next_serial_ = 1, guarded_ = 0;
     bool guard_blocked_ = false;
