@@ -243,7 +243,7 @@ int main() {
     // wrong version: header field patched and header hash recomputed so only the version differs
     {
         auto d = image;
-        uint32_t v = 2; std::memcpy(d.data() + 8, &v, 4);
+        uint32_t v = 3; std::memcpy(d.data() + 8, &v, 4);   // 2 is the layer-split format
         const uint64_t h = session_hash64(d.data(), 56, 0); std::memcpy(d.data() + 56, &h, 8);
         const fs::path p = dir / "ver.bin"; spit(p, d);
         check(rejects(p, id, "version"), "unknown version rejected");
@@ -357,6 +357,79 @@ int main() {
         // K/V in the image and as sources at once is ambiguous: refused
         check(!session_file_write((dir / "both.bin").string(), original, sources, id, written, error),
               "image K/V plus sources refused");
+    }
+    // format v2 (a layer split): the first stage's payload, then a stage count and each later stage's payload, every
+    // stage read against its own bounds
+    {
+        auto stage = [&](int64_t lo, int64_t hi, uint8_t seed) {
+            SavedConversation st = sample();               // same geometry; its own carve, running state and K/V
+            st.layer_lo = lo; st.layer_hi = hi;
+            st.live = checkpoint(1000, seed);
+            st.checkpoints = {checkpoint(10, uint8_t(seed + 1)), checkpoint(500, uint8_t(seed + 2))};
+            st.kv.erase(st.kv.begin());                    // its own two (small) K/V layers
+            return st;
+        };
+        SavedConversation split = original;
+        split.layer_hi = 10;
+        split.stage_images = {stage(10, 22, 50), stage(22, 35, 60), stage(35, 48, 70)};
+        auto bounds = [](int64_t lo, int64_t hi) { SessionReadLimits l; l.layer_range = std::make_pair(lo, hi); return l; };
+        SessionReadLimits lim = bounds(0, 10);
+        lim.stages = {bounds(10, 22), bounds(22, 35), bounds(35, 48)};
+        const fs::path p = dir / "split.bin";
+        check(session_file_write(p.string(), split, id, written, error), "v2: split write succeeds");
+        const std::vector<char> v2 = slurp(p);
+        uint32_t ver = 0; std::memcpy(&ver, v2.data() + 8, 4);
+        check(ver == 2, "v2: a split image is written as version 2");
+        SavedConversation back;
+        size_t got = 0;
+        check(session_file_read(p.string(), id, back, got, error, lim), "v2: read with the runtime's stage bounds");
+        bool all = same(back, split) && back.stage_images.size() == 3;
+        for (size_t k = 0; all && k < 3; ++k) all = same(back.stage_images[k], split.stage_images[k]);
+        check(all, "v2: every stage round-trips");
+        check(got == v2.size(), "v2: read reports the file size");
+        check(rejects(p, id, "layer split"), "v2: refused by a runtime without a split");
+        SessionReadLimits two = lim; two.stages.pop_back();
+        check(rejects(p, id, "stages", two), "v2: refused by a runtime with another stage count");
+        SessionReadLimits moved = lim; moved.stages[1] = bounds(22, 36);
+        check(rejects(p, id, "layer range", moved), "v2: a stage with another carve is refused");
+        check(rejects(good, id, "one GPU", lim), "v1: refused by a runtime with a split");
+        {
+            auto d = v2;
+            d[d.size() - 16 - 40] ^= 0x5a;                 // inside the last stage's payload
+            const fs::path q = dir / "split-flip.bin"; spit(q, d);
+            check(rejects(q, id, "checksum", lim), "v2: a corrupted stage payload is rejected");
+        }
+        // checkpoint stage parts must be split into the stage images first
+        SavedConversation unsplit = original;
+        unsplit.checkpoints[0].stage_parts.push_back(checkpoint(10, 9));
+        check(!session_file_write((dir / "unsplit.bin").string(), unsplit, id, written, error) &&
+              error.find("stage parts") != std::string::npos, "v2: unsplit checkpoint parts refused");
+        // streamed: each stage's K/V from its own sources gives the same bytes as the captured split image
+        auto sources_of = [](const SavedConversation& img) {
+            std::vector<SessionKvSource> out;
+            for (const auto& k : img.kv) {
+                SessionKvSource s;
+                s.format = k.format; s.cells = k.cells; s.heads = k.heads; s.head_dim = k.head_dim;
+                s.page_size = k.page_size; s.pooled_rows = k.pooled_rows; s.idx_dim = k.idx_dim;
+                const std::array<const ConversationBuffer*, 5> parts = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+                for (size_t i = 0; i < 5; ++i) s.sizes[i] = parts[i]->size();
+                s.read = [parts](size_t part, size_t offset, void* dst, size_t n) { return parts[part]->read(dst, offset, n); };
+                out.push_back(std::move(s));
+            }
+            return out;
+        };
+        SavedConversation meta = split;
+        meta.kv.clear();
+        for (auto& st : meta.stage_images) st.kv.clear();
+        std::vector<std::vector<SessionKvSource>> stage_src;
+        for (const auto& st : split.stage_images) stage_src.push_back(sources_of(st));
+        const fs::path q = dir / "split-streamed.bin";
+        check(session_file_write(q.string(), meta, sources_of(split), stage_src, id, written, error),
+              "v2: streamed split write succeeds");
+        check(slurp(q) == v2, "v2: streamed split write equals the captured split write");
+        stage_src.pop_back();
+        check(!session_file_write((dir / "split-short.bin").string(), meta, sources_of(split), stage_src, id, written,
+                                  error), "v2: a missing stage source list is refused");
     }
 
     // the configuration fingerprint: every field counts, doubles by their exact bits
