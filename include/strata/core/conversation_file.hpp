@@ -148,6 +148,9 @@ struct SessionWriteOptions {
     // write starts.  Not a reservation: other writers can take the space afterwards.
     uint64_t min_free_bytes = 0;
     bool durable = true;            // flush the file before the rename and (POSIX) the folder after it
+    // write only the deepest checkpoint (by token count) of the image, and the same one of every stage image; none
+    // when the stages' checkpoint lists do not line up.  A parked image holds its whole chain; a file needs one.
+    bool deepest_checkpoint_only = false;
     SessionProgress progress;
     // "flush" (the file's flush, `bytes` = the file) and "publish" (rename and folder flush), before each starts
     SessionPhase phase;
@@ -246,6 +249,18 @@ uint64_t session_read_peak_bytes(uint64_t file_bytes);
 bool session_file_read(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
                        size_t& bytes, std::string& error, const SessionReadLimits& limits = {},
                        SessionStatus* status = nullptr);
+
+// What a session-folder index needs without reading the payload: the header and identity are checked (magic,
+// header hash, version, fingerprints - a foreign file is refused), then the first stage's live token ids and images
+// and its deepest checkpoint's are read; every state array and the K/V are skipped (not hashed: the full read checks
+// them).  `deepest` is empty when the file holds no checkpoint.
+struct SessionPeek {
+    ConversationCheckpoint live, deepest;   // ids and imgs only
+    bool cvec = false;
+    uint64_t bytes = 0;
+    uint32_t version = 0;
+};
+bool session_file_peek(const std::string& path, const SessionFileIdentity& id, SessionPeek& out, std::string& error);
 
 // The folder the free-space preflight asks about for `path`, by the rules of Windows or of POSIX (exposed so both can
 // be tested anywhere).  Windows: backslashes and a trailing backslash, as GetDiskFreeSpaceExW requires for a UNC
