@@ -8006,8 +8006,15 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     termination = "sigint"
     finished = threading.Event()                        # set when the clean stop is over (a Windows console handler waits for it)
 
+    stopping = False
+
     def request_stop(reason: str):
-        nonlocal termination
+        nonlocal termination, stopping
+        # only the first SIGTERM/SIGHUP stops: systemd signals the whole service and llama-swap sends its own stop, and a
+        # second one must not take the "Ctrl+C again" path that kills the engine mid-QUIT (it may be saving then)
+        if reason != "sigint" and stopping:
+            return
+        stopping = True
         termination = reason
         if threading.current_thread() is threading.main_thread():
             raise KeyboardInterrupt
