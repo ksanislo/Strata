@@ -2,6 +2,7 @@
 // fetch, preload, foreign files.  Built with -DSTRATA_BUILD_CONVERSATION_TESTS=ON; no CUDA, no model.
 #include "strata/core/session_dir.hpp"
 
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -197,6 +198,34 @@ int main() {
         auto got = sd.fetch(p, {}, false, 0, t);
         check(got && got->stage_images.size() == 3 && got->stage_images[2].checkpoints.size() == 1,
               "split: every stage comes back with its deepest checkpoint");
+    }
+    // low RAM: a conversation written NOW from streamed sources (no image copy), then fetched as a mapped view
+    {
+        SessionDir sd(opts(dir, id));
+        sd.open();
+        const SavedConversation full = conv(tokens(130000, 2500), 9);
+        SavedConversation meta = full;
+        meta.kv.clear();
+        meta.checkpoints = {full.checkpoints[1]};   // the engine passes the deepest only
+        std::vector<SessionKvSource> src;
+        for (const auto& k : full.kv) {
+            SessionKvSource x;
+            x.format = k.format; x.cells = k.cells; x.heads = k.heads; x.head_dim = k.head_dim;
+            x.page_size = k.page_size; x.pooled_rows = k.pooled_rows; x.idx_dim = k.idx_dim;
+            const std::array<const ConversationBuffer*, 5> parts = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+            for (size_t i = 0; i < 5; ++i) x.sizes[i] = parts[i]->size();
+            x.read = [parts](size_t part, size_t at, void* dst, size_t n) { return parts[part]->read(dst, at, n); };
+            src.push_back(std::move(x));
+        }
+        size_t b = 0;
+        std::string err;
+        const size_t before = sd.files();
+        check(sd.write_now(meta, src, {}, b, err) && sd.files() == before + 1, "write_now: written and indexed");
+        int64_t t = 0;
+        auto p = full.live.ids; p.push_back(1);
+        auto got = sd.fetch(p, {}, false, 0, t);
+        check(got && got->live.ids == full.live.ids && got->kv.size() == 1 && got->kv[0].k.external() &&
+              got->kv[0].k == full.kv[0].k, "write_now: fetched back as a mapped view with the same K/V");
     }
     // supersedes(): the rules on their own
     {
