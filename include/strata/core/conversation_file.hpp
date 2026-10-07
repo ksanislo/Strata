@@ -250,6 +250,14 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
                        size_t& bytes, std::string& error, const SessionReadLimits& limits = {},
                        SessionStatus* status = nullptr);
 
+// The same checks as session_file_read, through a read-only mapping of the file: the small arrays are copied, every
+// K/V buffer is a VIEW into the mapping (ConversationBuffer::view) - the bulk of a file never becomes this process's
+// RAM, only the OS file cache's, which it can give back.  The checksum pass reads every page before the image is
+// returned, as the copying read does.  For machines whose RAM cannot hold a conversation twice.  Off Linux it is
+// session_file_read.  `limits.admit` is asked for the copied part only (the file minus its K/V).
+bool session_file_map(const std::string& path, const SessionFileIdentity& id, SavedConversation& image, size_t& bytes,
+                      std::string& error, const SessionReadLimits& limits = {}, SessionStatus* status = nullptr);
+
 // What a session-folder index needs without reading the payload: the header and identity are checked (magic,
 // header hash, version, fingerprints - a foreign file is refused), then the first stage's live token ids and images
 // and its deepest checkpoint's are read; every state array and the K/V are skipped (not hashed: the full read checks
