@@ -1,7 +1,9 @@
 // On-disk persistence of a conversation's state (SavedConversation): one file holding the running state, the
 // checkpoints the caller passes (the engine passes only the deepest one), every QSA layer's authoritative K/V and
 // the draft layer's K/V.  Pure host code: no CUDA.  Format v1 and the fail-closed read order are in
-// docs/DETAILS.md (Session files).
+// docs/DETAILS.md (Session files).  Format v2 (a layer split) is v1's payload for the first stage followed by a stage
+// count and each later stage's payload in the same encoding (SavedConversation::stage_images); a single-stage image is
+// still written as v1.
 //
 // Format v1 is little-endian, with fixed-width integers and IEEE-754 floats; a big-endian build is refused at
 // compile time.  The hashes detect accidental corruption; they do not authenticate a file: restore trusted files only.
@@ -178,6 +180,12 @@ struct SessionKvSource {
 bool session_file_write(const std::string& path, const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
                         const SessionFileIdentity& id, size_t& bytes, std::string& error,
                         const SessionWriteOptions& options = {}, SessionStatus* status = nullptr);
+// Layer split (format v2): `meta.stage_images` holds the later stages' images (K/V empty, each with its share of the
+// checkpoints, NOT checkpoint stage_parts), `stage_kv[k]` the sources of stage k + 1 (one list per stage image).
+bool session_file_write(const std::string& path, const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
+                        const std::vector<std::vector<SessionKvSource>>& stage_kv, const SessionFileIdentity& id,
+                        size_t& bytes, std::string& error, const SessionWriteOptions& options = {},
+                        SessionStatus* status = nullptr);
 
 // The checkpoints worth a disk write: the deepest one (the next turn's resume point when the live tail was
 // rewritten).  Earlier checkpoints only serve edits further back and cost ~118 MB each at this geometry.
@@ -222,6 +230,10 @@ struct SessionReadLimits {
     // parse holds at its peak (session_read_peak_bytes); false refuses the file.  Not a reservation.
     std::function<bool(uint64_t need_bytes, std::string& why)> admit;
     SessionProgress progress;
+    // Layer split: the bounds of each later stage's image, in stage order (their admit / progress are not used).
+    // Empty: the runtime has one stage and only a single-stage file (v1) is accepted; otherwise only a v2 file with
+    // exactly this many later stages, each checked against its own bounds.
+    std::vector<SessionReadLimits> stages;
 };
 // The largest file these limits admit (UINT64_MAX when one of them is open); session_file_read applies it.
 uint64_t session_read_max_file_bytes(const SessionReadLimits& limits);
