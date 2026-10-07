@@ -87,6 +87,7 @@
 
 #include <array>
 #include <chrono>
+#include <csignal>
 #include <algorithm>
 #include <memory>
 #include <iostream>
@@ -8461,6 +8462,11 @@ int main(int argc, char** argv) {
                 if (!pump(false)) return false;
             return true;
         };
+        // --serve is driven by its server over stdin (QUIT, or EOF when the server is gone): a SIGTERM / SIGINT sent to
+        // the whole process group (systemd stopping a service, Ctrl+C in a terminal) must not end the engine before
+        // the server's orderly QUIT - the conversation is parked and written then (--session-dir).  SIGKILL still ends it.
+        std::signal(SIGTERM, SIG_IGN);
+        std::signal(SIGINT, SIG_IGN);
         if (!o.session_dir.empty()) {
             std::string why;
             if (!conversations.enabled()) why = "needs --conversation-cache-mib (and --prompt-cache > 0)";
