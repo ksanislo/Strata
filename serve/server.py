@@ -5618,7 +5618,15 @@ def main() -> int:
     # #96: docker stop sends SIGTERM, which Python ignores by default, so the container's PID 1 would be killed after
     # the grace period with the engine still running. SIGTERM takes Ctrl+C's path below (QUIT to the engine).
     # SIGINT keeps Python's own handler, so Ctrl+C and a second Ctrl+C work as before.
+    # Only the FIRST SIGTERM stops the server: systemd signals every process of a service at once and a proxy
+    # (llama-swap) then sends its own stop, so a second SIGTERM must not take the "Ctrl+C again" path that kills the
+    # engine mid-QUIT (it parks and writes the conversation then, --session-dir).  A second Ctrl+C still does.
+    stopping = [False]
+
     def on_sigterm(signum, frame):
+        if stopping[0]:
+            return
+        stopping[0] = True
         raise KeyboardInterrupt
     try:
         signal.signal(signal.SIGTERM, on_sigterm)
