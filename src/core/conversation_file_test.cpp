@@ -454,6 +454,38 @@ int main() {
                    same_checkpoint(one.stage_images[k].checkpoints[0], split.stage_images[k].checkpoints[1]);
         check(deep, "deepest-only: the deepest checkpoint of every stage, alone");
         check(fs::file_size(d) < v2.size(), "deepest-only: a smaller file");
+        // the mapped read (low RAM): the same image, its K/V views into the file, the same refusals
+        SavedConversation mapped;
+        check(session_file_map(p.string(), id, mapped, got, error, lim), "map: v2 file");
+        bool mall = same(mapped, split) && mapped.stage_images.size() == 3;
+        for (size_t k = 0; mall && k < 3; ++k) mall = same(mapped.stage_images[k], split.stage_images[k]);
+        check(mall, "map: every stage equals the copying read");
+        check(mapped.kv[0].k.external() && mapped.stage_images[2].kv[0].v.external(), "map: K/V are views, not copies");
+        size_t kvb = 0;
+        for (const auto& k : mapped.kv) kvb += k.k.bytes() + k.v.bytes();
+        check(kvb == 0 && mapped.bytes() < split.bytes() / 4, "map: the K/V count no RAM");
+        SavedConversation one_v1;
+        check(session_file_map(good.string(), id, one_v1, got, error) && same(one_v1, original), "map: v1 file");
+        {
+            auto bad = v2;
+            bad[bad.size() - 16 - 40] ^= 0x5a;
+            const fs::path q = dir / "split-flip-map.bin"; spit(q, bad);
+            SavedConversation x;
+            check(!session_file_map(q.string(), id, x, got, error, lim) && error.find("checksum") != std::string::npos,
+                  "map: a corrupted stage payload is rejected");
+        }
+        check(!session_file_map(p.string(), id, mapped, got, error) && error.find("layer split") != std::string::npos,
+              "map: a v2 file refused by a runtime without a split");
+        {   // the views outlive the read call (the mapping is kept by the buffers) and resize copies them
+            SavedConversation keep_alive;
+            check(session_file_map(good.string(), id, keep_alive, got, error), "map: read for the lifetime check");
+            ConversationBuffer copy = keep_alive.kv[1].v;
+            copy.resize(copy.size() + 3);
+            check(!copy.external() && copy.size() == original.kv[1].v.size() + 3, "map: resizing a view copies it");
+            std::vector<uint8_t> tmp(16);
+            check(keep_alive.kv[1].v.read(tmp.data(), 0, 16) && original.kv[1].v.read(tmp.data(), 0, 16),
+                  "map: a view reads after the call returned");
+        }
     }
 
     // the configuration fingerprint: every field counts, doubles by their exact bits
