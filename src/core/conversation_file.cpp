@@ -29,6 +29,7 @@
 #include <process.h>
 #else
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
@@ -384,6 +385,7 @@ public:
         size = (uint64_t) st.st_size;
         return true;
     }
+    int fd() const { return fd_; }   // session_file_map
     bool is_open() const { return fd_ >= 0; }
     bool direct() const { return direct_; }
     bool write_all(const uint8_t* p, size_t n) {
@@ -749,10 +751,19 @@ struct In {
     const SessionReadLimits* lim;   // the bounds of the image being parsed (a v2 read moves it to each stage's)
     SessionError kind = SessionError::invalid;
     size_t kv_layer = 0;
+    // session_file_map: the payload is read from a mapping, and the K/V buffers become views into it
+    const uint8_t* mem = nullptr;
+    std::shared_ptr<const void> keep;
     bool fail(const std::string& m) { if (error.empty()) error = "session file: " + m; return false; }
     bool raw(void* p, size_t c) {
         if (c > left) return fail("payload ends early");
-        if (c && !f->read(p, c)) { kind = f->kind(); return fail("read error: " + f->error()); }
+        if (mem) {
+            std::memcpy(p, mem, c);
+            mem += c;
+        } else if (c && !f->read(p, c)) {
+            kind = f->kind();
+            return fail("read error: " + f->error());
+        }
         hash.update(p, c);
         left -= c;
         return true;
@@ -779,6 +790,13 @@ struct In {
         const uint64_t limit = kv_layer < lim->max_kv_bytes.size() ? lim->max_kv_bytes[kv_layer][part] : UINT64_MAX;
         if (!count(n, 1, limit)) return false;
         b = {};
+        if (mem) {   // a view into the mapping: hashed here (this pass reads every page), never copied
+            b = ConversationBuffer::view(mem, (size_t) n, keep);
+            hash.update(mem, (size_t) n);
+            mem += n;
+            left -= n;
+            return true;
+        }
         b.resize((size_t) n);
         return b.visit(0, b.size(), [&](uint8_t* p, size_t c, size_t) { return raw(p, c); });
     }
@@ -1414,6 +1432,74 @@ bool session_file_peek(const std::string& path, const SessionFileIdentity& id, S
     }
     out = std::move(p);
     return true;
+}
+
+
+bool session_file_map(const std::string& path, const SessionFileIdentity& id, SavedConversation& image, size_t& bytes,
+                      std::string& error, const SessionReadLimits& limits, SessionStatus* status) {
+#ifdef _WIN32
+    return session_file_read(path, id, image, bytes, error, limits, status);
+#else
+    SessionStatus st;
+    st.error = SessionError::invalid;
+    auto done = [&](bool ok) { if (status) *status = st; return ok; };
+    error.clear();
+    try {
+        RawFile raw;
+        uint64_t size = 0;
+        if (!raw.open_session(path, size)) {
+            st.error = raw.refused() ? SessionError::invalid : raw.kind();
+            error = "session file: " + path + ": " + raw.error();
+            return done(false);
+        }
+        if (size < kHeader + kTrailer) { error = "session file: size " + std::to_string(size) + " is below the minimum"; return done(false); }
+        const uint64_t max_size = session_read_max_file_bytes(limits);
+        if (size > max_size || size > (uint64_t) std::numeric_limits<size_t>::max()) {
+            error = "session file: size " + std::to_string(size) + " exceeds this engine's limit";
+            return done(false);
+        }
+        void* m = ::mmap(nullptr, (size_t) size, PROT_READ, MAP_PRIVATE, raw.fd(), 0);
+        if (m == MAP_FAILED) { st.error = errno_kind(errno); error = std::string("session file: mmap: ") + std::strerror(errno); return done(false); }
+        const size_t len = (size_t) size;
+        std::shared_ptr<const void> keep(m, [len](const void* p) { ::munmap(const_cast<void*>(p), len); });
+        ::madvise(m, len, MADV_SEQUENTIAL);
+        const uint8_t* h = static_cast<const uint8_t*>(m);
+        uint32_t version = 0, hsize = 0;
+        uint64_t model = 0, config = 0, payload = 0, r0 = 0, r1 = 0, hh = 0;
+        std::memcpy(&version, h + 8, 4); std::memcpy(&hsize, h + 12, 4);
+        std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8); std::memcpy(&payload, h + 32, 8);
+        std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
+        if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return done(false); }
+        if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return done(false); }
+        if (version != kVersion && version != kVersionSplit) { error = "session file: unsupported version " + std::to_string(version); return done(false); }
+        if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields"; return done(false); }
+        if (model != id.model) { error = "session file: saved with another model (model fingerprint differs)"; return done(false); }
+        if (config != id.config) { error = "session file: saved with another engine configuration (config fingerprint differs)"; return done(false); }
+        if (payload > size || size - kHeader - kTrailer != payload) { error = "session file: size does not match the header"; return done(false); }
+        SavedConversation parsed;
+        In in{nullptr, SessionHasher(0), payload, error, &limits};
+        in.mem = h + kHeader;
+        in.keep = keep;
+        if (!get_all(in, parsed, version)) { st.error = in.kind; return done(false); }
+        if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return done(false); }
+        uint64_t ph = 0;
+        std::memcpy(&ph, h + kHeader + payload, 8);
+        if (ph != in.hash.digest()) { error = "session file: payload checksum mismatch"; return done(false); }
+        if (std::memcmp(h + kHeader + payload + 8, kEnd, 8) != 0) { error = "session file: bad end marker"; return done(false); }
+        if (limits.admit) {   // what was copied: the running state, checkpoints and token lists
+            std::string why;
+            if (!limits.admit(parsed.bytes(), why)) { st.error = SessionError::memory; error = "session file: " + why; return done(false); }
+        }
+        image = std::move(parsed);
+        bytes = len;
+        st.error = SessionError::none;
+        return done(true);
+    } catch (const std::bad_alloc&) {
+        error = "session file: out of memory while mapping " + path;
+        st.error = SessionError::memory;
+        return done(false);
+    }
+#endif
 }
 
 } // namespace strata::core
