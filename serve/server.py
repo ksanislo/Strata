@@ -2395,6 +2395,7 @@ class Service:
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.fifo = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
+        self.session_autosave = None                  # "session_autosave": the held conversation across restarts
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
@@ -2452,6 +2453,27 @@ class Service:
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
+
+    def autosave(self, action: str) -> None:
+        """"session_autosave": PATH - the conversation the engine holds is written to PATH when the server stops or
+        unloads, and read back after the engine (re)starts, so a restart (an idle unload by a proxy such as
+        llama-swap) does not read the whole conversation again.  A file the engine refuses (another model or
+        configuration, another layer split) is left alone and the next request reads its prompt as usual.  The
+        caller holds self.fifo."""
+        path = self.session_autosave
+        if not path or not hasattr(self.engine, "session_file") or getattr(self.engine, "batch", 0):
+            return
+        if not self.loaded() or (action == "restore" and not os.path.lexists(path)):
+            return
+        t0 = time.time()
+        try:
+            r = self.engine.session_file(action, path)
+            print(f"[strata] session {action}d: {r['tokens']} tokens, {r['bytes'] >> 20} MiB in "
+                  f"{time.time() - t0:.1f} s ({path})", flush=True)
+        except SessionRefused as e:                     # the engine is still in step: nothing changed
+            print(f"[strata] session {action} skipped: {e}", flush=True)
+        except (EngineDied, ValueError, OSError) as e:  # EngineSilent is an EngineDied
+            print(f"[strata] session {action} failed: {e}", flush=True)
 
     def slot_action(self, slot: str, action: str, filename) -> tuple[int, dict]:
         """llama-server's POST /slots/{id}?action=save|restore {"filename": ...}: the conversation the engine holds,
@@ -2625,6 +2647,7 @@ class Service:
                 self.vision.unload()
             raise
         print("[strata] the engine is running again", flush=True)
+        self.autosave("restore")
         if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # #533: the reserve asked for last
             try:
                 self.engine.vram(self.vram_reserve)
@@ -2707,6 +2730,7 @@ class Service:
                     return "busy"
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
+            self.autosave("save")
             self.engine.unload()
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
@@ -5506,6 +5530,16 @@ def main() -> int:
             raise SystemExit(f"[strata] {e}")
         print(f"[strata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
               "about 1.2 GB per 63K-token conversation; restore only files this server wrote)", flush=True)
+    if cfg.get("session_autosave"):
+        sa = str(cfg["session_autosave"])
+        sa = sa if os.path.isabs(sa) else os.path.join(cfg.get("cwd") or os.getcwd(), sa)
+        if not os.path.isdir(os.path.dirname(sa)):
+            raise SystemExit(f"[strata] session_autosave: the folder of {sa} does not exist")
+        svc.session_autosave = sa
+        print(f"[strata] session autosave on: {sa} (written when the server stops, read back after a start)",
+              flush=True)
+        with svc.fifo:
+            svc.autosave("restore")
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
@@ -5595,6 +5629,14 @@ def main() -> int:
             time.sleep(1)                               # Windows never delivers Ctrl+C to an untimed Event.wait()
     except KeyboardInterrupt:
         print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
+        if svc.session_autosave:
+            if svc.fifo.acquire(timeout=30):
+                try:
+                    svc.autosave("save")
+                finally:
+                    svc.fifo.release()
+            else:
+                print("[strata] session autosave skipped: a request still holds the engine", flush=True)
         closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
                    hub.close if hub is not None else None]
         for close in filter(None, closers):

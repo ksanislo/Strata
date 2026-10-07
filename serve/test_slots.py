@@ -447,3 +447,42 @@ class Slots(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Autosave(unittest.TestCase):
+    """"session_autosave": the held conversation is saved when the server stops or unloads and restored after a start."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.engine = FakeEngine()
+        self.svc = Service(self.engine, ByteTokenizer(), ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.svc.session_autosave = os.path.join(self.dir.name, "last.session")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def sent(self):
+        return [s.strip().split(" ")[0] for s in self.engine.proc.sent]
+
+    def test_restore_without_a_file_sends_nothing(self):
+        self.svc.autosave("restore")
+        self.assertEqual(self.sent(), [])
+
+    def test_save_then_restore(self):
+        self.svc.autosave("save")
+        self.assertTrue(os.path.exists(self.svc.session_autosave))
+        self.svc.autosave("restore")
+        self.assertEqual(self.sent(), ["SAVE", "RESTORE"])
+        self.assertEqual(self.engine.proc.sent[0].strip(), "SAVE " + self.svc.session_autosave)
+
+    def test_a_refused_file_leaves_the_engine_in_step(self):
+        Path(self.svc.session_autosave).write_bytes(b"old")
+        self.engine.fail = True
+        self.svc.autosave("restore")                 # SERR: logged, no exception, the engine is not ended
+        self.assertFalse(self.engine.ended)
+        self.assertTrue(os.path.exists(self.svc.session_autosave))
+
+    def test_off_without_a_path(self):
+        self.svc.session_autosave = None
+        self.svc.autosave("save")
+        self.assertEqual(self.sent(), [])
