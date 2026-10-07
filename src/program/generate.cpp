@@ -6911,7 +6911,9 @@ int main(int argc, char** argv) {
                     {"native_preset", !o.native_preset.empty()}, {"shared_late", o.shared_late},
                     {"keep_canonical", o.keep_canonical}, {"no_fused_gr", o.no_fused_gr},
                     {"no_fast_attn", o.no_fast_attn}, {"no_fused_gdn", o.no_fused_gdn},
-                    {"no_fast_select", o.no_fast_select}, {"vision", o.vision}};
+                    {"no_fast_select", o.no_fast_select}, {"vision", o.vision},
+                    // this build's session files (v2 = layer split) are not upstream's: never read each other's
+                    {"fork_session_files_split", 1}};
                 config_fp = strata::core::session_config_fingerprint(c);
             }
             id.model = *model_fp;
