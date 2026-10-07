@@ -112,5 +112,13 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
                                     const ModelGeometry& g, const QsaState* draft, std::string& error);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
                                                    const ModelGeometry& g, const QsaState* draft, std::string& error);
+// Disk sessions with a layer split: the same with `draft == nullptr` for a stage without the draft layer (its file
+// image then holds its own QSA layers' K/V only).
+bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                   const ConversationView& view, const SessionState& session,
+                                   const ModelGeometry& g, const QsaState* draft, std::string& error);
+bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& session, const ModelGeometry& g,
+                                      const QsaState* draft, uint64_t max_tokens, uint64_t max_checkpoints,
+                                      std::string& error);
 
 } // namespace strata::core
