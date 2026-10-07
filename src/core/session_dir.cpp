@@ -190,32 +190,52 @@ void SessionDir::writer_loop() {
         lk.lock();
         writing_ = nullptr;
         if (ok) {
-            Entry e;
-            e.path = path;
-            e.peek = peek_of(*job.image, written);
-            e.seq = ++seq_;
-            size_t dropped = 0;
-            for (size_t i = 0; i < entries_.size();) {
-                if (entries_[i].state != State::loading &&
-                    supersedes(job.image->live, job.image->checkpoints, entries_[i].peek)) {
-                    drop_entry_locked(i, "superseded");
-                    ++dropped;
-                } else {
-                    ++i;
-                }
-            }
-            char b[200];
-            std::snprintf(b, sizeof b, "wrote %zu tokens, %zu MiB in %.1f s (%zu older file(s) of it dropped)",
-                          job.image->live.ids.size(), written >> 20, s, dropped);
-            say(b);
-            entries_.push_back(std::move(e));
-            enforce_caps_locked();
+            add_written_locked(path, *job.image, written, s, "wrote");
         } else {
             say("write failed: " + err);
         }
         job.image.reset();   // an image evicted from the cache meanwhile is freed here, outside the cache's budget
         cv_.notify_all();
     }
+}
+
+void SessionDir::add_written_locked(const std::string& path, const SavedConversation& image, size_t written, double s,
+                                    const char* what) {
+    Entry e;
+    e.path = path;
+    e.peek = peek_of(image, written);
+    e.seq = ++seq_;
+    size_t dropped = 0;
+    for (size_t i = 0; i < entries_.size();) {
+        if (entries_[i].state != State::loading && supersedes(image.live, image.checkpoints, entries_[i].peek)) {
+            drop_entry_locked(i, "superseded");
+            ++dropped;
+        } else {
+            ++i;
+        }
+    }
+    char b[200];
+    std::snprintf(b, sizeof b, "%s %zu tokens, %zu MiB in %.1f s (%zu older file(s) of it dropped)", what,
+                  image.live.ids.size(), written >> 20, s, dropped);
+    say(b);
+    entries_.push_back(std::move(e));
+    enforce_caps_locked();
+}
+
+bool SessionDir::write_now(const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
+                           const std::vector<std::vector<SessionKvSource>>& stage_kv, size_t& bytes, std::string& error) {
+    const std::string path = (fs::path(o_.dir) / random_name()).string();
+    SessionWriteOptions wo;
+    wo.min_free_bytes = o_.min_free_bytes;
+    SessionStatus st;
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = meta.stage_images.empty() ? session_file_write(path, meta, kv, o_.id, bytes, error, wo, &st)
+                                              : session_file_write(path, meta, kv, stage_kv, o_.id, bytes, error, wo, &st);
+    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (!ok) { say("write failed: " + error); return false; }
+    std::lock_guard<std::mutex> lk(mu_);
+    add_written_locked(path, meta, bytes, s, "wrote (directly, low RAM)");
+    return true;
 }
 
 void SessionDir::preload_loop() {
@@ -346,7 +366,7 @@ std::optional<SavedConversation> SessionDir::fetch(const std::vector<int32_t>& i
 bool SessionDir::read_file(const std::string& path, SavedConversation& image, std::string& error) const {
     size_t bytes = 0;
     SessionStatus st;
-    return session_file_read(path, o_.id, image, bytes, error, o_.limits, &st);
+    return session_file_map(path, o_.id, image, bytes, error, o_.limits, &st);   // K/V as views: no RAM copy
 }
 
 void SessionDir::drop_entry_locked(size_t i, const char* why) {
