@@ -128,6 +128,29 @@ int main() {
         sd2.flush();
         check(session_files(dir) == 2, "claim drops a queued write");
     }
+    // a parked conversation still inside its write delay at exit: written by flush, and by the destructor alone
+    {
+        SessionDir::Options slow = opts(dir, id);
+        slow.write_delay = std::chrono::milliseconds(600000);
+        const size_t before = session_files(dir);
+        {
+            SessionDir sd(slow);
+            sd.open();
+            sd.write(std::make_shared<SavedConversation>(conv(tokens(110000, 1500), 7)));
+            check(session_files(dir) == before, "delay: not written yet");
+            const auto t0 = std::chrono::steady_clock::now();
+            sd.flush();
+            check(session_files(dir) == before + 1 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30),
+                  "flush writes a delayed image at once");
+            sd.write(std::make_shared<SavedConversation>(conv(tokens(120000, 1500), 8)));
+        }   // destructor only
+        check(session_files(dir) == before + 2, "the destructor writes what is still queued");
+        for (const auto& e : fs::directory_iterator(dir)) {   // leave the folder as the caps test expects it
+            SessionPeek pk; std::string err;
+            if (session_file_peek(e.path().string(), id, pk, err) && !pk.live.ids.empty() &&
+                (pk.live.ids[0] == 110000 || pk.live.ids[0] == 120000)) fs::remove(e.path());
+        }
+    }
     // caps: the oldest file goes
     {
         SessionDir::Options o = opts(dir, id);
