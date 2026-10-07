@@ -430,6 +430,30 @@ int main() {
         stage_src.pop_back();
         check(!session_file_write((dir / "split-short.bin").string(), meta, sources_of(split), stage_src, id, written,
                                   error), "v2: a missing stage source list is refused");
+        // peek: the first stage's live ids/images and deepest checkpoint, nothing else read
+        SessionPeek pk;
+        check(session_file_peek(p.string(), id, pk, error), "peek: v2 file");
+        check(pk.version == 2 && pk.bytes == v2.size() && !pk.cvec, "peek: version, size, cvec");
+        check(pk.live.ids == split.live.ids && pk.live.imgs == split.live.imgs, "peek: live ids and images");
+        check(pk.deepest.ids == split.checkpoints[1].ids && pk.deepest.imgs == split.checkpoints[1].imgs,
+              "peek: the deepest checkpoint");
+        check(session_file_peek(good.string(), id, pk, error) && pk.version == 1 && pk.live.ids == original.live.ids,
+              "peek: v1 file");
+        check(!session_file_peek(good.string(), {id.model ^ 1, id.config}, pk, error) &&
+              error.find("model") != std::string::npos, "peek: another model refused");
+        // deepest checkpoint only: one checkpoint per stage, the same one everywhere
+        SessionWriteOptions only;
+        only.deepest_checkpoint_only = true;
+        const fs::path d = dir / "split-deepest.bin";
+        check(session_file_write(d.string(), split, id, written, error, only), "deepest-only: write");
+        SavedConversation one;
+        check(session_file_read(d.string(), id, one, got, error, lim), "deepest-only: read back");
+        bool deep = one.checkpoints.size() == 1 && same_checkpoint(one.checkpoints[0], split.checkpoints[1]);
+        for (size_t k = 0; deep && k < 3; ++k)
+            deep = one.stage_images[k].checkpoints.size() == 1 &&
+                   same_checkpoint(one.stage_images[k].checkpoints[0], split.stage_images[k].checkpoints[1]);
+        check(deep, "deepest-only: the deepest checkpoint of every stage, alone");
+        check(fs::file_size(d) < v2.size(), "deepest-only: a smaller file");
     }
 
     // the configuration fingerprint: every field counts, doubles by their exact bits
