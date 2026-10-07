@@ -8737,7 +8737,13 @@ int main(int argc, char** argv) {
                 };
                 strata::core::progress_at(save ? "saving a session" : "restoring a session");
                 if (path.empty()) { refuse("missing path"); continue; }
-                if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
+                if (multi_gpu && stages.empty()) { refuse("session files do not support this multi-GPU mode"); continue; }
+                // --layer-split: one image per stage (format v2), each captured from and restored to its own GPU;
+                // the draft layer's K/V lives on the last stage, as with parking
+                const size_t n_st = stages.size();
+                auto draft_of = [&](size_t k) -> const strata::core::QsaState* {
+                    return use_mtp && k + 1 == n_st ? &mtp.kv_state() : nullptr;
+                };
                 if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
                 if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
                 if (o.prompt_cache <= 0) { refuse("session files need --prompt-cache > 0"); continue; }
@@ -8773,16 +8779,24 @@ int main(int argc, char** argv) {
                         {
                             strata::core::ConversationStateSizes z;
                             std::string why;
-                            uint64_t state = UINT64_MAX;   // unknown sizes: the preflight refuses rather than guesses
-                            if (strata::core::conversation_session_sizes(g, ss, z, why)) {
-                                const uint64_t q = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0);
+                            // unknown sizes: the preflight refuses rather than guesses
+                            auto state_of = [&](const strata::core::SessionState& s_) -> uint64_t {
+                                if (!strata::core::conversation_session_sizes(g, s_, z, why)) return UINT64_MAX;
+                                const uint64_t q = (uint64_t) std::max<int64_t>(s_.qsa_alloc, 0);
                                 const uint64_t per = (uint64_t) z.tail + z.dead + z.block_pos;
-                                if (q == 0 || per <= (UINT64_MAX - z.gdn - z.ple) / q) state = z.gdn + z.ple + q * per;
+                                if (q != 0 && per > (UINT64_MAX - z.gdn - z.ple) / q) return UINT64_MAX;
+                                return z.gdn + z.ple + q * per;
+                            };
+                            uint64_t state = state_of(ss), kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + 1;
+                            for (const auto& st_ : stages) {   // every stage's running state is copied too
+                                const uint64_t b = state_of(st_->ss);
+                                state = b == UINT64_MAX || state > UINT64_MAX - b ? UINT64_MAX : state + b;
+                                kv_layers += (uint64_t) std::max<int64_t>(st_->ss.qsa_alloc, 0);
                             }
                             sl.state_bytes = state;
                             sl.tokens = live.size();
                             sl.images = live_imgs.size();
-                            sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + 1;
+                            sl.kv_layers = kv_layers;
                         }
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                         auto admit = [&](uint64_t need, std::string& why) {
@@ -8802,13 +8816,52 @@ int main(int argc, char** argv) {
                             continue;
                         }
                         kept = disk_checks.size();
-                        const strata::core::ConversationView view{live, live_imgs, disk_checks, cvec_cached};
+                        // a split: the deepest checkpoint's stage parts go to the stage images (one that lacks a
+                        // part for every stage is not saved; the live state alone still restores)
+                        strata::core::ConversationCheckpointSplit dcs;
+                        if (n_st > 0) {
+                            dcs = strata::core::conversation_checkpoints_split(std::move(disk_checks), n_st);
+                            kept = dcs.stage0.size();
+                        }
+                        const strata::core::ConversationView view{live, live_imgs, n_st > 0 ? dcs.stage0 : disk_checks,
+                                                                  cvec_cached};
                         strata::core::SavedConversation meta;
                         std::vector<strata::core::SessionKvSource> sources;
+                        std::vector<std::vector<strata::core::SessionKvSource>> stage_sources;
                         // the live running state comes off the device in one synchronous copy
                         blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
-                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(),
-                                                                         err)) {
+                        if (!(n_st > 0 ? strata::core::conversation_snapshot_sources(meta, sources, view, ss, g,
+                                                                                     (const strata::core::QsaState*) nullptr, err)
+                                       : strata::core::conversation_snapshot_sources(meta, sources, view, ss, g,
+                                                                                     mtp.kv_state(), err))) {
+                            refuse(err, strata::core::SessionError::io);
+                            continue;
+                        }
+                        bool stage_failed = false;
+                        for (size_t k = 0; k < n_st && !stage_failed; ++k) {
+                            const int dev = stages[k]->dev;
+                            const strata::core::OnDevice on(dev);
+                            const strata::core::ConversationView view_k{live, live_imgs, dcs.parts[k], cvec_cached};
+                            strata::core::SavedConversation part;
+                            std::vector<strata::core::SessionKvSource> ps;
+                            if (!strata::core::conversation_snapshot_sources(part, ps, view_k, stages[k]->ss, g,
+                                                                             draft_of(k), err)) {
+                                err = "stage CUDA" + std::to_string(dev) + ": " + err;
+                                stage_failed = true;
+                                break;
+                            }
+                            // the file writer pulls each block later, from this thread: read on the stage's GPU
+                            for (auto& src : ps) {
+                                auto inner = std::move(src.read);
+                                src.read = [inner, dev](size_t part_, size_t at, void* dst, size_t n) {
+                                    const strata::core::OnDevice on_(dev);
+                                    return inner(part_, at, dst, n);
+                                };
+                            }
+                            meta.stage_images.push_back(std::move(part));
+                            stage_sources.push_back(std::move(ps));
+                        }
+                        if (stage_failed) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
                         }
@@ -8818,7 +8871,9 @@ int main(int argc, char** argv) {
                         wo.progress = moving;
                         wo.phase = blocking;
                         strata::core::SessionStatus st;
-                        if (!strata::core::session_file_write(path, meta, sources, id, bytes, err, wo, &st)) {
+                        if (!(n_st > 0 ? strata::core::session_file_write(path, meta, sources, stage_sources, id, bytes,
+                                                                          err, wo, &st)
+                                       : strata::core::session_file_write(path, meta, sources, id, bytes, err, wo, &st))) {
                             refuse(err, st.error, st.published);
                             continue;
                         }
@@ -8851,9 +8906,30 @@ int main(int argc, char** argv) {
                                   (avail ? std::to_string(*avail >> 20) + " MiB available)" : "RAM telemetry unavailable)");
                             return false;
                         };
-                        if (!strata::core::conversation_session_read_limits(
-                                limits, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
-                                (uint64_t) std::max(o.prompt_cache, 1), err)) {
+                        if (!(n_st > 0 ? strata::core::conversation_session_read_limits(
+                                             limits, ss, g, (const strata::core::QsaState*) nullptr,
+                                             (uint64_t) o.max_context, (uint64_t) std::max(o.prompt_cache, 1), err)
+                                       : strata::core::conversation_session_read_limits(
+                                             limits, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
+                                             (uint64_t) std::max(o.prompt_cache, 1), err))) {
+                            refuse(err, strata::core::SessionError::io);
+                            continue;
+                        }
+                        bool stage_failed = false;   // a split: each later stage's image against its own bounds
+                        for (size_t k = 0; k < n_st && !stage_failed; ++k) {
+                            strata::core::SessionReadLimits sl;
+                            if (!strata::core::conversation_session_read_limits(
+                                    sl, stages[k]->ss, g, draft_of(k), (uint64_t) o.max_context,
+                                    (uint64_t) std::max(o.prompt_cache, 1), err)) {
+                                err = "stage CUDA" + std::to_string(stages[k]->dev) + ": " + err;
+                                stage_failed = true;
+                                break;
+                            }
+                            sl.admit = nullptr;
+                            sl.progress = nullptr;
+                            limits.stages.push_back(std::move(sl));
+                        }
+                        if (stage_failed) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
                         }
@@ -8869,10 +8945,25 @@ int main(int argc, char** argv) {
                     const double read_ms = ms();
                     // the whole image against this engine, still without any device write
                     blocking("validate", bytes);
-                    if (!strata::core::conversation_snapshot_validate(image, ss, g, mtp.kv_state(), err)) {
+                    if (!(n_st > 0 ? strata::core::conversation_snapshot_validate(image, ss, g,
+                                                                                  (const strata::core::QsaState*) nullptr, err)
+                                   : strata::core::conversation_snapshot_validate(image, ss, g, mtp.kv_state(), err))) {
                         refuse(err);
                         continue;
                     }
+                    // a split: every stage image is checked on its own GPU before ANY device write
+                    if (image.stage_images.size() != n_st) { refuse("the file's stage count is not this runtime's"); continue; }
+                    bool stage_invalid = false;
+                    for (size_t k = 0; k < n_st; ++k) {
+                        const strata::core::OnDevice on(stages[k]->dev);
+                        if (!strata::core::conversation_snapshot_validate(image.stage_images[k], stages[k]->ss, g,
+                                                                          draft_of(k), err)) {
+                            err = "stage CUDA" + std::to_string(stages[k]->dev) + ": " + err;
+                            stage_invalid = true;
+                            break;
+                        }
+                    }
+                    if (stage_invalid) { refuse(err); continue; }
                     // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells
                     if (!kvg_ensure((int64_t) image.live.ids.size() + 256, [&] { cudaDeviceSynchronize(); apply_pending(true); })) {
                         refuse("the K/V cannot grow to the saved conversation: no VRAM is left", strata::core::SessionError::memory);
@@ -8882,8 +8973,20 @@ int main(int argc, char** argv) {
                     live_ok = false;
                     // host -> device in synchronous copies of the whole state: one bounded allowance
                     blocking("transfer", bytes);
-                    if (strata::core::conversation_snapshot_restore(image, ss, g, mtp.kv_state(), err) !=
-                        strata::core::ConversationRestore::restored) {
+                    bool restored = (n_st > 0 ? strata::core::conversation_snapshot_restore(
+                                                    image, ss, g, (const strata::core::QsaState*) nullptr, err)
+                                              : strata::core::conversation_snapshot_restore(image, ss, g, mtp.kv_state(),
+                                                                                            err)) ==
+                                    strata::core::ConversationRestore::restored;
+                    for (size_t k = 0; restored && k < n_st; ++k) {   // the later stages, each on its own GPU
+                        const strata::core::OnDevice on(stages[k]->dev);
+                        restored = strata::core::conversation_snapshot_restore(image.stage_images[k], stages[k]->ss, g,
+                                                                               draft_of(k), err) ==
+                                       strata::core::ConversationRestore::restored &&
+                                   cudaDeviceSynchronize() == cudaSuccess;
+                        if (!restored && err.empty()) err = "stage CUDA" + std::to_string(stages[k]->dev) + " sync";
+                    }
+                    if (!restored) {
                         // validated above: a failure here is a transfer failure, after device writes began - never
                         // decode from a partial state; the server starts the engine again
                         std::fprintf(stderr, "strata serve: session restore %s: transfer failed: %s\n", path.c_str(),
@@ -8895,7 +8998,14 @@ int main(int argc, char** argv) {
                     }
                     live = std::move(image.live.ids);
                     live_imgs = std::move(image.live.imgs);
-                    checks = std::move(image.checkpoints);
+                    if (n_st == 0) {
+                        checks = std::move(image.checkpoints);
+                    } else {   // give each checkpoint back its stage parts; none if they do not line up
+                        strata::core::ConversationCheckpointSplit cs;
+                        cs.stage0 = std::move(image.checkpoints);
+                        for (auto& si : image.stage_images) cs.parts.push_back(std::move(si.checkpoints));
+                        if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
+                    }
                     for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
                     cvec_cached = image.cvec;
                     live_ok = true;
