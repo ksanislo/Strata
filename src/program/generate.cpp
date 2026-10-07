@@ -116,6 +116,7 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 
 #include <array>
 #include <chrono>
+#include <csignal>
 #include <algorithm>
 #include <memory>
 #include <iostream>
@@ -11587,6 +11588,11 @@ int main(int argc, char** argv) {
                 if (!pump(false)) return false;
             return true;
         };
+        // --serve is driven by its server over stdin (QUIT, or EOF when the server is gone): a SIGTERM / SIGINT sent to
+        // the whole process group (systemd stopping a service, Ctrl+C in a terminal) must not end the engine before
+        // the server's orderly QUIT.  SIGKILL still ends it.
+        std::signal(SIGTERM, SIG_IGN);
+        std::signal(SIGINT, SIG_IGN);
         for (;;) {
             line_drain_ms = 0.0;
             if (batch_on() || (piped && pipe_inflight())) {
