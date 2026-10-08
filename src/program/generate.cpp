@@ -7259,6 +7259,12 @@ int main(int argc, char** argv) {
                 const size_t snapshot_bytes = image.bytes();
                 const bool stored = conversations.put(std::move(image), held);
                 if (stored && sdir) sdir->write(conversations.newest());   // written behind, after its delay
+                if (stored) {   // the server's log: a conversation going out, to RAM
+                    std::printf("INFO sess_event=parked sess_tokens=%zu sess_bytes=%zu sess_ms=%.0f sess_why=ram\n",
+                                live.size(), snapshot_bytes,
+                                std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                    std::fflush(stdout);
+                }
                 if (!stored) spill_current();
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", live.size(),
@@ -9572,7 +9578,14 @@ int main(int argc, char** argv) {
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
                     conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv));
                 }
+                const size_t incoming_bytes = incoming->bytes();
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
+                // the server's log: a conversation coming back in, from RAM or (read before) from disk
+                std::printf("INFO sess_event=restored sess_tokens=%lld sess_bytes=%zu sess_ms=%.0f sess_why=%s\n",
+                            (long long) resume, incoming_bytes,
+                            std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                            ctx_from ? ctx_from : "ram");
+                std::fflush(stdout);
                 std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
                              (long long) resume, from_live ? "live" : "checkpoint",
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),

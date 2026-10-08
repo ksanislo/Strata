@@ -596,7 +596,13 @@ def session_event_text(f: dict, state: dict | None) -> str | None:
                  "background": "in the background"}.get(why, "")
         return f"saved {conv} to disk {where} ({took})".replace("  ", " ")
     if what == "read":
-        return f"resumed {conv} from disk ({took})"
+        return f"reading {conv} back from disk ({took})"
+    if what == "parked":
+        return f"parked {conv} in RAM ({took})"
+    if what == "restored":
+        if why == "disk":
+            return f"switched to {conv} from disk ({ms / 1000:.1f} s onto the GPU)"
+        return f"switched to {conv} parked in RAM ({ms / 1000:.1f} s)"
     if what == "write_failed":
         return f"could not save {conv} (see the engine log)"
     if what == "deleted":
@@ -853,6 +859,8 @@ class StrataEngine:
         if "ctx_source" in f:
             self.last_ctx = {"source": f.get("ctx_source"), "reused": int(f.get("ctx_reused") or 0),
                              "prompt": int(f.get("ctx_prompt") or 0), "at": time.time()}
+            if self.last_ctx["source"] == "none" and self.last_ctx["prompt"] > 0:   # nothing to bring back in
+                print(f"[strata] sessions: new conversation, {self.last_ctx['prompt']:,} tokens to read", flush=True)
             return True
         msg = session_event_text(f, self.sessions)
         if msg:
