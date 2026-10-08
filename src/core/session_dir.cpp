@@ -114,8 +114,8 @@ void SessionDir::open() {
     uint64_t total = 0;
     for (const auto& e : entries_) total += e.peek.bytes;
     say(std::to_string(entries_.size()) + " conversation file(s), " + std::to_string(total >> 20) + " MiB in " + o_.dir);
+    state_locked();   // first: the server's "opened" line names the count from it
     note_locked("opened", 0, total, 0, "start");
-    state_locked();
     writer_ = std::thread([this] { writer_loop(); });
 }
 
