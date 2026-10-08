@@ -7068,8 +7068,12 @@ int main(int argc, char** argv) {
         // --session-dir when parking is off or refuses (low RAM): the active conversation straight from the device and
         // the pinned K/V pool into a session file - the deepest checkpoint and the running state are the only host
         // copies.  On the request's path (it is what lets a low-RAM machine switch conversations without losing one).
+        // set by a request around its park: the prompt continues this same conversation from a checkpoint near its end
+        // (the client re-rendered the last reply) - parking keeps that old tail in RAM cheaply, a synchronous disk
+        // write of the whole conversation for it is not worth it; a real switch resumes far earlier (or not at all)
+        bool spill_skip_rewind = false;
         auto spill_current = [&]() {
-            if (!sdir || !live_ok || live.empty()) return;
+            if (!sdir || !live_ok || live.empty() || spill_skip_rewind) return;
             std::string e;
             try {
                 const size_t n_st = stages.size();
@@ -7111,7 +7115,7 @@ int main(int argc, char** argv) {
                     stage_sources.push_back(std::move(ps));
                 }
                 size_t bytes = 0;
-                sdir->write_now(meta, sources, stage_sources, bytes, e);   // logs its own result
+                sdir->write_now(meta, sources, stage_sources, bytes, e, &checks);   // logs its own result
             } catch (const std::bad_alloc&) {
                 std::fprintf(stderr, "strata serve: session dir: spill skipped (allocation failed)\n");
             }
@@ -9450,7 +9454,13 @@ int main(int argc, char** argv) {
                 resume == req_pin && live_ok)
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() == resume && c.pinned) pin_sibling = true;
-            if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && !park_current(incoming ? incoming->bytes() : 0)) {
+            // --session-dir's direct write (parking off or refused): not for a rewind of this same conversation, whose
+            // prompt resumes within its last 4096 tokens - only its rewritten tail would be lost, not the conversation
+            spill_skip_rewind = !incoming && slot_source < 0 && resume > 0 && (int64_t) live.size() - resume <= 4096;
+            const bool park_ok = !((!from_live || incoming || slot_source >= 0) && !pin_sibling &&
+                                   !park_current(incoming ? incoming->bytes() : 0));
+            spill_skip_rewind = false;
+            if (!park_ok) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
