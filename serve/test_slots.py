@@ -511,6 +511,18 @@ class SessionNotes(unittest.TestCase):
         text = out.getvalue()
         self.assertIn("[strata] sessions: saved a 187,275-token conversation to disk on shutdown (2.96 GB, 4.1 s)", text)
         self.assertIn("removed a 900-token conversation unused for 7 days (230 MB)", text)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            e._session_note("INFO sess_event=parked sess_tokens=533 sess_bytes=247000000 sess_ms=300 sess_why=ram\n")
+            e._session_note("INFO sess_event=restored sess_tokens=32559 sess_bytes=700000000 sess_ms=210 sess_why=ram\n")
+            e._session_note("INFO sess_event=restored sess_tokens=169011 sess_bytes=0 sess_ms=1200 sess_why=disk\n")
+            e._session_note("INFO ctx_source=none ctx_reused=0 ctx_prompt=8434\n")
+            e._session_note("INFO ctx_source=gpu ctx_reused=8537 ctx_prompt=8558\n")   # a continuation: no line
+        lines = out.getvalue().splitlines()
+        self.assertEqual(lines, ["[strata] sessions: parked a 533-token conversation in RAM (247 MB, 0.3 s)",
+                                 "[strata] sessions: switched to a 32,559-token conversation parked in RAM (0.2 s)",
+                                 "[strata] sessions: switched to a 169,011-token conversation from disk (1.2 s onto the GPU)",
+                                 "[strata] sessions: new conversation, 8,434 tokens to read"])
         self.assertTrue(e._session_note("INFO ctx_source=disk ctx_reused=169011 ctx_prompt=170071\n"))
         self.assertEqual(context_text(e.last_ctx), ", context: 169,011 tokens from disk, 1,060 new")
         self.assertEqual(context_text({"source": "none", "reused": 0, "prompt": 500}), ", context: none reused, 500 read")
