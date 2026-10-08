@@ -734,9 +734,13 @@ std::vector<size_t> deepest_pick(const SavedConversation& s) {
     if (s.checkpoints.empty()) return {};
     for (const auto& st : s.stage_images)
         if (st.checkpoints.size() != s.checkpoints.size()) return {};
-    size_t best = 0;
-    for (size_t i = 1; i < s.checkpoints.size(); ++i)
-        if (s.checkpoints[i].ids.size() > s.checkpoints[best].ids.size()) best = i;
+    // as session_deepest_checkpoint: with a pinned shared prefix in the chain, the deepest PINNED one
+    bool any_pinned = false;
+    for (const auto& c : s.checkpoints) any_pinned = any_pinned || c.pinned;
+    size_t best = s.checkpoints.size();
+    for (size_t i = 0; i < s.checkpoints.size(); ++i)
+        if ((!any_pinned || s.checkpoints[i].pinned) &&
+            (best == s.checkpoints.size() || s.checkpoints[i].ids.size() > s.checkpoints[best].ids.size())) best = i;
     for (const auto& st : s.stage_images)
         if (st.checkpoints[best].ids != s.checkpoints[best].ids) return {};
     return {best};
