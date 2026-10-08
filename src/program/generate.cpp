@@ -8760,6 +8760,8 @@ int main(int argc, char** argv) {
                 so.write_delay = std::chrono::milliseconds((int64_t) (o.session_dir_delay_s * 1000.0));
                 so.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
                 so.log = [](const std::string& m) { std::fprintf(stderr, "strata serve: session dir: %s\n", m.c_str()); };
+                // the server's notes (any thread; one whole line per call, so stdout never interleaves inside one)
+                so.event = [](const std::string& m) { std::printf("INFO %s\n", m.c_str()); std::fflush(stdout); };
                 sdir = std::make_unique<strata::core::SessionDir>(std::move(so));
                 sdir->open();
                 sdir->start_preload();
@@ -9411,15 +9413,19 @@ int main(int argc, char** argv) {
             std::optional<strata::core::SavedConversation> incoming;
             int64_t incoming_tokens = 0;
             bool incoming_live = false;
+            const char* incoming_src = nullptr;   // "disk" | "ram": where a restored conversation came from
+            const char* ctx_from = nullptr;       // set once it is restored (the server's request line says so)
             if (fetched && from_disk > std::max({resume, slot_tokens, parked.tokens})) {
                 // straight to the cards, not through the cache: its K/V are views into the file (no RAM copy), so
                 // this works with parking off too (low RAM)
                 incoming = std::move(fetched);
+                incoming_src = "disk";
                 incoming_tokens = from_disk;
                 incoming_live = strata::core::conversation_prefix(incoming->live, ids, req_imgs) == from_disk;
             } else if (parked.tokens > std::max(resume, slot_tokens)) {
                 if (sdir) sdir->claim(conversations.shared(parked.index).get());   // its write, if any, first
                 incoming.emplace(conversations.take(parked.index));
+                incoming_src = "ram";
                 incoming_tokens = parked.tokens;
                 incoming_live = parked.live;
             }
@@ -9558,6 +9564,7 @@ int main(int argc, char** argv) {
                 cvec_cached = incoming->cvec;
                 resume = incoming_tokens;
                 from_live = incoming_live;
+                ctx_from = incoming_src;
                 // a mapped image's K/V are read-only views: they are not kept for the next park to write into
                 const bool mapped = !incoming->kv.empty() && incoming->kv.front().k.external();
                 if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr && !mapped) {
@@ -9583,6 +9590,11 @@ int main(int argc, char** argv) {
                              return (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
                          }), checks.end());
             live_ok = false;   // until this request has finished, the session is in between
+            // where this prompt's context came from - restored from disk / a RAM-parked image, still held by the GPU,
+            // or none (read from scratch) - for the server's request line
+            std::printf("INFO ctx_source=%s ctx_reused=%lld ctx_prompt=%lld\n",
+                        ctx_from ? ctx_from : resume > 0 ? "gpu" : "none", (long long) resume, (long long) n);
+            std::fflush(stdout);
             // the elastic K/V: the outgoing session is parked and this request rewrites every cell from `resume` on,
             // so cells past this prompt's are no longer anyone's - far more than it needs go back to the cache
             if (kvg.on) {
@@ -11395,6 +11407,7 @@ int main(int argc, char** argv) {
                              remote_experts[(size_t) r].ms_wait() - wait_before[(size_t) r]);
         }
         if (sdir) {   // --session-dir: the active conversation too, then everything queued, before the engine ends
+            sdir->begin_exit();
             park_current(0);
             sdir->flush();
             std::fprintf(stderr, "strata serve: session dir: %zu file(s), %llu MiB on disk at exit\n", sdir->files(),
