@@ -560,11 +560,17 @@ def human_bytes(n: int) -> str:
     return f"{n} B"
 
 
+def article(n: int) -> str:
+    """ "an" before a number spoken with a vowel sound (8, 11, 18, 80-89, 800-899, 8,000, 11,000, 18,000, ...)"""
+    head = f"{n:,}".split(",")[0]
+    return "an" if head.startswith("8") or head in ("11", "18") else "a"
+
+
 def session_event_text(f: dict, state: dict | None) -> str | None:
     """--session-dir: one engine event (sess_event=... key=value fields) as a line for people."""
     what, why = f.get("sess_event"), f.get("sess_why", "")
     tokens, size, ms = int(f.get("sess_tokens") or 0), int(f.get("sess_bytes") or 0), float(f.get("sess_ms") or 0)
-    conv = f"a {tokens:,}-token conversation"
+    conv = f"{article(tokens)} {tokens:,}-token conversation"
     took = f"{human_bytes(size)}, {ms / 1000:.1f} s"
     if what == "opened":
         n = (state or {}).get("files")

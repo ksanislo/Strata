@@ -516,6 +516,9 @@ class SessionNotes(unittest.TestCase):
         self.assertEqual(context_text({"source": "none", "reused": 0, "prompt": 500}), ", context: none reused, 500 read")
         # anything else stays a protocol line
         self.assertFalse(e._session_note("INFO context=262144 kv=int8\n"))
+        from serve.server import article
+        self.assertEqual([article(n) for n in (8628, 11000, 18500, 187275, 1500, 80, 800, 2000, 169011)],
+                         ["an", "an", "an", "a", "a", "an", "an", "a", "a"])
 
     def test_status_shows_the_folder(self):
         tok = ByteTokenizer()
