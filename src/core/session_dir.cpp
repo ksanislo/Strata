@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <random>
 #include <system_error>
@@ -93,7 +94,10 @@ void SessionDir::open() {
         std::string err;
         if (!session_file_peek(e.path, o_.id, e.peek, err)) {
             say("drop " + e.path + " (" + err + ")");
+            const uint64_t sz = (uint64_t) fs::file_size(de.path(), ec);
             fs::remove(de.path(), ec);
+            std::lock_guard<std::mutex> lk(mu_);
+            note_locked("deleted", 0, ec ? 0 : sz, 0, "foreign");
             continue;
         }
         const auto ft = de.last_write_time(ec);
@@ -110,6 +114,8 @@ void SessionDir::open() {
     uint64_t total = 0;
     for (const auto& e : entries_) total += e.peek.bytes;
     say(std::to_string(entries_.size()) + " conversation file(s), " + std::to_string(total >> 20) + " MiB in " + o_.dir);
+    note_locked("opened", 0, total, 0, "start");
+    state_locked();
     writer_ = std::thread([this] { writer_loop(); });
 }
 
@@ -193,6 +199,7 @@ void SessionDir::writer_loop() {
             add_written_locked(path, *job.image, written, s, "wrote");
         } else {
             say("write failed: " + err);
+            note_locked("write_failed", job.image->live.ids.size(), 0, s * 1000.0, "error");
         }
         job.image.reset();   // an image evicted from the cache meanwhile is freed here, outside the cache's budget
         cv_.notify_all();
@@ -220,8 +227,11 @@ void SessionDir::add_written_locked(const std::string& path, const SavedConversa
     std::snprintf(b, sizeof b, "%s %zu tokens, %zu MiB in %.1f s (%zu older file(s) of it dropped)", what,
                   image.live.ids.size(), written >> 20, s, dropped);
     say(b);
+    note_locked("wrote", image.live.ids.size(), written, s * 1000.0,
+                exiting_ ? "exit" : std::strcmp(what, "wrote") == 0 ? "background" : "direct");
     entries_.push_back(std::move(e));
     enforce_caps_locked();
+    state_locked();
 }
 
 bool SessionDir::write_now(const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
@@ -235,8 +245,12 @@ bool SessionDir::write_now(const SavedConversation& meta, const std::vector<Sess
     const bool ok = meta.stage_images.empty() ? session_file_write(path, meta, kv, o_.id, bytes, error, wo, &st)
                                               : session_file_write(path, meta, kv, stage_kv, o_.id, bytes, error, wo, &st);
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    if (!ok) { say("write failed: " + error); return false; }
     std::lock_guard<std::mutex> lk(mu_);
+    if (!ok) {
+        say("write failed: " + error);
+        note_locked("write_failed", meta.live.ids.size(), 0, s * 1000.0, "error");
+        return false;
+    }
     add_written_locked(path, meta, bytes, s, "wrote (directly, low RAM)", chain);
     return true;
 }
@@ -271,6 +285,7 @@ void SessionDir::preload_loop() {
                 std::snprintf(b, sizeof b, "preloaded %zu tokens in %.1f s", image.live.ids.size(), s);
                 say(b);
                 ready_.push_back({path, std::move(image)});
+                state_locked();
             } else {
                 say("preload failed: " + err);
                 drop_entry_locked(i, "unreadable");
@@ -360,6 +375,12 @@ std::optional<SavedConversation> SessionDir::fetch(const std::vector<int32_t>& i
             char b[160];
             std::snprintf(b, sizeof b, "read %zu tokens for this request in %.1f s", image.live.ids.size(), s);
             say(b);
+            {   // (the folder's lock is held again here)
+                uint64_t sz = 0;
+                for (const auto& x : entries_) if (x.path == path) sz = x.peek.bytes;
+                note_locked("read", image.live.ids.size(), sz, s * 1000.0, "request");
+                state_locked();
+            }
             tokens = best_t;
             return image;
         }
@@ -375,8 +396,46 @@ bool SessionDir::read_file(const std::string& path, SavedConversation& image, st
 void SessionDir::drop_entry_locked(size_t i, const char* why) {
     std::error_code ec;
     fs::remove(entries_[i].path, ec);
+    const char* key = std::strstr(why, "superseded") ? "superseded" : std::strstr(why, "age") ? "age"
+                    : std::strstr(why, "least recently") ? "lru" : std::strstr(why, "unreadable") ? "unreadable" : "other";
+    note_locked("deleted", entries_[i].peek.live.ids.size(), entries_[i].peek.bytes, 0, key);
     say(std::string("deleted ") + fs::path(entries_[i].path).filename().string() + " (" + why + ")");
     entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
+}
+
+void SessionDir::note_locked(const char* what, uint64_t tokens, uint64_t bytes, double ms, const char* why) {
+    if (!o_.event) return;
+    char b[256];
+    std::snprintf(b, sizeof b, "sess_event=%s sess_tokens=%llu sess_bytes=%llu sess_ms=%.0f sess_why=%s", what,
+                  (unsigned long long) tokens, (unsigned long long) bytes, ms, why);
+    o_.event(b);
+}
+
+void SessionDir::state_locked() {
+    if (!o_.event) return;
+    std::vector<const Entry*> order;
+    for (const auto& e : entries_) order.push_back(&e);
+    std::sort(order.begin(), order.end(), [](const Entry* a, const Entry* b) { return a->seq > b->seq; });
+    uint64_t total = 0;
+    for (const auto& e : entries_) total += e.peek.bytes;
+    std::string j = "sess_json={\"files\":" + std::to_string(entries_.size()) + ",\"bytes\":" + std::to_string(total) +
+                    ",\"max_bytes\":" + std::to_string(o_.max_bytes) + ",\"max_files\":" + std::to_string(o_.max_files) +
+                    ",\"max_age_days\":" + std::to_string(o_.max_age.count() / 24) + ",\"conversations\":[";
+    for (size_t i = 0; i < order.size(); ++i) {
+        const Entry& e = *order[i];
+        const long long used = (long long) std::chrono::duration_cast<std::chrono::seconds>(e.used.time_since_epoch()).count();
+        j += (i ? "," : "");
+        j += "{\"tokens\":" + std::to_string(e.peek.live.ids.size()) + ",\"bytes\":" + std::to_string(e.peek.bytes) +
+             ",\"last_used\":" + std::to_string(used) + ",\"state\":\"" +
+             (e.state == State::loading ? "reading" : e.state == State::preloaded ? "in_ram" : "on_disk") + "\"}";
+    }
+    j += "]}";
+    o_.event(j);
+}
+
+void SessionDir::begin_exit() {
+    std::lock_guard<std::mutex> lk(mu_);
+    exiting_ = true;
 }
 
 void SessionDir::touch_locked(Entry& e) {
