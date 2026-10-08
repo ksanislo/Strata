@@ -96,7 +96,9 @@ void SessionDir::open() {
             fs::remove(de.path(), ec);
             continue;
         }
-        found.emplace_back(de.last_write_time(ec), std::move(e));
+        const auto ft = de.last_write_time(ec);
+        e.used = std::chrono::time_point_cast<std::chrono::system_clock::duration>(std::chrono::file_clock::to_sys(ft));
+        found.emplace_back(ft, std::move(e));
     }
     std::sort(found.begin(), found.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
     std::lock_guard<std::mutex> lk(mu_);
@@ -203,6 +205,7 @@ void SessionDir::add_written_locked(const std::string& path, const SavedConversa
     e.path = path;
     e.peek = peek_of(image, written);
     e.seq = ++seq_;
+    e.used = std::chrono::system_clock::now();
     size_t dropped = 0;
     for (size_t i = 0; i < entries_.size();) {
         if (entries_[i].state != State::loading &&
@@ -324,7 +327,7 @@ std::optional<SavedConversation> SessionDir::fetch(const std::vector<int32_t>& i
                 SavedConversation out = std::move(ready_[r].image);
                 ready_.erase(ready_.begin() + (std::ptrdiff_t) r);
                 e.state = State::idle;
-                e.seq = ++seq_;
+                touch_locked(e);
                 tokens = best_t;
                 return out;
             }
@@ -345,7 +348,7 @@ std::optional<SavedConversation> SessionDir::fetch(const std::vector<int32_t>& i
             if (entries_[i].path != path) continue;
             if (ok) {
                 entries_[i].state = State::idle;
-                entries_[i].seq = ++seq_;
+                touch_locked(entries_[i]);
             } else {
                 say("read failed: " + err);
                 drop_entry_locked(i, "unreadable");
@@ -376,7 +379,19 @@ void SessionDir::drop_entry_locked(size_t i, const char* why) {
     entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
 }
 
+void SessionDir::touch_locked(Entry& e) {
+    e.seq = ++seq_;
+    e.used = std::chrono::system_clock::now();
+    std::error_code ec;
+    fs::last_write_time(e.path, fs::file_time_type::clock::now(), ec);   // recency survives a restart
+}
+
 void SessionDir::enforce_caps_locked() {
+    const auto cutoff = std::chrono::system_clock::now() - o_.max_age;
+    for (size_t i = 0; i < entries_.size();) {
+        if (entries_[i].state == State::idle && entries_[i].used < cutoff) drop_entry_locked(i, "not used for the folder's age limit");
+        else ++i;
+    }
     for (;;) {
         uint64_t total = 0;
         for (const auto& e : entries_) total += e.peek.bytes;
@@ -386,7 +401,7 @@ void SessionDir::enforce_caps_locked() {
             if (entries_[i].state == State::idle && (oldest == entries_.size() || entries_[i].seq < entries_[oldest].seq))
                 oldest = i;
         if (oldest == entries_.size()) return;   // everything left is being read: next time
-        drop_entry_locked(oldest, "over the folder's cap");
+        drop_entry_locked(oldest, "least recently used, over the folder's cap");
     }
 }
 
