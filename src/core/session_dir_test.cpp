@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -246,6 +247,37 @@ int main() {
         SessionDir sd2(aged);
         sd2.open();
         check(session_files(dir) == n - 1 && !fs::exists(newest), "max_age: an 8-day-old file is deleted, the rest kept");
+    }
+    // the server's notes: an event per write / read / deletion (with its reason) and the folder's state as JSON
+    {
+        std::vector<std::string> notes;
+        std::mutex nm;
+        SessionDir::Options o = opts(dir, id);
+        o.event = [&](const std::string& m) { std::lock_guard<std::mutex> lk(nm); notes.push_back(m); };
+        SessionDir sd(o);
+        sd.open();
+        const auto q = tokens(180000, 3000);
+        sd.write(std::make_shared<SavedConversation>(conv(q, 15)));
+        sd.flush();
+        auto q2 = q; for (int32_t t : tokens(181000, 200)) q2.push_back(t);
+        sd.write(std::make_shared<SavedConversation>(conv(q2, 16)));
+        sd.flush();
+        auto pq = q2; pq.push_back(1);
+        int64_t t = 0;
+        check(sd.fetch(pq, {}, false, 0, t).has_value(), "notes: fetch for the read event");
+        std::lock_guard<std::mutex> lk(nm);
+        auto has = [&](const char* a, const char* b = nullptr) {
+            for (const auto& n : notes) if (n.find(a) != std::string::npos && (!b || n.find(b) != std::string::npos)) return true;
+            return false;
+        };
+        check(has("sess_event=opened"), "notes: opened");
+        check(has("sess_event=wrote sess_tokens=3000", "sess_why=background"), "notes: a background write");
+        check(has("sess_event=deleted", "sess_why=superseded"), "notes: the older copy replaced");
+        check(has("sess_event=read sess_tokens=3200", "sess_why=request"), "notes: a read for a request");
+        const std::string& last = notes.back();
+        check(last.rfind("sess_json={\"files\":", 0) == 0 && last.find(' ') == std::string::npos &&
+              last.find("\"conversations\":[{\"tokens\":3200") != std::string::npos,
+              "notes: the state JSON, most recent first, no spaces");
     }
     // supersedes(): the rules on their own
     {
