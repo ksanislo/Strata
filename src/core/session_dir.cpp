@@ -36,9 +36,7 @@ SessionPeek peek_of(const SavedConversation& image, uint64_t bytes) {
     bool aligned = !image.checkpoints.empty();
     for (const auto& st : image.stage_images) aligned = aligned && st.checkpoints.size() == image.checkpoints.size();
     if (aligned) {
-        const ConversationCheckpoint* deepest = nullptr;
-        for (const auto& c : image.checkpoints)
-            if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
+        const ConversationCheckpoint* deepest = session_deepest_checkpoint(image.checkpoints);   // the file's one
         p.deepest.ids = deepest->ids;
         p.deepest.imgs = deepest->imgs;
     }
