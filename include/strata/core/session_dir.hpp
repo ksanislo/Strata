@@ -38,6 +38,10 @@ public:
         std::chrono::milliseconds write_delay{30000};   // a parked image is written this long after it was parked
         uint64_t min_free_bytes = 4ull << 30;  // a write is refused when the disk would keep less than this free
         std::function<void(const std::string&)> log;
+        // machine-readable notes for the server, one line each (no newline): an event
+        // ("sess_event=<what> sess_tokens=N sess_bytes=B sess_ms=T sess_why=<why>") and, after every change, the
+        // folder's state as JSON ("sess_json={...}", no spaces).  Called with the folder's lock held.
+        std::function<void(const std::string&)> event;
     };
     explicit SessionDir(Options o);
     ~SessionDir();                             // stops the preload, writes every queued image, then stops
@@ -66,6 +70,8 @@ public:
     // while the preload reads it).  nullopt when none beats it, or the read failed (logged; the file is deleted).
     std::optional<SavedConversation> fetch(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs,
                                            bool cvec, int64_t beat, int64_t& tokens);
+    // The engine is quitting: writes from here on are labelled as the shutdown's.
+    void begin_exit();
     // Write every queued image now and wait until they are on disk.
     void flush();
     size_t files() const;
@@ -101,6 +107,8 @@ private:
     bool read_file(const std::string& path, SavedConversation& image, std::string& error) const;
     void drop_entry_locked(size_t i, const char* why);
     void touch_locked(Entry& e);
+    void note_locked(const char* what, uint64_t tokens, uint64_t bytes, double ms, const char* why);
+    void state_locked();
     void enforce_caps_locked();
     int64_t match(const Entry& e, const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs,
                   bool cvec) const;
@@ -114,7 +122,7 @@ private:
     const SavedConversation* writing_ = nullptr;
     uint64_t seq_ = 0, preloaded_bytes_ = 0;
     size_t preloaded_files_ = 0;
-    bool stop_ = false, flushing_ = false, fetching_ = false;
+    bool stop_ = false, flushing_ = false, fetching_ = false, exiting_ = false;
     std::thread writer_, preloader_;
 };
 
