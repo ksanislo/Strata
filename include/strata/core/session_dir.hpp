@@ -28,8 +28,11 @@ public:
         std::string dir;
         SessionFileIdentity id;
         SessionReadLimits limits;              // this runtime's bounds (its stages included); admit = RAM preflight
-        size_t max_files = 8;                  // the oldest files beyond these caps are deleted
+        // the least recently used files go first when the folder is over max_bytes (or, a safety net, max_files);
+        // a file not written or resumed for max_age goes in any case
+        size_t max_files = 64;
         uint64_t max_bytes = 64ull << 30;
+        std::chrono::hours max_age{24 * 7};
         uint64_t preload_bytes = 0;            // the background preload stops before this many bytes (0: no preload)
         size_t preload_files = 0;
         std::chrono::milliseconds write_delay{30000};   // a parked image is written this long after it was parked
@@ -78,6 +81,7 @@ private:
         std::string path;
         SessionPeek peek;
         uint64_t seq = 0;                      // recency: higher is newer
+        std::chrono::system_clock::time_point used;   // last written or resumed (the file's mtime across restarts)
         State state = State::idle;
     };
     struct Job {
@@ -96,6 +100,7 @@ private:
     void preload_loop();
     bool read_file(const std::string& path, SavedConversation& image, std::string& error) const;
     void drop_entry_locked(size_t i, const char* why);
+    void touch_locked(Entry& e);
     void enforce_caps_locked();
     int64_t match(const Entry& e, const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs,
                   bool cvec) const;
