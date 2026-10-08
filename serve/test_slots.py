@@ -486,3 +486,48 @@ class Autosave(unittest.TestCase):
         self.svc.session_autosave = None
         self.svc.autosave("save")
         self.assertEqual(self.sent(), [])
+
+
+class SessionNotes(unittest.TestCase):
+    """--session-dir: the engine's INFO notes become /status's "sessions", plain log lines and the request line's
+    context note; other INFO lines are left to the protocol."""
+
+    def setUp(self):
+        self.engine = FakeEngine()
+
+    def test_state_event_and_context(self):
+        import contextlib, io
+        from serve.server import context_text
+        e = self.engine
+        self.assertTrue(e._session_note('INFO sess_json={"files":2,"bytes":3000000000,"max_bytes":68719476736,'
+                                        '"max_files":64,"max_age_days":7,"conversations":[]}\n'))
+        self.assertEqual(e.sessions["files"], 2)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertTrue(e._session_note("INFO sess_event=wrote sess_tokens=187275 sess_bytes=2959000000 "
+                                            "sess_ms=4100 sess_why=exit\n"))
+            self.assertTrue(e._session_note("INFO sess_event=deleted sess_tokens=900 sess_bytes=230000000 "
+                                            "sess_ms=0 sess_why=age\n"))
+        text = out.getvalue()
+        self.assertIn("[strata] sessions: saved a 187,275-token conversation to disk on shutdown (2.96 GB, 4.1 s)", text)
+        self.assertIn("removed a 900-token conversation unused for 7 days (230 MB)", text)
+        self.assertTrue(e._session_note("INFO ctx_source=disk ctx_reused=169011 ctx_prompt=170071\n"))
+        self.assertEqual(context_text(e.last_ctx), ", context: 169,011 tokens from disk, 1,060 new")
+        self.assertEqual(context_text({"source": "none", "reused": 0, "prompt": 500}), ", context: none reused, 500 read")
+        # anything else stays a protocol line
+        self.assertFalse(e._session_note("INFO context=262144 kv=int8\n"))
+
+    def test_status_shows_the_folder(self):
+        tok = ByteTokenizer()
+        svc = Service(self.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        try:
+            self.engine._session_note('INFO sess_json={"files":1,"bytes":5,"conversations":[{"tokens":3,"bytes":5,'
+                                      '"last_used":1,"state":"on_disk"}]}\n')
+            with urllib.request.urlopen(f"http://127.0.0.1:{httpd.server_address[1]}/status") as r:
+                body = json.loads(r.read())
+            self.assertEqual(body["sessions"]["files"], 1)
+            self.assertEqual(body["sessions"]["conversations"][0]["state"], "on_disk")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
