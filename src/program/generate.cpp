@@ -591,7 +591,7 @@ struct Options {
     int prompt_cache = 6;
     int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
     std::string session_dir;            // --session-dir: parked conversations persisted, one file each (session_dir.hpp)
-    int64_t session_dir_files = 8, session_dir_gib = 64;
+    int64_t session_dir_files = 64, session_dir_gib = 64, session_dir_days = 7;
     double session_dir_delay_s = 30.0;
     int64_t session_dir_preload_mib = 0;   // 0: lazy - a file is read only when a request continues it
     int conversation_cache_slots = 4;
@@ -746,7 +746,9 @@ void usage() {
                  "                       back when a request continues one (only the headers and token ids are read\n"
                  "                       at the start); --session-dir-preload MIB also reads files in the background\n"
                  "                       after the start, newest first, up to MIB (default 0 = lazy only).\n"
-                 "                       --session-dir-files N / --session-dir-gib G cap the folder (8 / 64).\n"
+                 "                       The least recently used files (written or resumed) go first when the folder\n"
+                 "                       is over --session-dir-gib G (64) or --session-dir-files N (64); a file unused\n"
+                 "                       for --session-dir-days D (7) goes in any case.\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking or restoring a\n"
                  "                       session file (default 2560)\n"
@@ -1847,6 +1849,7 @@ int main(int argc, char** argv) {
         else if (a == "--session-dir") o.session_dir = next("--session-dir");
         else if (a == "--session-dir-files") o.session_dir_files = std::max(1LL, std::atoll(next("--session-dir-files")));
         else if (a == "--session-dir-gib") o.session_dir_gib = std::max(1LL, std::atoll(next("--session-dir-gib")));
+        else if (a == "--session-dir-days") o.session_dir_days = std::max(1LL, std::atoll(next("--session-dir-days")));
         else if (a == "--session-dir-delay") o.session_dir_delay_s = std::max(0.0, std::atof(next("--session-dir-delay")));
         else if (a == "--session-dir-preload") o.session_dir_preload_mib = std::max(0LL, std::atoll(next("--session-dir-preload")));
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
@@ -8750,6 +8753,7 @@ int main(int argc, char** argv) {
                 so.dir = o.session_dir;
                 so.max_files = (size_t) o.session_dir_files;
                 so.max_bytes = (uint64_t) o.session_dir_gib << 30;
+                so.max_age = std::chrono::hours(24 * o.session_dir_days);
                 // the background preload (opt-in): never more than the cache's budget
                 so.preload_bytes = (uint64_t) std::min(o.session_dir_preload_mib, o.conversation_cache_mib) << 20;
                 so.preload_files = (size_t) o.conversation_cache_slots;
