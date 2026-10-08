@@ -160,10 +160,12 @@ int main() {
         sd.open();
         sd.write(std::make_shared<SavedConversation>(conv(tokens(90000, 1000), 5)));
         sd.flush();
-        check(sd.files() == 2 && session_files(dir) == 2, "max_files drops the oldest");
+        check(sd.files() == 2 && session_files(dir) == 2, "max_files drops the least recently used");
         int64_t t = 0;
+        auto pb = b; pb.push_back(1);
+        check(!sd.fetch(pb, {}, false, 0, t), "the dropped one was B: written after A, but A was RESUMED since");
         auto p = a2v; p.push_back(1);
-        check(!sd.fetch(p, {}, false, 0, t), "the dropped one was the oldest (A)");
+        check(sd.fetch(p, {}, false, 0, t).has_value(), "A, resumed most recently before the new one, is kept");
     }
     // a restart: the index comes back from the folder, the preload reads the newest first
     {
@@ -179,7 +181,7 @@ int main() {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             pre = sd.take_preloaded();
         }
-        check(pre.size() == 1 && pre[0].live.ids == tokens(90000, 1000), "preload: the newest file, within its budget");
+        check(pre.size() == 1 && pre[0].live.ids == a2v, "preload: the most recently used file (A, resumed last), within its budget");
     }
     // a file of another identity is deleted at open
     {
@@ -226,6 +228,24 @@ int main() {
         auto got = sd.fetch(p, {}, false, 0, t);
         check(got && got->live.ids == full.live.ids && got->kv.size() == 1 && got->kv[0].k.external() &&
               got->kv[0].k == full.kv[0].k, "write_now: fetched back as a mapped view with the same K/V");
+    }
+    // age: a file not written or resumed for max_age is deleted at open
+    {
+        SessionDir::Options o = opts(dir, id);
+        SessionDir sd(o);
+        sd.open();
+        sd.write(std::make_shared<SavedConversation>(conv(tokens(170000, 2000), 14)));
+        sd.flush();
+        fs::path newest;
+        for (const auto& e : fs::directory_iterator(dir))
+            if (newest.empty() || fs::last_write_time(e.path()) > fs::last_write_time(newest)) newest = e.path();
+        fs::last_write_time(newest, fs::file_time_type::clock::now() - std::chrono::hours(24 * 8));
+        const size_t n = session_files(dir);
+        SessionDir::Options aged = opts(dir, id);
+        aged.max_age = std::chrono::hours(24 * 7);
+        SessionDir sd2(aged);
+        sd2.open();
+        check(session_files(dir) == n - 1 && !fs::exists(newest), "max_age: an 8-day-old file is deleted, the rest kept");
     }
     // supersedes(): the rules on their own
     {
