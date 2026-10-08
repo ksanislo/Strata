@@ -200,14 +200,15 @@ void SessionDir::writer_loop() {
 }
 
 void SessionDir::add_written_locked(const std::string& path, const SavedConversation& image, size_t written, double s,
-                                    const char* what) {
+                                    const char* what, const std::vector<ConversationCheckpoint>* chain) {
     Entry e;
     e.path = path;
     e.peek = peek_of(image, written);
     e.seq = ++seq_;
     size_t dropped = 0;
     for (size_t i = 0; i < entries_.size();) {
-        if (entries_[i].state != State::loading && supersedes(image.live, image.checkpoints, entries_[i].peek)) {
+        if (entries_[i].state != State::loading &&
+            supersedes(image.live, chain ? *chain : image.checkpoints, entries_[i].peek)) {
             drop_entry_locked(i, "superseded");
             ++dropped;
         } else {
@@ -223,7 +224,8 @@ void SessionDir::add_written_locked(const std::string& path, const SavedConversa
 }
 
 bool SessionDir::write_now(const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
-                           const std::vector<std::vector<SessionKvSource>>& stage_kv, size_t& bytes, std::string& error) {
+                           const std::vector<std::vector<SessionKvSource>>& stage_kv, size_t& bytes, std::string& error,
+                           const std::vector<ConversationCheckpoint>* chain) {
     const std::string path = (fs::path(o_.dir) / random_name()).string();
     SessionWriteOptions wo;
     wo.min_free_bytes = o_.min_free_bytes;
@@ -234,7 +236,7 @@ bool SessionDir::write_now(const SavedConversation& meta, const std::vector<Sess
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     if (!ok) { say("write failed: " + error); return false; }
     std::lock_guard<std::mutex> lk(mu_);
-    add_written_locked(path, meta, bytes, s, "wrote (directly, low RAM)");
+    add_written_locked(path, meta, bytes, s, "wrote (directly, low RAM)", chain);
     return true;
 }
 
