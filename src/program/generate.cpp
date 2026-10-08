@@ -9151,8 +9151,12 @@ int main(int argc, char** argv) {
         // --session-dir when parking is off or refuses (low RAM): the active conversation straight from the device and
         // the pinned K/V pool into a session file - the deepest checkpoint and the running state are the only host
         // copies.  On the request's path (it is what lets a low-RAM machine switch conversations without losing one).
+        // set by a request around its park: the prompt continues this same conversation from a checkpoint near its end
+        // (the client re-rendered the last reply) - parking keeps that old tail in RAM cheaply, a synchronous disk
+        // write of the whole conversation for it is not worth it; a real switch resumes far earlier (or not at all)
+        bool spill_skip_rewind = false;
         auto spill_current = [&]() {
-            if (!sdir || !live_ok || live.empty()) return;
+            if (!sdir || !live_ok || live.empty() || spill_skip_rewind) return;
             std::string e;
             try {
                 const size_t n_st = stages.size();
@@ -9194,7 +9198,7 @@ int main(int argc, char** argv) {
                     stage_sources.push_back(std::move(ps));
                 }
                 size_t bytes = 0;
-                sdir->write_now(meta, sources, stage_sources, bytes, e);   // logs its own result
+                sdir->write_now(meta, sources, stage_sources, bytes, e, &checks);   // logs its own result
             } catch (const std::bad_alloc&) {
                 std::fprintf(stderr, "strata serve: session dir: spill skipped (allocation failed)\n");
             }
@@ -12647,6 +12651,11 @@ int main(int argc, char** argv) {
                                          : 0;
             const bool park_worth = o.conversation_cache_park_gain <= 0 || park_held == 0 ||
                                     (int64_t) live.size() >= (int64_t) park_held + o.conversation_cache_park_gain;
+            // --session-dir's direct write (parking off or refused): not for a rewind of this same conversation, whose
+            // prompt resumes within its last 4096 tokens - only its rewritten tail would be lost, not the conversation
+            spill_skip_rewind = !incoming && !borrow && slot_source < 0 && resume > 0 &&
+                                (int64_t) live.size() - resume <= 4096;
+            bool park_ok = true;
             if (borrow && !pin_sibling && park_worth) {
                 conversations.guard(parked.serial);   // parking the outgoing conversation must not evict the donor
                 const bool parked_ok = park_current(0);
@@ -12662,15 +12671,22 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: conversation cache: no room beside the parked conversation "
                                          "this request starts with; taking it instead of borrowing\n");
                     borrow = false;
-                    if (const size_t at = conversations.index_of(parked.serial); at != SIZE_MAX)
+                    if (const size_t at = conversations.index_of(parked.serial); at != SIZE_MAX) {
+                        if (sdir) sdir->claim(conversations.shared(at).get());
                         incoming.emplace(conversations.take(at));
+                        incoming_tokens = parked.tokens;
+                        incoming_live = parked.live;
+                    }
                     if (!park_current(incoming ? incoming->bytes() : 0)) {
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
                     }
                 }
-            } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth &&
-                       !park_current(incoming ? incoming->bytes() : 0)) {
+            } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth) {
+                park_ok = park_current(incoming ? incoming->bytes() : 0);
+            }
+            spill_skip_rewind = false;
+            if (!park_ok) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
