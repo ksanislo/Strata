@@ -1035,8 +1035,11 @@ geometry and layer range before any state array, and every count against the byt
 limits (context and cells, checkpoints, layers, each running-state array, each K/V part) before allocating it, the payload hash
 and then the usual snapshot validation - all before any device write, and a refusal leaves the current session as it
 was. A transfer failure after the device writes began ends the engine (`FATAL`) rather than decode from a partial
-state; the server reports `500` and starts it again. A restore does not park the outgoing session. Not supported with
-`--layer-split`, `--peer-device`, `--batch` (the config's `"parallel"`, #465; the server answers `501`) or
+state; the server reports `500` and starts it again. A restore does not park the outgoing session. With `--layer-split`
+the file is format v2: v1's payload for the first stage, then the count of later stages (u64) and each one's payload in the
+same encoding, the draft layer's K/V with the last stage. A v2 file is read only by a runtime with the same number of
+stages, each stage against its own bounds, and every stage image is validated on its GPU before any device write. A
+single-GPU file is still v1, byte for byte. Not supported with `--peer-device`, `--batch` (the config's `"parallel"`, #465; the server answers `501`) or
 `--prompt-cache 0` (the RAM conversation cache need not be on). On Linux the file
 moves with `O_DIRECT` in 16 MiB blocks when the filesystem takes it (buffered I/O otherwise, or with
 `STRATA_SESSION_BUFFERED=1`); on Windows with buffered I/O. The engine has been run on Linux/CUDA only. An earlier
