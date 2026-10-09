@@ -821,7 +821,7 @@ class StrataEngine:
                     self.silent_note = "Unrecoverable native verification failure: " + line[4:].strip()
                     self.ended = True
                 try:
-                    proc.terminate()
+                    proc.kill()                 # the engine ignores SIGTERM in --serve
                 except OSError:
                     pass
                 break                           # publish EOF, never the trailing DONE
@@ -1832,7 +1832,8 @@ class StrataEngine:
 
     def close(self):
         """End the engine process: QUIT first (the engine frees its memory itself - unpinning tens of GB can take
-        a while), then terminate, then kill, each given 20 s.  Raises EngineStuck when it still runs after all three."""
+        a while), then kill, each given 20 s (the engine ignores SIGTERM in --serve, so there is no terminate step).
+        Raises EngineStuck when it still runs after both."""
         if self.proc is None:
             return
         try:
@@ -1841,10 +1842,9 @@ class StrataEngine:
                     self.proc.stdin.write("QUIT\n")
                     self.proc.stdin.flush()
                     self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
-                    self.proc.wait(timeout=20)
-                except (OSError, ValueError, subprocess.TimeoutExpired):
-                    self.proc.terminate()
-                    self.proc.wait(timeout=20)
+                except (OSError, ValueError):
+                    pass                            # stdin already gone: the engine is ending on its own
+                self.proc.wait(timeout=20)
         except subprocess.TimeoutExpired:
             self.proc.kill()
             try:
@@ -5963,7 +5963,15 @@ def main() -> int:
     # #96: docker stop sends SIGTERM, which Python ignores by default, so the container's PID 1 would be killed after
     # the grace period with the engine still running. SIGTERM takes Ctrl+C's path below (QUIT to the engine).
     # SIGINT keeps Python's own handler, so Ctrl+C and a second Ctrl+C work as before.
+    # Only the FIRST SIGTERM stops the server: systemd signals every process of a service at once and a proxy
+    # (llama-swap) then sends its own stop, so a second SIGTERM must not take the "Ctrl+C again" path that kills the
+    # engine mid-QUIT (it may be saving a conversation then).  A second Ctrl+C still does.
+    stopping = [False]
+
     def on_sigterm(signum, frame):
+        if stopping[0]:
+            return
+        stopping[0] = True
         raise KeyboardInterrupt
     try:
         signal.signal(signal.SIGTERM, on_sigterm)

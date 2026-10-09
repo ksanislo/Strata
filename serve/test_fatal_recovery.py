@@ -86,11 +86,11 @@ class FatalRecovery(unittest.TestCase):
         import queue
         class P:
             stdout=iter(lines)
-            terminated=False
-            def terminate(self):self.terminated=True
+            killed=False
+            def kill(self):self.killed=True     # the engine ignores SIGTERM in --serve
         old=e.proc;e.proc=P();e.lines=queue.Queue();e.slot_q=[queue.Queue() for _ in range(slots)];e.ended=False
         e._pump()
-        self.assertTrue(e.ended);self.assertTrue(e.proc.terminated)
+        self.assertTrue(e.ended);self.assertTrue(e.proc.killed)
         self.assertIsNone(e.lines.get_nowait());self.assertTrue(e.lines.empty())   # EOF, never the trailing DONE
         e.proc=old
     def test_fatal_lines_are_checked_before_batch_routing(self):
