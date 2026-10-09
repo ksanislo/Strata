@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -204,7 +205,7 @@ public:
     // the longest parked conversation, in tokens (--kv-grow keeps the K/V that long while it could be restored)
     int64_t longest_tokens() const {
         int64_t n = 0;
-        for (const auto& e : entries_) n = std::max<int64_t>(n, (int64_t) e.live.ids.size());
+        for (const auto& e : entries_) n = std::max<int64_t>(n, (int64_t) e->live.ids.size());
         return n;
     }
 
@@ -236,7 +237,7 @@ public:
         // Ties prefer the most recently parked branch. The caller prefers its
         // already-active state when that offers the same prefix length.
         for (size_t i = entries_.size(); i-- > 0;) {
-            const auto& e = entries_[i];
+            const auto& e = *entries_[i];
             if (e.cvec != cvec) continue;
             auto consider = [&](const ConversationCheckpoint& c, bool live) {
                 const int64_t n = conversation_prefix(c, prompt, images);
@@ -248,12 +249,16 @@ public:
         return best;
     }
 
+    // The caller makes sure nobody else reads the entry (a session-file writer holding it is waited for first).
     SavedConversation take(size_t index) {
-        SavedConversation out = std::move(entries_.at(index));
-        bytes_ -= out.bytes();
+        std::shared_ptr<SavedConversation> e = entries_.at(index);
+        bytes_ -= e->bytes();
         entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
-        return out;
+        return std::move(*e);
     }
+    // Shared access for a background reader (session files): an entry evicted meanwhile stays alive while held.
+    std::shared_ptr<const SavedConversation> shared(size_t index) const { return entries_.at(index); }
+    std::shared_ptr<const SavedConversation> newest() const { return entries_.empty() ? nullptr : entries_.back(); }
 
     // Reserve before allocating a snapshot. held is an incoming image removed
     // with take() but still alive during the exchange; count it against RAM too.
@@ -275,9 +280,10 @@ public:
     // to the kernel at once - the next admission check reads it back from /proc/meminfo.
     // False when none can go (empty, or only entries that hold a pinned shared prefix are left).
     bool evict_oldest() {
-        auto victim = std::find_if(entries_.begin(), entries_.end(), [](const SavedConversation& e) { return !e.pinned(); });
+        auto victim = std::find_if(entries_.begin(), entries_.end(),
+                                   [](const std::shared_ptr<SavedConversation>& e) { return !e->pinned(); });
         if (victim == entries_.end()) return false;
-        bytes_ -= victim->bytes();
+        bytes_ -= (*victim)->bytes();
         entries_.erase(victim);
         ++evictions_;
         return true;
@@ -303,7 +309,7 @@ public:
         };
         size_t dropped = 0;
         for (size_t i = 0; i < entries_.size();) {
-            const auto& e = entries_[i];
+            const auto& e = *entries_[i];
             const ConversationCheckpoint* deepest = nullptr;
             for (const auto& c : e.checkpoints)
                 if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
@@ -325,14 +331,14 @@ public:
         if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
         drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
         if (!make_room(n, held)) return false;
-        entries_.push_back(std::move(image));
+        entries_.push_back(std::make_shared<SavedConversation>(std::move(image)));
         bytes_ += n;
         return true;
     }
 
 private:
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0;
-    std::deque<SavedConversation> entries_; // least recently active first
+    std::deque<std::shared_ptr<SavedConversation>> entries_; // least recently active first
     ConversationKvReuse reuse_;
 };
 

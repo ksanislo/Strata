@@ -568,6 +568,66 @@ FATAL_PREFIXES = ("ERR verify: timed out at layer ", "ERR verify batch: timed ou
                   "ERR verify: an earlier window never finished", "ERR verify batch: an earlier window never finished")
 
 
+def human_bytes(n: int) -> str:
+    """1536 -> "1.5 KB" ... 2959000000 -> "2.96 GB" (decimal, as disks are sold)"""
+    for unit, size in (("GB", 1e9), ("MB", 1e6), ("KB", 1e3)):
+        if n >= size:
+            return f"{n / size:.{2 if n < 10 * size else 1 if n < 100 * size else 0}f} {unit}"
+    return f"{n} B"
+
+
+def article(n: int) -> str:
+    """ "an" before a number spoken with a vowel sound (8, 11, 18, 80-89, 800-899, 8,000, 11,000, 18,000, ...)"""
+    head = f"{n:,}".split(",")[0]
+    return "an" if head.startswith("8") or head in ("11", "18") else "a"
+
+
+def session_event_text(f: dict, state: dict | None) -> str | None:
+    """--session-dir: one engine event (sess_event=... key=value fields) as a line for people."""
+    what, why = f.get("sess_event"), f.get("sess_why", "")
+    tokens, size, ms = int(f.get("sess_tokens") or 0), int(f.get("sess_bytes") or 0), float(f.get("sess_ms") or 0)
+    conv = f"{article(tokens)} {tokens:,}-token conversation"
+    took = f"{human_bytes(size)}, {ms / 1000:.1f} s"
+    if what == "opened":
+        n = (state or {}).get("files")
+        return f"{n if n is not None else 'the'} saved conversation{'' if n == 1 else 's'}, {human_bytes(size)} on disk"
+    if what == "wrote":
+        where = {"exit": "on shutdown", "direct": "straight from the GPU (no RAM to park it)",
+                 "background": "in the background"}.get(why, "")
+        return f"saved {conv} to disk {where} ({took})".replace("  ", " ")
+    if what == "read":
+        return f"reading {conv} back from disk ({took})"
+    if what == "parked":
+        return f"parked {conv} in RAM ({took})"
+    if what == "restored":
+        if why == "disk":
+            return f"switched to {conv} from disk ({ms / 1000:.1f} s onto the GPU)"
+        return f"switched to {conv} parked in RAM ({ms / 1000:.1f} s)"
+    if what == "write_failed":
+        return f"could not save {conv} (see the engine log)"
+    if what == "deleted":
+        cap = state or {}
+        reasons = {"superseded": f"replaced an older copy of {conv}",
+                   "age": f"removed {conv} unused for {cap.get('max_age_days', '?')} days",
+                   "lru": f"removed the least recently used conversation ({tokens:,} tokens) to stay under "
+                          f"{human_bytes(cap.get('max_bytes', 0))}",
+                   "foreign": "removed a file saved by another model or other settings",
+                   "unreadable": "removed an unreadable conversation file"}
+        return f"{reasons.get(why, f'removed {conv}')} ({human_bytes(size)})"
+    return None
+
+
+def context_text(ctx: dict | None) -> str:
+    """The request line's note on where the prompt's context came from (--session-dir / parking)."""
+    if not ctx:
+        return ""
+    src, reused, prompt = ctx.get("source"), ctx.get("reused", 0), ctx.get("prompt", 0)
+    new = max(0, prompt - reused)
+    where = {"disk": "from disk", "ram": "from RAM (parked)", "gpu": "already on the GPU"}.get(src)
+    return f", context: {reused:,} tokens {where}, {new:,} new" if where and reused else \
+           f", context: none reused, {new:,} read"
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -650,7 +710,7 @@ class StrataEngine:
         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
         # stays for _pump (one reader at a time)
         ready_q: queue.Queue = queue.Queue()
-        threading.Thread(target=self._ready_pump, args=(self.proc, ready_q), daemon=True).start()
+        threading.Thread(target=self._ready_pump, args=(self.proc, ready_q, self._session_note), daemon=True).start()
         ready_deadline = None if ENGINE_READY_S is None else time.monotonic() + ENGINE_READY_S
         timed_out = False
         while True:
@@ -751,6 +811,8 @@ class StrataEngine:
         slot_q = self.slot_q
         line = None
         for line in proc.stdout:
+            if line.startswith("INFO ") and self._session_note(line):
+                continue                                # a session note: shown and kept, never an answer
             # checked before batch routing: a fatal line is never a slot's own
             if line.startswith(FATAL_PREFIXES):
                 # release_gpu_waits invalidates the verifier, even if the native
@@ -777,6 +839,33 @@ class StrataEngine:
         lines.put(None)
         for q in slot_q:
             q.put(None)
+
+    # --session-dir (engine notes on its stdout, from any of its threads): the folder's state for /status, the last
+    # request's context source for the request line, and one plain line per event in the server's output
+    sessions = None
+    last_ctx = None
+
+    def _session_note(self, line: str) -> bool:
+        body = line[5:].strip()
+        if body.startswith("sess_json="):
+            try:
+                self.sessions = json.loads(body[len("sess_json="):])
+            except ValueError:
+                pass
+            return True
+        if not body.startswith(("sess_event=", "ctx_source=")):
+            return False
+        f = dict(kv.partition("=")[::2] for kv in body.split())
+        if "ctx_source" in f:
+            self.last_ctx = {"source": f.get("ctx_source"), "reused": int(f.get("ctx_reused") or 0),
+                             "prompt": int(f.get("ctx_prompt") or 0), "at": time.time()}
+            if self.last_ctx["source"] == "none" and self.last_ctx["prompt"] > 0:   # nothing to bring back in
+                print(f"[strata] sessions: new conversation, {self.last_ctx['prompt']:,} tokens to read", flush=True)
+            return True
+        msg = session_event_text(f, self.sessions)
+        if msg:
+            print(f"[strata] sessions: {msg}", flush=True)
+        return True
 
     def death_note(self) -> str:
         """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
@@ -827,11 +916,13 @@ class StrataEngine:
     RESTART_RETRY_S = 15.0   # between the tries of restart(): a dying engine's VRAM may take a while to come back
 
     @staticmethod
-    def _ready_pump(proc, out: queue.Queue) -> None:
+    def _ready_pump(proc, out: queue.Queue, note=None) -> None:
         """The engine's first lines up to READY, for a read that can time out; None when its output closed first."""
         done = False
         try:
             for line in proc.stdout:
+                if note is not None and line.startswith("INFO ") and note(line):
+                    continue                            # a session note: shown and kept, never an answer
                 out.put(line)
                 if line.startswith("READY"):
                     done = True
@@ -3724,8 +3815,10 @@ class Service:
                             hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
                             if hit_msg and pcie_share:
                                 hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
+                            ctx = getattr(self.engine, "last_ctx", None)
+                            ctx_msg = context_text(ctx) if ctx and ctx.get("at", 0) >= st.get("started", now) - 1 else ""
                             print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
-                                  f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
+                                  f"({finish}, cancel={cancel.is_set()}){hit_msg}{ctx_msg}", flush=True)
                             if finish == "length" and parser.state in ("reasoning", "rcall"):   # #530
                                 print("[strata] the reply reached max tokens while still thinking, so it has no "
                                       "answer: a thinking budget (reasoning_budget_tokens, in the request or in "
@@ -4545,6 +4638,8 @@ def make_handler(svc: Service):
                         s["tokens_per_s_mean"] = round(svc._tok_s_mean(), 1)
                 for k in ("started", "first_token"):
                     s.pop(k, None)
+                if getattr(svc.engine, "sessions", None) is not None:   # --session-dir: the saved conversations
+                    s["sessions"] = svc.engine.sessions
                 self._json(200, s)
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
