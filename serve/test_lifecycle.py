@@ -72,11 +72,10 @@ class Lifecycle(unittest.TestCase):
                 self.assertTrue(engine.ended)
                 self.assertIsNone(engine.progress)
                 self.assertEqual(engine.last, {})
+                proc.terminate.assert_not_called()      # the engine ignores SIGTERM in --serve
                 if running:
-                    proc.terminate.assert_called_once()
                     proc.wait.assert_called_once_with(timeout=20)
                 else:
-                    proc.terminate.assert_not_called()
                     proc.wait.assert_not_called()
                 proc.kill.assert_not_called()
                 engine.close()                          # repeated cleanup is harmless
@@ -102,11 +101,11 @@ class Lifecycle(unittest.TestCase):
         with self.assertRaisesRegex(EngineStuck, "still releasing"):
             engine.close()
         self.assertIs(engine.proc, proc)
-        proc.terminate.assert_called_once()
+        proc.terminate.assert_not_called()
         proc.kill.assert_called_once()
 
-    def test_close_terminates_before_it_kills(self):
-        # an engine that does not end on QUIT is terminated first (as the unload always did); kill is the last resort
+    def test_close_kills_an_engine_that_does_not_end_on_quit(self):
+        # the engine ignores SIGTERM in --serve, so there is no terminate step: QUIT, then kill
         engine = StrataEngine("missing-executable", [], lazy=True)
         proc = mock.Mock()
         proc.stdin, proc.stdout = io.StringIO(), io.StringIO()
@@ -114,8 +113,8 @@ class Lifecycle(unittest.TestCase):
         proc.wait.side_effect = [subprocess.TimeoutExpired("engine", 20), 0]
         engine.proc = proc
         engine.close()
-        proc.terminate.assert_called_once()
-        proc.kill.assert_not_called()
+        proc.terminate.assert_not_called()
+        proc.kill.assert_called_once()
         self.assertIsNone(engine.proc)
 
     def test_native_lazy_constructor_does_not_start_a_process(self):

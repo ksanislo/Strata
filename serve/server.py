@@ -759,7 +759,7 @@ class StrataEngine:
                     self.silent_note = "Unrecoverable native verification failure: " + line[4:].strip()
                     self.ended = True
                 try:
-                    proc.terminate()
+                    proc.kill()                 # the engine ignores SIGTERM in --serve
                 except OSError:
                     pass
                 break                           # publish EOF, never the trailing DONE
@@ -1741,7 +1741,8 @@ class StrataEngine:
 
     def close(self):
         """End the engine process: QUIT first (the engine frees its memory itself - unpinning tens of GB can take
-        a while), then terminate, then kill, each given 20 s.  Raises EngineStuck when it still runs after all three."""
+        a while), then kill, each given 20 s (the engine ignores SIGTERM in --serve, so there is no terminate step).
+        Raises EngineStuck when it still runs after both."""
         if self.proc is None:
             return
         try:
@@ -1750,10 +1751,9 @@ class StrataEngine:
                     self.proc.stdin.write("QUIT\n")
                     self.proc.stdin.flush()
                     self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
-                    self.proc.wait(timeout=20)
-                except (OSError, ValueError, subprocess.TimeoutExpired):
-                    self.proc.terminate()
-                    self.proc.wait(timeout=20)
+                except (OSError, ValueError):
+                    pass                            # stdin already gone: the engine is ending on its own
+                self.proc.wait(timeout=20)
         except subprocess.TimeoutExpired:
             self.proc.kill()
             try:
