@@ -1175,7 +1175,7 @@ class StrataEngine:
                     self.silent_note = "Unrecoverable native verification failure: " + line[4:].strip()
                     self.ended = True
                 try:
-                    proc.terminate()
+                    proc.kill()                 # the engine ignores SIGTERM in --serve
                 except OSError:
                     pass
                 break                           # publish EOF, never the trailing DONE
