@@ -25,6 +25,10 @@ models:
 
 - `exec` makes the Python server the process llama-swap stops. On llama-swap's stop (SIGTERM) the server stops its engine:
   in our test the engine was gone and the V100's memory freed within 2 s.
+- The engine itself ignores SIGTERM and SIGINT while it serves, so a stop that signals every process of the service at
+  once (systemd, Ctrl+C in a terminal) does not end it before the server's orderly stop; it ends on the server's
+  `QUIT`, when its stdin closes, or on SIGKILL. A second SIGTERM during the server's shutdown (systemd and llama-swap
+  both sending one) is ignored; a second Ctrl+C still kills the engine at once.
 - `checkEndpoint: /health` -- Strata's `/health` answers only once the model is loaded. Measured load time on our machine
   (model files on a SATA SSD): 80 s, 105 s while another download was using the disk.
 - If other models share the GPU, put them in a llama-swap group or let swapping unload them; Strata needs the card's
