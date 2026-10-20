@@ -11707,7 +11707,7 @@ int main(int argc, char** argv) {
             if (why.empty()) {
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                 so.limits.admit = [floor](uint64_t need, std::string& w) {
-                    const auto avail = strata::core::conversation_available_memory();
+                    const auto avail = strata::core::available_host_bytes();
                     if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
                     w = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB needed)";
                     return false;
