@@ -20,6 +20,8 @@
 #include <utility>
 #include <vector>
 
+#include "strata/platform/numa.hpp"
+
 namespace strata::core {
 
 enum class PageBacking { LargePages, NormalPages, PinnedByCuda };
@@ -42,6 +44,8 @@ inline std::atomic<bool>& arena_uma_no_register_flag() {
 /// STRATA_ARENA_PIN_GIB to a number (STRATA_ARENA_PIN_GIB=0 registers the whole arena as before).
 bool arena_no_register();
 
+/// STRATA_NUMA_PLACE: spans (arena offsets) the next anonymous arena binds to their nodes before it registers (used once).
+void pinned_arena_numa_plan(std::vector<strata::platform::NumaSpan> spans);
 struct PinnedArena {
     void* base = nullptr;
     uint64_t capacity = 0;
