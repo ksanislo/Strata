@@ -352,6 +352,25 @@ one cold 64K prompt joining four streams: `STRATA_BATCH_DECODE_SHARE=2.0` 2.4 s 
 s and 13.8 s. Pieces of one chunk (`PIECE=8192`) cost the long prompt the most. Not measured: other GPU pairs, three or
 more stages, HIP and SYCL (built for CUDA only), sampled decoding, prompts with pictures.
 
+## One CPU pool and doorbell thread per stage (experimental, opt-in)
+
+`STRATA_STAGE_SERVE=1` (Linux, a layer split on separate GPUs) gives every stage its own expert pool on the cores of
+the NUMA node its GPU hangs off (sysfs: the card's `numa_node`, the node's `cpulist`) and its own expert dispatch, so
+two stages never share the pool's scratch and nothing is re-pointed per layer. A node's physical cores, minus the host
+thread's core, are cut between the stages on it by their layers, at least one each: the first core of a share runs the
+stage's service thread, the rest are its pool's workers (the start-up log prints each stage's line). `--pool-workers N`
+caps the workers of all stages together, split by layers; the service threads are not counted.
+
+- With pipelined groups (`--batch-groups` > 1) each stage's service thread serves that stage's doorbells for good (the
+  `STRATA_PIPED_CONCURRENT` doorbell thread is not started); the host thread only launches the windows and polls them
+  (the 20 s timeout and the "never rang" check stay there). Between windows a service thread spins 20 ms, then sleeps
+  until the next launch wakes it.
+- The other verify windows (the serial decode, a slot's first token, `--batch-groups 1`, `--pipeline-windows`) still
+  serve their doorbells on the host thread, one stage after another, but each stage's layers run on that stage's pool.
+- The prompt path keeps the engine's own pool.
+- Off (with a log line) beside what also keeps `STRATA_PIPED_CONCURRENT` off, the routing-aware prefetch, a peer
+  device, `--dump-routing`, `--no-pool` and `--split-device 0`. Not measured yet.
+
 ## The VRAM expert tier keeps adapting in batch windows
 
 Batch windows count which experts they route to, and every `--adapt-every` windows (default 4) the engine swaps the
