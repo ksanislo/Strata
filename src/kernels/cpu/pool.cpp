@@ -685,8 +685,15 @@ void restore_thread_affinity(const ThreadAffinity& previous) {
 
 namespace {
 std::atomic<const ExpertPool*> g_diag_pool{nullptr};
+constexpr int kStagePools = 16;
+std::atomic<const ExpertPool*> g_stage_pools[kStagePools];   // STRATA_STAGE_SERVE: one per stage
 void diag_active_pool(std::FILE* f) {
     if (const ExpertPool* p = g_diag_pool.load()) p->diag(f);
+    for (int i = 0; i < kStagePools; ++i)
+        if (const ExpertPool* p = g_stage_pools[i].load()) {
+            std::fprintf(f, "  stage pool %d:\n", i);
+            p->diag(f);
+        }
 }
 int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
@@ -845,14 +852,7 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     plan_cores_ = wplan.cores;
     plan_logical_ = plan_in.logical;
     if (n_ < 1) n_ = 1;
-    scratch_.resize((size_t) n_);
-    wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
-    for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
-    hstate_ms_.store(now_ms());
-    g_diag_pool.store(this);
-    strata::core::diag_pool_fn().store(&diag_active_pool);
-    split_.resize((size_t) kMaxSplit);
-    split_multi_.resize((size_t) kMaxSplitMulti);
+    prepare(false);
     // STRATA_NUMA_SPLIT: decided here, before any worker starts (a worker counts into its slice's `parked` from its
     // first instruction), and never revised.  Unset: the plan stays empty and nothing below runs.
     NumaSplitPlan plan;
@@ -920,9 +920,39 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     }
     g_numa_plan = std::move(plan);
     g_numa_owner = this;
+    start_workers(pin, topo_.worker_cores);
+}
+
+ExpertPool::ExpertPool(const std::vector<int>& cores, bool host_works, int tasks)
+    : tasks_(tasks), host_works_(host_works) {
+    if (tasks < 0 || tasks > kMaxTasks) throw std::invalid_argument("expert pool tasks must be in 0..4096");
+    if (const char* e = std::getenv("STRATA_POOL_SPIN_US"))
+        spin_before_sleep_ = std::chrono::microseconds((std::max)(0, std::atoi(e)));
+    n_ = (std::max)(1, (int) cores.size());
+    // no NUMA split and no g_numa_plan: a stage pool's cores sit on one node, the plan stays the engine pool's
+    prepare(true);
+    start_workers(true, cores);
+}
+
+void ExpertPool::prepare(bool stage) {
+    scratch_.resize((size_t) n_);
+    wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
+    for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
+    hstate_ms_.store(now_ms());
+    if (!stage) g_diag_pool.store(this);
+    for (int i = 0; stage && i < kStagePools && stage_slot_ < 0; ++i) {
+        const ExpertPool* none = nullptr;
+        if (g_stage_pools[i].compare_exchange_strong(none, this)) stage_slot_ = i;
+    }
+    strata::core::diag_pool_fn().store(&diag_active_pool);
+    split_.resize((size_t) kMaxSplit);
+    split_multi_.resize((size_t) kMaxSplitMulti);
+}
+
+void ExpertPool::start_workers(bool pin, const std::vector<int>& cores) {
     threads_.reserve((size_t) n_);
     for (int i = 0; i < n_; ++i) {
-        const int core = pin ? (i < (int) topo_.worker_cores.size() ? topo_.worker_cores[(size_t) i] : -1) : -1;
+        const int core = pin ? (i < (int) cores.size() ? cores[(size_t) i] : -1) : -1;
         threads_.emplace_back([this, i, core] {
             strata::platform::name_this_thread("strata-pool", i);
             strata::aux_cpus::note_owned_thread();   // --aux-cpus never moves a worker
@@ -952,6 +982,7 @@ ExpertPool::~ExpertPool() {
         g_numa_plan = NumaSplitPlan{};
         g_numa_owner = nullptr;
     }
+    if (stage_slot_ >= 0) g_stage_pools[stage_slot_].store(nullptr);
     stop_.store(true, std::memory_order_release);
     // Bump the epoch so a PARKED worker notices the stop flag rather than sleeping through it.
     publish();

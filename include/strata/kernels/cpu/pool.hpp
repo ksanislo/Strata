@@ -198,6 +198,9 @@ public:
     /// asserted - the counter it moves is `pool phases ... drain`, which is host-side and needs no profiler.
     explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true,
                         PoolAffinity affinity = PoolAffinity::All, int tasks = 0);
+    /// STRATA_STAGE_SERVE: one worker per CPU of `cores`, pinned there (a layer-split stage's share of its NUMA node).
+    /// Construct it on the thread that will call `run`, already on that node: the scratch is touched here first.
+    ExpertPool(const std::vector<int>& cores, bool host_works, int tasks);
     /// Batched row phases: 0 keeps three tasks per participating thread; explicit counts are capped by rows.
     static constexpr int kMaxTasks = 4096;
     /// The watchdog's view of the pool (issue #31): the batch, the counters, every thread's state.
@@ -284,6 +287,8 @@ public:
     static constexpr std::chrono::seconds kStall{60};
 
 private:
+    void prepare(bool stage);
+    void start_workers(bool pin, const std::vector<int>& cores);
     int phase_tasks(int64_t rows) const;
     int tasks_ = 0;
     void worker(int id);
@@ -411,6 +416,7 @@ private:
     std::string numa_counters() const;
     PoolAffinity affinity_ = PoolAffinity::All;
     CpuTopology topo_;
+    int stage_slot_ = -1;   // STRATA_STAGE_SERVE: its place in the watchdog's list of stage pools
 };
 
 }  // namespace strata::kernels::cpu
