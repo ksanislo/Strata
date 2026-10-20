@@ -189,6 +189,15 @@ int elastic_slots_mode() {
     }();
     return m;
 }
+// STRATA_ELASTIC_SLOTS_GIVE=1 (with STRATA_ELASTIC_SLOTS=1): when a card's slot budget runs short, that card's expert cache
+// gives the slots room from below its prompt loan, and takes it back when the slots let it go
+bool elastic_give_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_ELASTIC_SLOTS_GIVE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
+}
 int64_t elastic_slots_env(const char* name, int64_t dflt) {
     const char* v = std::getenv(name);
     return v != nullptr && std::atoll(v) > 0 ? std::atoll(v) : dflt;
@@ -5304,6 +5313,8 @@ int main(int argc, char** argv) {
             }
             o.batch = fit;
             resolve_groups_auto();   // (the slots that fit may not be the ones asked for)
+            // the caches open after this: in VMM, so each can hand whole chunks to its card's slot budget
+            if (elastic_give_env() && elastic_slots_mode() == 2) strata::core::ExpertCache::set_vmm(true);
             if (o.batch_groups > 1 && o.batch % o.batch_groups != 0) o.batch_groups = 1;
             // the sessions' VRAM is the expert cache's: say what it costs (docs/BATCHING.md has the measured trade)
             std::fprintf(stderr, "strata generate: --batch %d: the slot sessions take %.2f GiB of VRAM on CUDA0 that the "
@@ -11139,17 +11150,6 @@ int main(int argc, char** argv) {
             return false;
         }();
         auto eslot_dev = [&](size_t k) { return k == 0 ? 0 : stages[k - 1]->dev; };
-        auto slot_fit = [&](int b, int64_t need, bool trim) -> bool {
-            const int64_t target = strata::core::slot_grow_target(need, eslot_step, o.max_context);
-            for (size_t k = 0; k < bslot_ss.size(); ++k) {
-                strata::core::SessionState& u = *bslot_ss[k][(size_t) b];
-                if (u.slot_cells < 0 || (!trim && need <= u.slot_cells)) continue;
-                const strata::core::OnDevice on_k(eslot_dev(k));
-                if (!strata::core::session_slot_fit(u, target, trim) && !strata::core::session_slot_fit(u, need, false))
-                    return false;
-            }
-            return true;
-        };
         // per card: MiB the slot's elastic arrays hold, and the budget's free MiB
         auto slot_mem_note = [&](int b) {
             std::string r;
@@ -11165,6 +11165,286 @@ int main(int argc, char** argv) {
             }
             return r;
         };
+        // ---- STRATA_ELASTIC_SLOTS_GIVE: per card, the expert cache gives the slot budget whole chunks from the slots
+        // just below its prompt loan when the slots need them, and takes them back when the slots let them go (kvg_ensure
+        // and kvg_trim, for one stage's cache, its layers and its own residency table).  Only on a quiet card: no window
+        // in flight there, no prompt chunk being read (the prompt path's loan sits above `top` and never reaches below).
+        struct Give {
+            strata::core::ExpertCache* cache = nullptr;
+            int dev = 0;
+            int64_t lb = 0, le = 0;
+            int32_t* dres = nullptr;
+            std::vector<std::pair<int32_t, int32_t>> prof;   // the card's layers' share of the profile, hottest first
+            int64_t top = 0, lo = 0;                          // slots [lo, top) hold no expert
+            int64_t gives = 0, backs = 0, evicted = 0, moved = 0, refilled = 0;
+        };
+        std::vector<Give> gv;
+        const int64_t give_floor = 128;
+        const bool give_on = [&] {
+            if (!elastic_give_env() || !eslots_on) return false;
+            const char* why = srcp != &arena_src ? "the experts are not all in the RAM arena"
+                            : ajob ? "--adapt-async is on"
+                            : o.prefill_head_alias ? "--prefill-head-alias is on"
+                            : d_res == nullptr || host_res.empty() ? "there is no residency table"
+                            : nullptr;
+            for (size_t k = 0; why == nullptr && k < bslot_ss.size(); ++k) {
+                strata::core::ExpertCache& xc = k == 0 ? xcache : stages[k - 1]->cache;
+                if (xc.vmm_range() == nullptr || xc.segmented()) why = "an expert cache is not in VMM";
+            }
+            if (why != nullptr) {
+                std::fprintf(stderr, "strata batch: STRATA_ELASTIC_SLOTS_GIVE is off: %s\n", why);
+                return false;
+            }
+            for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                Give v;
+                v.cache = k == 0 ? &xcache : &stages[k - 1]->cache;
+                v.dev = eslot_dev(k);
+                v.lb = k == 0 ? 0 : stages[k - 1]->lb;
+                v.le = k == 0 ? (multi_gpu ? split_at[0] : g.n_layers) : stages[k - 1]->le;
+                v.dres = k == 0 ? d_res : stages[k - 1]->d_res;
+                if (k == 0) {
+                    for (const auto& pr : profile) if (pr.first >= v.lb && pr.first < v.le) v.prof.push_back(pr);
+                } else {
+                    v.prof = stages[k - 1]->profile;
+                }
+                v.top = v.cache->slots();
+                for (const PfPart& p : pf_parts)
+                    if (p.cache == v.cache && p.first >= 0) v.top = std::min<int64_t>(v.top, p.first);
+                v.lo = v.top;
+                std::fprintf(stderr, "strata batch: elastic slots on CUDA%d: the expert cache (%lld slots) gives the slots "
+                                     "room below slot %lld when its budget runs short\n", v.dev,
+                             (long long) v.cache->slots(), (long long) v.top);
+                gv.push_back(std::move(v));
+            }
+            return true;
+        }();
+        // the slots a loan may not reach into on this cache (its whole size without giving)
+        auto give_top = [&](const strata::core::ExpertCache* xc) -> int64_t {
+            for (const Give& v : gv) if (v.cache == xc) return v.top;
+            return 0;
+        };
+        // the residency rows of card k's layers to its own table (no other card reads them)
+        auto give_upload = [&](const Give& v) -> bool {
+            const size_t a = (size_t) v.lb * (size_t) g.n_expert, n = (size_t) (v.le - v.lb) * (size_t) g.n_expert;
+            if (cudaMemcpy(v.dres + a, host_res.data() + a, n * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess ||
+                cudaStreamSynchronize(nullptr) != cudaSuccess) {
+                std::fprintf(stderr, "strata: elastic slots: the residency table upload failed on CUDA%d: %s\n", v.dev,
+                             cudaGetErrorString(cudaGetLastError()));
+                return false;
+            }
+            return true;
+        };
+        // card k's cache gives its budget at least `need` chunks (fewer when it is at its floor); the card is quiet
+        auto give = [&](size_t k, int64_t need) -> int64_t {
+            Give& v = gv[k];
+            strata::core::ExpertCache& xc = *v.cache;
+            strata::core::VmmRange& r = *xc.vmm_range();
+            const uint64_t G = r.granularity();
+            const strata::core::OnDevice on(v.dev);
+            apply_pending(true);   // a swap still copying could write a slot given up here
+            if (cudaDeviceSynchronize() != cudaSuccess) return 0;
+            auto freeable = [&]() -> int64_t {   // mapped chunks wholly inside [lo, top): a chunk a live slot shares stays
+                const int64_t c0 = (int64_t) ((xc.slot_offset(v.lo) + G - 1) / G), c1 = (int64_t) (xc.slot_offset(v.top) / G);
+                int64_t n = 0;
+                for (int64_t c = c0; c < c1; ++c) n += r.mapped(c) ? 1 : 0;
+                return n;
+            };
+            const size_t i0 = (size_t) v.lb * (size_t) g.n_expert, i1 = (size_t) v.le * (size_t) g.n_expert;
+            std::vector<int32_t> owner, rank;
+            std::vector<std::pair<float, int32_t>> cold;   // the loan region's residents, hottest first
+            auto heat = [&](int32_t i) -> float {
+                const float u = drive.d.usage.empty() ? 0.0f : drive.d.usage[(size_t) i];
+                return u * 1048576.0f - (float) rank[(size_t) i];
+            };
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            int64_t gave = 0, moved = 0;
+            std::vector<int32_t> out;   // experts evicted
+            while (freeable() < need && v.lo > give_floor) {
+                if (owner.empty()) {
+                    owner.assign((size_t) xc.slots(), -1);
+                    for (size_t i = i0; i < i1; ++i)
+                        if (host_res[i] >= 0 && host_res[i] < xc.slots()) owner[(size_t) host_res[i]] = (int32_t) i;
+                    rank.assign(host_res.size(), (int32_t) v.prof.size());
+                    for (size_t q = 0; q < v.prof.size(); ++q)
+                        rank[(size_t) v.prof[q].first * (size_t) g.n_expert + (size_t) v.prof[q].second] = (int32_t) q;
+                    for (size_t i = i0; i < i1; ++i)
+                        if (host_res[i] >= v.top && host_res[i] < xc.slots()) cold.emplace_back(heat((int32_t) i), (int32_t) i);
+                    std::sort(cold.begin(), cold.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                }
+                --v.lo;
+                ++gave;
+                const int32_t oi = owner[(size_t) v.lo];
+                if (oi < 0) continue;
+                const int64_t layer = oi / g.n_expert;
+                int32_t vi = -1;
+                if (!cold.empty() && cold.back().first < heat(oi)) {   // a hotter expert takes the coldest one's slot
+                    vi = cold.back().second;
+                    const int32_t vs = host_res[(size_t) vi];
+                    if (xc.slot_room(vs) < lay.blob_bytes(layer) ||
+                        cudaMemcpy(xc.device_slot(vs), xc.device_slot((int32_t) v.lo), (size_t) lay.blob_bytes(layer),
+                                   cudaMemcpyDeviceToDevice) != cudaSuccess)
+                        vi = -1;
+                    else {
+                        cold.pop_back();
+                        host_res[(size_t) oi] = vs;
+                        host_res[(size_t) vi] = strata::core::kNotResident;
+                        out.push_back(vi);
+                        ++moved;
+                    }
+                }
+                if (vi < 0) {
+                    host_res[(size_t) oi] = strata::core::kNotResident;
+                    out.push_back(oi);
+                }
+                ++v.evicted;
+            }
+            // the moves still read the slots given up: they land before a chunk is unmapped
+            if (gave > 0 && cudaDeviceSynchronize() != cudaSuccess) {
+                std::fprintf(stderr, "strata: elastic slots: moving experts failed on CUDA%d: %s\n", v.dev,
+                             cudaGetErrorString(cudaGetLastError()));
+                return 0;
+            }
+            if (gave > 0 && !give_upload(v)) return 0;
+            int64_t given = 0;
+            const int64_t c0 = (int64_t) ((xc.slot_offset(v.lo) + G - 1) / G), c1 = (int64_t) (xc.slot_offset(v.top) / G);
+            for (int64_t c = c0; c < c1; ++c)
+                if (r.mapped(c))
+                    if (const strata::core::VmmChunk h = r.unmap(c)) {
+                        strata::core::qsa_slot_budget_give(v.dev, h);
+                        ++given;
+                    }
+            for (const int32_t i : out) srcp->prefetch((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);
+            ++v.gives;
+            v.moved += moved;
+            std::fprintf(stderr, "strata batch: elastic slots: CUDA%d's expert cache gives %lld MiB to the slots (%lld slots, "
+                                 "%lld hotter experts moved to colder ones' slots); %lld of %lld slots hold experts\n",
+                         v.dev, (long long) (given * (int64_t) G >> 20), (long long) gave, (long long) moved,
+                         (long long) (v.lo + (xc.slots() - v.top)), (long long) xc.slots());
+            return given;
+        };
+        // card k's cache takes up to `n` free budget chunks back and refills the slots they complete with its layers'
+        // hottest experts the card does not hold; the card is quiet and nothing of its cache is lent
+        auto take_back = [&](size_t k, int64_t n) -> bool {
+            Give& v = gv[k];
+            strata::core::ExpertCache& xc = *v.cache;
+            if (n <= 0 || v.lo >= v.top) return true;
+            strata::core::VmmRange& r = *xc.vmm_range();
+            const uint64_t G = r.granularity();
+            const strata::core::OnDevice on(v.dev);
+            apply_pending(true);
+            if (cudaDeviceSynchronize() != cudaSuccess) return false;
+            const int64_t c0 = (int64_t) (xc.slot_offset(v.lo) / G), c1 = (int64_t) (xc.slot_offset(v.top) / G);
+            int64_t holes = 0;
+            for (int64_t c = c0; c < c1; ++c) holes += r.mapped(c) ? 0 : 1;
+            std::vector<strata::core::VmmChunk> got;
+            strata::core::qsa_slot_budget_take(v.dev, std::min(n, holes), got);
+            int64_t cend = c0, want = (int64_t) got.size();   // one run from the lowest hole, as many holes as chunks taken
+            while (cend < c1 && want > 0) want -= r.mapped(cend++) ? 0 : 1;
+            size_t gi = 0;
+            const bool mapped = r.map_range(c0, cend, [&]() -> strata::core::VmmChunk { return gi < got.size() ? got[gi++] : 0; });
+            for (; gi < got.size(); ++gi) strata::core::qsa_slot_budget_give(v.dev, got[gi]);   // (not used)
+            if (!mapped) std::fprintf(stderr, "strata: elastic slots: CUDA%d's expert cache could not map its chunks back\n", v.dev);
+            const int64_t lo0 = v.lo;
+            while (v.lo < v.top) {   // a slot whose chunks are all mapped again holds an expert again
+                const int64_t a = (int64_t) (xc.slot_offset(v.lo) / G), b = (int64_t) ((xc.slot_offset(v.lo + 1) + G - 1) / G);
+                bool all = true;
+                for (int64_t c = a; c < b && all; ++c) all = r.mapped(c);
+                if (!all) break;
+                ++v.lo;
+            }
+            const auto& lay = strata::kernels::cpu::expert_layout();
+            std::vector<std::pair<size_t, int32_t>> filled;
+            size_t pi = 0;
+            for (int64_t s = lo0; s < v.lo; ++s) {
+                const uint64_t room = xc.slot_room((int32_t) s);
+                for (; pi < v.prof.size(); ++pi) {
+                    const int32_t l = v.prof[pi].first, e = v.prof[pi].second;
+                    const size_t i = (size_t) l * (size_t) g.n_expert + (size_t) e;
+                    if (host_res[i] >= 0 || lay.blob_bytes(l) > room) continue;
+                    const uint8_t* b = srcp->blob_stable(l, e);
+                    if (b == nullptr) continue;
+                    cudaMemcpyAsync(xc.device_slot((int32_t) s), b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, nullptr);
+                    filled.emplace_back(i, (int32_t) s);
+                    ++pi;
+                    break;
+                }
+            }
+            if (cudaDeviceSynchronize() != cudaSuccess) {
+                std::fprintf(stderr, "strata: elastic slots: refilling CUDA%d's expert cache failed: %s\n", v.dev,
+                             cudaGetErrorString(cudaGetLastError()));
+                return false;
+            }
+            for (const auto& [i, s] : filled) host_res[i] = s;
+            if (!filled.empty() && !give_upload(v)) return false;
+            ++v.backs;
+            v.refilled += (int64_t) filled.size();
+            std::fprintf(stderr, "strata batch: elastic slots: CUDA%d's expert cache takes %lld MiB back, %lld slots refilled "
+                                 "from the profile; %lld of %lld slots hold experts\n", v.dev,
+                         (long long) ((int64_t) got.size() * (int64_t) G >> 20), (long long) filled.size(),
+                         (long long) (v.lo + (xc.slots() - v.top)), (long long) xc.slots());
+            return true;
+        };
+        // slot b's sessions on every stage backed for `need` cells - whole steps past it, else just `need`.  `trim` gives
+        // back first what that does not need: only with no window in flight.  `quiet(k)`: card k may give now.
+        // 0: backed; 1: no memory; 2: card k's cache could give but is busy (try again when it is quiet)
+        auto slot_fit = [&](int b, int64_t need, bool trim, const std::function<bool(size_t)>& quiet) -> int {
+            const int64_t target = strata::core::slot_grow_target(need, eslot_step, o.max_context);
+            for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                strata::core::SessionState& u = *bslot_ss[k][(size_t) b];
+                if (u.slot_cells < 0 || (!trim && need <= u.slot_cells)) continue;
+                const strata::core::OnDevice on_k(eslot_dev(k));
+                if (strata::core::session_slot_fit(u, target, trim) || strata::core::session_slot_fit(u, need, false))
+                    continue;
+                if (!give_on || gv[k].lo <= give_floor) return 1;
+                if (!quiet(k)) return 2;
+                int64_t fr = 0;
+                strata::core::qsa_slot_budget_chunks(eslot_dev(k), &fr, nullptr);
+                give(k, std::max<int64_t>(strata::core::session_slot_need(u, target) - fr, 16));
+                if (strata::core::session_slot_fit(u, target, false) || strata::core::session_slot_fit(u, need, false))
+                    continue;
+                return 1;
+            }
+            return 0;
+        };
+        const std::function<bool(size_t)> all_quiet = [](size_t) { return true; };
+        // the chunks card k's decoding slots need for their next step (what its budget keeps free)
+        auto slots_low_water = [&](size_t k) -> int64_t {
+            int64_t n = 0;
+            for (size_t b = 0; b < bs.size(); ++b)
+                if (bs[b].active)
+                    n += strata::core::session_slot_need(*bslot_ss[k][b],
+                                                         strata::core::slot_grow_target(bs[b].p + 2, eslot_step, o.max_context));
+            return n;
+        };
+        // card k is quiet (no window in flight there, no prompt chunk being read): idle slots keep only what their
+        // conversations hold (one that keeps none: cell 0, state reset), the budget is topped up to what the decoding
+        // slots need next, and what is left over goes back to the expert cache
+        auto elastic_idle = [&](size_t k, bool may_give) {
+            if (!eslots_on) return;
+            const strata::core::OnDevice on_k(eslot_dev(k));
+            for (size_t b = 0; b < bs.size(); ++b) {
+                const BSlot& sl = bs[b];
+                strata::core::SessionState& u = *bslot_ss[k][b];
+                if (sl.active || u.slot_cells < 0) continue;
+                const bool keeps = sl.cached || sl.partial;
+                const int64_t keep = keeps ? (int64_t) sl.ids.size() + 4 : 1;
+                if (u.slot_cells <= keep) continue;
+                (void) strata::core::session_slot_fit(u, keep, true);
+                if (!keeps) strata::core::session_zero(u, g, nullptr, nullptr);   // its K/V map named page slots given back
+            }
+            if (!give_on) return;
+            int64_t fr = 0, made = 0;
+            strata::core::qsa_slot_budget_chunks(eslot_dev(k), &fr, &made);
+            const int64_t low = slots_low_water(k);
+            if (!may_give) return;
+            if (fr < low && gv[k].lo > give_floor) {
+                give(k, low - fr + 16);
+            } else if (fr > made + low + 32) {
+                bool lent = false;
+                for (const PfPart& p : pf_parts) lent = lent || (p.cache == gv[k].cache && !p.lent.empty());
+                if (!lent) (void) take_back(k, fr - made - low - 16);
+            }
+        };
         // an admission into slot b (everything drained): it is trimmed to its new conversation and backed for it; when the
         // budget is short, idle slots give their memory back and drop the conversations they keep (parked reads last)
         auto slot_admit_fit = [&](int b, int64_t upto, std::string& e) -> bool {
@@ -11173,7 +11453,7 @@ int main(int argc, char** argv) {
                 const strata::core::OnDevice on_k(eslot_dev(k));
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "elastic slots: device sync failed"; return false; }
             }
-            bool ok = slot_fit(b, upto + 1, true);
+            bool ok = slot_fit(b, upto + 1, true, all_quiet) == 0;
             for (int pass = 0; !ok && pass < 2; ++pass)
                 for (int j = 0; !ok && j < (int) bs.size(); ++j) {
                     BSlot& sj = bs[(size_t) j];
@@ -11192,7 +11472,7 @@ int main(int argc, char** argv) {
                                          "%zu tokens it kept%s\n", j, b, sj.ids.size(), sj.partial ? " (a parked read)" : "");
                     sj.cached = false;
                     sj.partial = false;
-                    ok = slot_fit(b, upto + 1, true);
+                    ok = slot_fit(b, upto + 1, true, all_quiet) == 0;
                 }
             // a trimmed slot's K/V map may name page slots given back: it starts over before anything reads it (the copy
             // after this, or a pad row when the admission fails)
@@ -11208,22 +11488,31 @@ int main(int argc, char** argv) {
                     " cells in slot " + std::to_string(b);
                 return false;
             }
+            // the slots decoding beside it are backed a step ahead now, while everything is quiet; then idle slots and
+            // the expert caches settle
+            for (int j = 0; j < (int) bs.size(); ++j)
+                if (j != b && bs[(size_t) j].active)
+                    (void) slot_fit(j, bs[(size_t) j].p + 2 + eslot_step, false, all_quiet);
+            for (size_t k = 0; k < bslot_ss.size(); ++k) elastic_idle(k, true);
             std::fprintf(stderr, "strata batch: elastic slot %d holds %lld cells: %s\n", b, (long long) upto,
                          slot_mem_note(b).c_str());
             return true;
         };
         // a decoding slot whose next window would need memory the budget does not have ends there (`length`); its state
         // is whole (no window of it is in flight), so it stays a cache
-        auto slot_grow_or_end = [&](int b, int64_t need) -> bool {
+        // 0: backed; 2: wait for a busy card (the caller tries again later); 1: it ended
+        auto slot_grow_or_end = [&](int b, int64_t need, const std::function<bool(size_t)>& quiet) -> int {
             BSlot& sl = bs[(size_t) b];
             bool backed = true;
             for (const auto& v : bslot_ss) backed = backed && (v[(size_t) b]->slot_cells < 0 || need <= v[(size_t) b]->slot_cells);
-            if (backed) return true;
-            if (slot_fit(b, need, false)) {
+            if (backed) return 0;
+            const int r = slot_fit(b, need, false, quiet);
+            if (r == 0) {
                 std::fprintf(stderr, "strata batch: elastic slot %d grows at %lld cells: %s\n", b, (long long) need,
                              slot_mem_note(b).c_str());
-                return true;
+                return 0;
             }
+            if (r == 2) return 2;
             std::fprintf(stderr, "strata batch: elastic slot %d ends at %lld tokens: the slot budget has no room to grow "
                                  "(STRATA_ELASTIC_SLOTS_MIB)\n", b, (long long) sl.p);
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
@@ -11231,7 +11520,7 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
             sl.active = false;
             sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
-            return false;
+            return 1;
         };
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
@@ -11334,13 +11623,21 @@ int main(int argc, char** argv) {
             int first[strata::kernels::kVerifyMaxT] = {}, active[strata::kernels::kVerifyMaxT] = {};
             static size_t next_slot = 0;
             // Each MTP slot uses two rows; rotate slots when more than four are active.
-            if (eslots_on)
+            // (every card is quiet between these windows; between a prompt's chunks its caches give nothing: a slot that
+            // needs them sits this window out)
+            std::vector<uint8_t> e_hold(bs.size(), 0);
+            if (eslots_on) {
+                const std::function<bool(size_t)> none = [](size_t) { return false; };
+                for (size_t k = 0; k < bslot_ss.size(); ++k) elastic_idle(k, !in_prompt_read);
                 for (int b = 0; b < (int) bs.size(); ++b)
-                    if (bs[(size_t) b].active) (void) slot_grow_or_end(b, bs[(size_t) b].p + (batch_mtp ? 3 : 2));
+                    if (bs[(size_t) b].active)
+                        e_hold[(size_t) b] = slot_grow_or_end(b, bs[(size_t) b].p + (batch_mtp ? 3 : 2),
+                                                              in_prompt_read ? none : all_quiet) == 2;
+            }
             int A = 0;
             for (size_t offset = 0; offset < bs.size() && S + (batch_mtp ? 2 : 1) <= strata::kernels::kVerifyMaxT; ++offset) {
                 const int b = (int) ((next_slot + offset) % bs.size());
-                if (bs[(size_t) b].active) {
+                if (bs[(size_t) b].active && !e_hold[(size_t) b]) {
                     first[A] = S;
                     active[A++] = b;
                     rows[S] = b;
@@ -11593,6 +11890,12 @@ int main(int argc, char** argv) {
         // served on another (conc_serving); between windows that thread waits on bell_cv and a launch wakes it (a
         // timed sleep is a whole timer tick on Windows, up to 15.6 ms, and the window's first layer would wait for it)
         bool conc_serving = false;
+        // STRATA_ELASTIC_SLOTS: a card gives the slots room only while quiet (no window in flight, no prompt read beside),
+        // and settles its slots' memory once after each window it finishes
+        std::vector<uint8_t> eidle_due((size_t) n_pipe, 0);
+        const std::function<bool(size_t)> stage_quiet = [&](size_t k) {
+            return !conc_serving && !in_prompt_read && k < stage_group.size() && stage_group[k] < 0;
+        };
         std::mutex bell_mu;
         std::condition_variable bell_cv;
         std::atomic<bool> bell_waiting{false};
@@ -11613,6 +11916,7 @@ int main(int argc, char** argv) {
                 if (r == 0) continue;
                 if (batch_telemetry_enabled) stage_in_flight.complete(k, Clock::now());
                 stage_group[(size_t) k] = -1;
+                if (eslots_on) eidle_due[(size_t) k] = 1;
                 PGroup& G = pg[(size_t) gi];
                 if (k + 1 < n_pipe) { G.stage = k + 1; G.since = pipe_tick; continue; }
                 // the last stage: the group's picks
@@ -11664,6 +11968,13 @@ int main(int argc, char** argv) {
                 G.inflight = false;
                 report_batch_window(G.S, G.active, !pipe_inflight() && !batch_on(), G.started);
             }
+            // STRATA_ELASTIC_SLOTS: each card that has just finished a window (and is quiet) settles its slots' memory
+            if (eslots_on && !conc_serving)
+                for (int k = 0; k < n_pipe; ++k)
+                    if (eidle_due[(size_t) k] && stage_group[(size_t) k] < 0) {
+                        eidle_due[(size_t) k] = 0;
+                        elastic_idle((size_t) k, !in_prompt_read);
+                    }
             // start waiting groups on free stages, the longest waiting first; a new step on stage 0 round-robin
             for (int k = n_pipe - 1; k >= 0; --k) {
                 if (stage_group[(size_t) k] >= 0) continue;
@@ -11683,9 +11994,11 @@ int main(int argc, char** argv) {
                     if (pick < 0) continue;
                     rr = pick + 1;
                     if (eslots_on) {   // its rows' slots backed on every stage before the window starts (pad rows: cell 0)
+                        bool wait = false;
                         for (int t = 0; t < GS; ++t)
-                            if (bs[(size_t) (pick * GS + t)].active) (void) slot_grow_or_end(pick * GS + t, bs[(size_t) (pick * GS + t)].p + 2);
-                        if (!group_active(pick)) continue;
+                            if (bs[(size_t) (pick * GS + t)].active)
+                                wait = slot_grow_or_end(pick * GS + t, bs[(size_t) (pick * GS + t)].p + 2, stage_quiet) == 2 || wait;
+                        if (wait || !group_active(pick)) continue;   // (a card to give room is busy: the group starts later)
                     }
                     PGroup& G = pg[(size_t) pick];
                     G.S = 0;
@@ -13176,11 +13489,13 @@ int main(int argc, char** argv) {
                         // loan starts where the chunk itself needs it (the 128-slot floor aside); a chunk that cannot be
                         // lent even then is halved until it can, instead of ending the engine.
                         int64_t need_p = part_slots(p, want_p);
-                        while ((need_p <= 0 || need_p + 128 > p.cache->slots()) && want_p > 256) {
+                        // STRATA_ELASTIC_SLOTS_GIVE: a loan stays above the slots the cache may give the batch slots
+                        const int64_t room_p = give_on ? p.cache->slots() - give_top(p.cache) : p.cache->slots();
+                        while ((need_p <= 0 || need_p + 128 > p.cache->slots() || (give_on && need_p > room_p)) && want_p > 256) {
                             want_p = std::max<int64_t>(256, want_p / 2 / 256 * 256);
                             need_p = part_slots(p, want_p);
                         }
-                        if (need_p <= 0 || need_p + 128 > p.cache->slots()) {
+                        if (need_p <= 0 || need_p + 128 > p.cache->slots() || (give_on && need_p > room_p)) {
                             e = "prefill: no chunk of this request fits the slots that can be lent (#2090)";
                             return false;
                         }
