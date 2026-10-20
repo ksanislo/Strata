@@ -11,8 +11,8 @@ namespace {
 
 struct Api {
     bool ok = false;
-    uint64_t gran = 0;
-    int dev = -1;
+    decltype(&cuDeviceGetAttribute) attr = nullptr;
+    decltype(&cuMemGetAllocationGranularity) granularity = nullptr;
     decltype(&cuMemAddressReserve) reserve = nullptr;
     decltype(&cuMemAddressFree) free_va = nullptr;
     decltype(&cuMemCreate) create = nullptr;
@@ -43,43 +43,66 @@ const Api& api() {
     static Api& a = *new Api;
     static std::once_flag once;
     std::call_once(once, [] {
-        decltype(&cuDeviceGetAttribute) attr = nullptr;
-        decltype(&cuMemGetAllocationGranularity) granularity = nullptr;
-        if (cudaGetDevice(&a.dev) != cudaSuccess) return;
-        if (!resolve("cuDeviceGetAttribute", attr) || !resolve("cuMemGetAllocationGranularity", granularity) ||
-            !resolve("cuMemAddressReserve", a.reserve) || !resolve("cuMemAddressFree", a.free_va) ||
-            !resolve("cuMemCreate", a.create) || !resolve("cuMemRelease", a.release) || !resolve("cuMemMap", a.map) ||
-            !resolve("cuMemUnmap", a.unmap) || !resolve("cuMemSetAccess", a.access))
-            return;
-        int vmm = 0;
-        if (attr(&vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, (CUdevice) a.dev) != CUDA_SUCCESS || !vmm)
-            return;
-        CUmemAllocationProp prop{};
-        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        prop.location.id = a.dev;
-        size_t g = 0;
-        if (granularity(&g, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS || g == 0) return;
-        a.gran = g;
-        a.ok = true;
+        a.ok = resolve("cuDeviceGetAttribute", a.attr) && resolve("cuMemGetAllocationGranularity", a.granularity) &&
+               resolve("cuMemAddressReserve", a.reserve) && resolve("cuMemAddressFree", a.free_va) &&
+               resolve("cuMemCreate", a.create) && resolve("cuMemRelease", a.release) && resolve("cuMemMap", a.map) &&
+               resolve("cuMemUnmap", a.unmap) && resolve("cuMemSetAccess", a.access);
     });
     return a;
 }
 
+// per device (a layer split's stages each map their own): VMM support and the chunk size, looked up once
+constexpr int kMaxDev = 64;
+struct Dev {
+    std::once_flag once;
+    bool ok = false;
+    uint64_t gran = 0;
+};
+const Dev* dev_info(int dev) {
+    static Dev* d = new Dev[kMaxDev];
+    if (dev < 0 && cudaGetDevice(&dev) != cudaSuccess) return nullptr;
+    if (dev < 0 || dev >= kMaxDev) return nullptr;
+    Dev& x = d[dev];
+    std::call_once(x.once, [&x, dev] {
+        const Api& a = api();
+        if (!a.ok) return;
+        int vmm = 0;
+        if (a.attr(&vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, (CUdevice) dev) != CUDA_SUCCESS || !vmm)
+            return;
+        CUmemAllocationProp prop{};
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = dev;
+        size_t g = 0;
+        if (a.granularity(&g, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) != CUDA_SUCCESS || g == 0) return;
+        x.gran = g;
+        x.ok = true;
+    });
+    return x.ok ? &x : nullptr;
+}
+int current_dev() {
+    int d = -1;
+    return cudaGetDevice(&d) == cudaSuccess ? d : -1;
+}
+
 }  // namespace
 
-bool vmm_available() { return api().ok; }
-uint64_t vmm_granularity() { return api().ok ? api().gran : 0; }
+bool vmm_available(int dev) { return dev_info(dev) != nullptr; }
+uint64_t vmm_granularity(int dev) {
+    const Dev* d = dev_info(dev);
+    return d ? d->gran : 0;
+}
 
-VmmChunk vmm_chunk_new() {
-    const Api& a = api();
-    if (!a.ok) return 0;
+VmmChunk vmm_chunk_new(int dev) {
+    if (dev < 0) dev = current_dev();
+    const Dev* d = dev_info(dev);
+    if (d == nullptr) return 0;
     CUmemAllocationProp prop{};
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    prop.location.id = a.dev;
+    prop.location.id = dev;
     CUmemGenericAllocationHandle h = 0;
-    if (a.create(&h, (size_t) a.gran, &prop, 0) != CUDA_SUCCESS) return 0;
+    if (api().create(&h, (size_t) d->gran, &prop, 0) != CUDA_SUCCESS) return 0;
     return (VmmChunk) h;
 }
 
@@ -87,23 +110,25 @@ void vmm_chunk_free(VmmChunk h) {
     if (h != 0 && api().ok) api().release((CUmemGenericAllocationHandle) h);
 }
 
-bool VmmRange::reserve(uint64_t bytes) {
+bool VmmRange::reserve(uint64_t bytes, int dev) {
     release();
-    const Api& a = api();
-    if (!a.ok || bytes == 0) return false;
-    const uint64_t n = (bytes + a.gran - 1) / a.gran;
+    if (dev < 0) dev = current_dev();
+    const Dev* d = dev_info(dev);
+    if (d == nullptr || bytes == 0) return false;
+    const uint64_t n = (bytes + d->gran - 1) / d->gran;
     CUdeviceptr p = 0;
-    if (a.reserve(&p, (size_t) (n * a.gran), 0, 0, 0) != CUDA_SUCCESS) return false;
+    if (api().reserve(&p, (size_t) (n * d->gran), 0, 0, 0) != CUDA_SUCCESS) return false;
     base_ = (unsigned long long) p;
+    gran_ = d->gran;
+    dev_ = dev;
     h_.assign((size_t) n, 0);
     return true;
 }
 
 void VmmRange::release() {
     if (base_ == 0) return;
-    const Api& a = api();
     for (int64_t i = 0; i < chunks(); ++i) vmm_chunk_free(unmap(i));
-    a.free_va((CUdeviceptr) base_, (size_t) ((uint64_t) h_.size() * a.gran));
+    api().free_va((CUdeviceptr) base_, (size_t) ((uint64_t) h_.size() * gran_));
     base_ = 0;
     h_.clear();
 }
@@ -115,8 +140,7 @@ int64_t VmmRange::mapped_count() const {
 }
 
 bool VmmRange::map_one(int64_t i, VmmChunk h) {
-    const Api& a = api();
-    if (a.map((CUdeviceptr) (base_ + (uint64_t) i * a.gran), (size_t) a.gran, 0, (CUmemGenericAllocationHandle) h, 0) !=
+    if (api().map((CUdeviceptr) (base_ + (uint64_t) i * gran_), (size_t) gran_, 0, (CUmemGenericAllocationHandle) h, 0) !=
         CUDA_SUCCESS)
         return false;
     h_[(size_t) i] = h;
@@ -125,12 +149,11 @@ bool VmmRange::map_one(int64_t i, VmmChunk h) {
 
 bool VmmRange::set_access(int64_t lo, int64_t hi) {
     if (hi <= lo) return true;
-    const Api& a = api();
     CUmemAccessDesc d{};
     d.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    d.location.id = a.dev;
+    d.location.id = dev_;
     d.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    return a.access((CUdeviceptr) (base_ + (uint64_t) lo * a.gran), (size_t) ((uint64_t) (hi - lo) * a.gran), &d, 1) ==
+    return api().access((CUdeviceptr) (base_ + (uint64_t) lo * gran_), (size_t) ((uint64_t) (hi - lo) * gran_), &d, 1) ==
            CUDA_SUCCESS;
 }
 
@@ -142,9 +165,8 @@ bool VmmRange::commit_run(int64_t lo, int64_t hi) {
 
 VmmChunk VmmRange::unmap(int64_t i) {
     if (!mapped(i)) return 0;
-    const Api& a = api();
     const VmmChunk h = h_[(size_t) i];
-    if (a.unmap((CUdeviceptr) (base_ + (uint64_t) i * a.gran), (size_t) a.gran) != CUDA_SUCCESS) return 0;
+    if (api().unmap((CUdeviceptr) (base_ + (uint64_t) i * gran_), (size_t) gran_) != CUDA_SUCCESS) return 0;
     h_[(size_t) i] = 0;
     return h;
 }
@@ -212,10 +234,10 @@ const Api& api() {
 }
 }  // namespace
 
-bool vmm_available() { return api().ok; }
-uint64_t vmm_granularity() { return api().ok ? api().gran : 0; }
+bool vmm_available(int) { return api().ok; }
+uint64_t vmm_granularity(int) { return api().ok ? api().gran : 0; }
 
-VmmChunk vmm_chunk_new() {
+VmmChunk vmm_chunk_new(int) {
     const Api& a = api();
     if (!a.ok) return 0;
     const hipMemAllocationProp prop = alloc_prop(a.dev);
@@ -228,11 +250,13 @@ void vmm_chunk_free(VmmChunk h) {
     if (h != 0 && api().ok) (void) hipMemRelease((hipMemGenericAllocationHandle_t) (uintptr_t) h);
 }
 
-bool VmmRange::reserve(uint64_t bytes) {
+bool VmmRange::reserve(uint64_t bytes, int) {   // (one device under HIP)
     release();
     const Api& a = api();
     if (!a.ok || bytes == 0) return false;
     const uint64_t n = (bytes + a.gran - 1) / a.gran;
+    gran_ = a.gran;
+    dev_ = a.dev;
     void* p = nullptr;
     if (const hipError_t e = hipMemAddressReserve(&p, (size_t) (n * a.gran), 0, nullptr, 0); e != hipSuccess) { fail("hipMemAddressReserve", e); return false; }
     base_ = (unsigned long long) (uintptr_t) p;
@@ -300,11 +324,11 @@ VmmChunk VmmRange::unmap(int64_t i) {
 
 
 namespace strata::core {
-bool vmm_available() { return false; }
-uint64_t vmm_granularity() { return 0; }
-VmmChunk vmm_chunk_new() { return 0; }
+bool vmm_available(int) { return false; }
+uint64_t vmm_granularity(int) { return 0; }
+VmmChunk vmm_chunk_new(int) { return 0; }
 void vmm_chunk_free(VmmChunk) {}
-bool VmmRange::reserve(uint64_t) { return false; }
+bool VmmRange::reserve(uint64_t, int) { return false; }
 void VmmRange::release() {}
 int64_t VmmRange::mapped_count() const { return 0; }
 bool VmmRange::map_one(int64_t, VmmChunk) { return false; }
