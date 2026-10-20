@@ -1455,8 +1455,12 @@ the folder is over `--session-dir-gib G` (default 64) or `--session-dir-files N`
 `--session-dir-days D` (default 7) is deleted in any case, as is a file of another model, configuration or engine
 version. The server log shows each event (`[strata] sessions: ...`), every request's `done:` line ends with where
 its context came from (`context: N tokens from disk|from RAM (parked)|already on the GPU, M new`), and `GET /status`
-has `"sessions"` (files, bytes, limits and each conversation's tokens, bytes, last use and state). Same limits as the
-session files (`--peer-device`, `--batch`, `--prompt-cache 0` turn it off with a log line). Measured on 4 x T4
+has `"sessions"` (files, bytes, limits and each conversation's tokens, bytes, last use and state). With `--batch`
+(`"parallel"`) a finished request's conversation stays in its slot as before; when another conversation takes that
+slot, or at `QUIT`, the slot's conversation is parked (or written straight from the GPU) the same way first, unless
+the new request continues it or another slot holds it. Not saved: a slot that a pipelined group's pad row overwrites
+(`--batch-groups` with several slots per group; the log says so) and the slots dropped after non-finite logits.
+`--peer-device` and `--prompt-cache 0` turn it off with a log line. Measured on 4 x T4
 (Qwen3.8-Flash-Next Q8, `--layer-split`, NVMe): a 187,275-token conversation written at shutdown in 4.1 s (2.96 GB); a
 169,011-token one read on demand in 1.8 s, after which its next turn read only the 11,213 new tokens. In the GPU test
 (two ~8.5K-token conversations alternating, the server restarted before each one's third turn) every turn matched a
