@@ -1259,6 +1259,10 @@ public:
     }
     /// Pin by need, after open(): the registered ranges (0 when the prefix rule, or nothing, is in force)
     size_t pin_ranges() const { return pin_start_.size(); }
+    /// STRATA_NUMA_PLACE, before open(): the NUMA node of each layer (the node of the card that runs it).
+    void set_numa_layer_nodes(std::vector<int> nodes) { numa_nodes_ = std::move(nodes); }
+    /// After open(): where the arena's pages landed per node (empty without a placement).
+    const std::string& numa_note() const { return numa_note_; }
 
     /// What backing was obtained and why, for the startup print.  "The engine adapts to the machine it is on" is
     /// only true if the engine says what it got.
@@ -1286,6 +1290,8 @@ private:
     std::atomic<int64_t> reads_{0};   ///< (a counter only; two threads can read blobs at once)
     std::string note_;
     std::string ram_warning_;
+    std::vector<int> numa_nodes_;
+    std::string numa_note_;
     double gib_per_s_ = 0.0;
     double load_seconds_ = 0.0;
     double load_read_s_ = 0.0;
