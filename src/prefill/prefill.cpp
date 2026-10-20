@@ -1038,6 +1038,14 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
 }
 }  // namespace
 
+struct Prefill::JobQueue {
+    mutable std::mutex mu;
+    std::condition_variable cv, idle;
+    std::deque<std::shared_ptr<PromptJob>> q;
+    bool busy = false, stop = false;
+    std::thread th;
+};
+
 Prefill::Prefill() : impl_(new Impl) {}
 Prefill::~Prefill() { release(); }
 
@@ -1048,6 +1056,16 @@ void Prefill::reset() {
 }
 
 void Prefill::release() {
+    if (jobs_) {   // the queued prompts use the buffers released below
+        drain_jobs();
+        {
+            std::lock_guard<std::mutex> lk(jobs_->mu);
+            jobs_->stop = true;
+        }
+        jobs_->cv.notify_all();
+        if (jobs_->th.joinable()) jobs_->th.join();
+        jobs_.reset();
+    }
     if (!impl_) return;
     impl_->hand_worker.reset();   // idle here (run drains the chain before it returns); joins its thread
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
@@ -2539,15 +2557,26 @@ struct PeTimer {
 };
 }  // namespace
 
-bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
+bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err,
+                       const std::shared_ptr<PromptJob>& job, size_t depth, bool job_last) {
     err.clear();
     // force_chunk is for this run only: taken before any early return can leave it to the next one
-    const int64_t forced = hand_in_ == nullptr ? std::exchange(force_chunk_, 0) : 0;
+    const int64_t forced = hand_in_ == nullptr && !job ? std::exchange(force_chunk_, 0) : 0;
     const bool forced_single = force_single_, forced_planned = force_planned_;
     Impl& m = *impl_;
     const core::OnDevice on_device(m.device);
     const core::ModelGeometry& g = *m.g;
-    core::SessionState& ss = *m.ss;
+    // STRATA_PREFILL_MULTI: a queued prompt's own session and callbacks on this stage
+    core::SessionState& ss = job && depth < job->sessions.size() && job->sessions[depth] ? *job->sessions[depth] : *m.ss;
+    static const std::function<bool(int64_t, std::string&)> no_stage_cb;
+    const auto& stage_cb = !job ? on_stage_chunk : depth < job->on_stage_chunk.size() ? job->on_stage_chunk[depth] : no_stage_cb;
+    const auto& chunk_cb = job ? job->on_chunk : on_chunk;
+    const auto& stop_cb = job ? job->should_stop : should_stop;
+    const float* const* const embd_rows = job ? job->embd_rows : this->embd_rows;
+    if (job && &ss != m.ss && m.ss->ple.ready() && !ss.ple.ready() && stage_lb_ <= 1 && 1 < stage_le_) {
+        err = "prefill: the prompt's session has no PLE run (the stage's own has one)";
+        return false;
+    }
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
     // The direct successor's future lives on the Prefill object. Intermediate
@@ -2597,7 +2626,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // pool would decide which experts the CPU computed (other bits) - timing, where the chunks are a function of n
     const bool pipe_chunked = hand_in_ == nullptr ? (forced > 0 ? forced_planned : planned_C > 0 && C < std::min(n, m.T))
                                                   : pipe_chunked_;
-    const bool helped = single_chunk && bind_stage_helper(n);
+    const bool helped = single_chunk && !job && bind_stage_helper(n);   // (the helper may be reading a queued prompt)
     if (helped) std::swap(m.pp, m.help_pp);
     struct HelpScope {
         Impl& m;
@@ -2651,10 +2680,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
 
     if (hand_in_ == nullptr) stopped_at_ = -1;
     for (int64_t c0 = 0; c0 < n; c0 += C) {
-        if (should_stop && should_stop()) { err = "cancelled"; return false; }
+        if (stop_cb && stop_cb()) { err = "cancelled"; return false; }
+        if (job && job->failed()) return true;   // a later stage failed it: on_done has run
         // the first stage: end the run before this chunk (every chunk before it is handed on; the caller's drain
         // waits for the later stages to read them)
-        if (c0 > 0 && hand_in_ == nullptr && stop_at_chunk && stop_at_chunk()) {
+        if (c0 > 0 && hand_in_ == nullptr && !job && stop_at_chunk && stop_at_chunk()) {
             stopped_at_ = c0;
             break;
         }
@@ -4844,7 +4874,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
             // Wait only for the DIRECT successor's previous chunk. That successor
             // may already have forwarded its older chunk to later GPUs.
-            if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
+            if (stage_cb && !stage_cb(p0 + T, err)) return false;
             if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
             next_err_.clear();
             next_->hand_in_ = h;
@@ -4852,17 +4882,29 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             next_->hand_pieces_ = hp;
             next_->single_chunk_ = single_chunk;
             next_->pipe_chunked_ = pipe_chunked;
+            // a queued prompt's error ends that prompt only (its on_done), not the read of the next one
+            const bool last_here = job_last && c0 + T >= n;
+            auto step = [this, tokens, c0, T, p0, job, depth, last_here]() -> bool {
+                if (job && job->failed()) return true;
+                bool r = next_->run_impl(tokens + c0, T, p0, next_err_, job, depth + 1, last_here);
+                if (!r && job) {
+                    job->finish(false, next_err_);
+                    next_err_.clear();
+                    r = true;
+                }
+                return r;
+            };
             if (handoff_pipe_worker()) {
                 if (!m.hand_worker) m.hand_worker = std::make_unique<HandWorker>();
-                next_run_ = m.hand_worker->submit(std::packaged_task<bool()>([this, tokens, c0, T, p0] {
-                    const bool r = next_->run_impl(tokens + c0, T, p0, next_err_);
+                next_run_ = m.hand_worker->submit(std::packaged_task<bool()>([step] {
+                    const bool r = step();
                     (void) cudaGetLastError();   // clear what a thread's end cleared (std::async)
                     return r;
                 }));
             } else
-            next_run_ = std::async(std::launch::async, [this, tokens, c0, T, p0] {
+            next_run_ = std::async(std::launch::async, [step] {
                 strata::aux_cpus::pin_current_thread();
-                return next_->run_impl(tokens + c0, T, p0, next_err_);
+                return step();
             });
             hand_buf_ ^= 1;
             continue;   // the last stage reports the chunk (on_chunk)
@@ -4902,15 +4944,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 std::fclose(f);
             }
         }
-        if (on_chunk || on_stage_chunk) {
+        if (chunk_cb || stage_cb || (job && job_last && c0 + T >= n)) {   // (a queued prompt's state is final at on_done)
             const auto toc = Clock::now();
             if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
                 err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
             const auto toc2 = Clock::now();
-            if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
-            if (on_chunk && !on_chunk(m.R, T, p0, err)) return false;
+            if (stage_cb && !stage_cb(p0 + T, err)) return false;
+            if (chunk_cb && !chunk_cb(m.R, T, p0, err)) return false;
             host_sync_ms += std::chrono::duration<double, std::milli>(toc2 - toc).count();
             host_chunk_ms += ms_since(toc2);
         }
@@ -5009,6 +5051,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
         std::fprintf(stderr, "strata prefill: GDN_HASH %s\n", line.c_str());
     }
+    // the last stage has read a queued prompt's last chunk; every earlier stage synchronized before handing it on
+    if (job && next_ == nullptr && job_last) job->finish(true, std::string());
     return true;
 }
 
@@ -5047,6 +5091,57 @@ bool Prefill::reserve_uploads(int64_t T) {
     }
     if (next_ != nullptr) ok = next_->reserve_uploads(T) && ok;
     return ok;
+}
+
+void Prefill::enqueue(std::shared_ptr<PromptJob> job) {
+    if (!jobs_) {
+        jobs_ = std::make_unique<JobQueue>();
+        jobs_->th = std::thread([this] {
+            strata::aux_cpus::pin_current_thread();
+            JobQueue& jq = *jobs_;
+            for (;;) {
+                std::shared_ptr<PromptJob> j;
+                {
+                    std::unique_lock<std::mutex> lk(jq.mu);
+                    jq.cv.wait(lk, [&] { return jq.stop || !jq.q.empty(); });
+                    if (jq.q.empty()) return;
+                    j = std::move(jq.q.front());
+                    jq.q.pop_front();
+                    jq.busy = true;
+                }
+                std::string e;
+                if (!j->failed() && !run_impl(j->tokens.data(), (int64_t) j->tokens.size(), j->pos0, e, j, 0, true))
+                    j->finish(false, e.empty() ? std::string("prefill: the prompt read failed") : e);
+                (void) cudaGetLastError();
+                {
+                    std::lock_guard<std::mutex> lk(jq.mu);
+                    jq.busy = false;
+                }
+                jq.idle.notify_all();
+            }
+        });
+    }
+    {
+        std::lock_guard<std::mutex> lk(jobs_->mu);
+        jobs_->q.push_back(std::move(job));
+    }
+    jobs_->cv.notify_one();
+}
+
+size_t Prefill::jobs_pending() const {
+    if (!jobs_) return 0;
+    std::lock_guard<std::mutex> lk(jobs_->mu);
+    return jobs_->q.size() + (jobs_->busy ? 1 : 0);
+}
+
+void Prefill::drain_jobs() {
+    if (!jobs_) return;
+    {
+        std::unique_lock<std::mutex> lk(jobs_->mu);
+        jobs_->idle.wait(lk, [&] { return jobs_->q.empty() && !jobs_->busy; });
+    }
+    std::string e;   // (a job's error went to its on_done)
+    (void) drain_pipeline(e);
 }
 
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
