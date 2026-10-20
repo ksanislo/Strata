@@ -1265,14 +1265,15 @@ void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t 
     drive_pool_multi(s->base, x_f, ids, n_tok, k, out, layer);
 }
 
-/// STRATA_STAGE_SERVE=1: a layer-split stage's own Drive and expert pool, and a thread pinned on its GPU's NUMA node
-/// that builds the pool there and serves the stage's pipelined batch windows (`serving`: the pump only launches and
-/// polls them).  Between windows it spins for kSpin, then sleeps until `wake` (a launch).
+/// STRATA_STAGE_SERVE=1: a layer-split stage's expert pool, a Drive per verifier of the stage (the plan sink, cache and
+/// PCIe share set once), and a thread pinned on the stage GPU's NUMA node that builds the pool there and serves the
+/// stage's windows: the pipelined batch windows (`serving`) and the run() and pipelined windows handed to it
+/// (Verifier::set_external_server).  Between windows it spins for kSpin, then sleeps until `wake` (a launch).
 struct StageServe {
     static constexpr std::chrono::milliseconds kSpin{20};
-    Drive drive;
     std::unique_ptr<strata::kernels::cpu::ExpertPool> pool;
-    strata::core::Verifier* ver = nullptr;
+    std::vector<strata::core::Verifier*> vers;    ///< [0]: the stage's verifier (batch windows); [1]: --pipeline-windows' odd
+    std::vector<std::unique_ptr<Drive>> drives;   ///< one per verifier
     strata::program::StageCores cores;
     bool host_works = true;
     int tasks = 0;
@@ -1295,12 +1296,17 @@ struct StageServe {
             cv.notify_all();
         }
     }
+    bool busy() const {
+        for (const strata::core::Verifier* v : vers)
+            if ((serving.load(std::memory_order_acquire) && v->batch_busy()) || v->external_busy()) return true;
+        return false;
+    }
     void loop() {
         strata::aux_cpus::note_owned_thread();   // --aux-cpus never moves it
         if (cores.service >= 0) (void) strata::kernels::cpu::pin_current_thread(cores.service);
         try {   // built here, so its scratch is first touched on this node
             pool = std::make_unique<strata::kernels::cpu::ExpertPool>(cores.workers, host_works, tasks);
-            drive.d.pool = pool.get();
+            for (auto& d : drives) d->d.pool = pool.get();
         } catch (const std::exception& x) {
             pool_err = x.what();
         }
@@ -1311,8 +1317,19 @@ struct StageServe {
         cv.notify_all();
         Clock::time_point busy_at = Clock::now();
         while (!stop.load(std::memory_order_acquire)) {
-            if (serving.load(std::memory_order_acquire) && ver->batch_busy()) {
-                ver->batch_serve(&drive_pool_multi, &drive);
+            bool any = false;
+            for (size_t i = 0; i < vers.size(); ++i) {
+                strata::core::Verifier& v = *vers[i];
+                if (serving.load(std::memory_order_acquire) && v.batch_busy()) {
+                    v.batch_serve(&drive_pool_multi, drives[i].get());
+                    any = true;
+                }
+                if (v.external_busy()) {
+                    v.serve_external(&drive_pool_multi, drives[i].get());
+                    any = true;
+                }
+            }
+            if (any) {
                 busy_at = Clock::now();
                 continue;
             }
@@ -1323,9 +1340,7 @@ struct StageServe {
             std::unique_lock<std::mutex> lk(mu);
             waiting.store(true, std::memory_order_relaxed);
             std::atomic_thread_fence(std::memory_order_seq_cst);
-            cv.wait_for(lk, std::chrono::milliseconds(50), [&] {
-                return stop.load(std::memory_order_acquire) || (serving.load(std::memory_order_acquire) && ver->batch_busy());
-            });
+            cv.wait_for(lk, std::chrono::milliseconds(50), [&] { return stop.load(std::memory_order_acquire) || busy(); });
             waiting.store(false, std::memory_order_relaxed);
         }
         pool.reset();
@@ -8674,6 +8689,9 @@ int main(int argc, char** argv) {
         // the prompt path's own buffers (no loan) are not priced into them: with the whole arena pinned (#253) a
         // `--prefill auto` split could stop at start with "device buffers for a chunk of 2048 tokens do not fit".  A
         // chunk that does not fit is tried again one size smaller, down to 512 tokens (a smaller chunk only reads slower).
+        // STRATA_STAGE_SERVE: each stage's prompt path takes its stage's pool (set below, where the pools start)
+        std::vector<strata::kernels::cpu::ExpertPool*> prompt_pool;
+        auto prompt_pool_of = [&](size_t st) { return st < prompt_pool.size() ? prompt_pool[st] : &pool; };
         auto init_prompt_paths = [&]() -> int {   // 0: ready; 1: failed (err set); 2: failed with "do not fit"
             for (size_t i = 0; i < stages.size(); ++i) {
                 GpuStage& st = *stages[i];
@@ -8687,7 +8705,7 @@ int main(int argc, char** argv) {
                     sb = st.cache.device_slot(pf_parts[i + 1].first);
                     sbb = part_bytes(pf_parts[i + 1], pf_parts[i + 1].first);
                 }
-                if (share_pool) st.sp.set_cpu_pool(&pool);   // one stage at a time takes it for a chunk (prefill.cpp)
+                if (share_pool) st.sp.set_cpu_pool(prompt_pool_of(i + 1));   // one stage at a time takes a shared one (prefill.cpp)
                 if (!st.sp.init(st.wt, g, st.ss, srcp, &st.cache, host_res.data(), o.prefill_chunk, (void*) st.stream,
                                 err, sb, sbb)) {
                     err = "layer split, CUDA" + std::to_string(st.dev) + " prompt path: " + err;
@@ -8696,7 +8714,7 @@ int main(int argc, char** argv) {
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
             if (multi_gpu) sp.set_hand_node(strata::core::numa_place_node(stages[0]->dev));
-            if (share_pool) sp.set_cpu_pool(&pool);
+            if (share_pool) sp.set_cpu_pool(prompt_pool_of(0));
             if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes,
                          o.prefill_head_alias))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
@@ -11771,17 +11789,22 @@ int main(int argc, char** argv) {
                 bool ok = true;
                 for (int k = 0; k < n_stages && ok; ++k) {
                     auto sv = std::make_unique<StageServe>();
-                    sv->ver = &stage_ver(k);
                     sv->cores = plan[(size_t) k];
                     sv->host_works = !o.no_host_worker;
                     sv->tasks = o.pool_tasks;
-                    sv->drive.d.n_expert = g.n_expert;
-                    sv->drive.d.usage_into = &drive.d.usage;
-                    sv->drive.d.plan = split_drive.plan[k];
-                    sv->drive.d.cache_base = split_drive.cache_base[k];
-                    sv->drive.d.cache_slot_off = split_drive.cache_slot_off[k];
-                    sv->drive.d.pcie_num = split_drive.pcie_num[k];
-                    drive_sync(sv->drive, drive);
+                    for (int par = 0; par < (pipe ? 2 : 1); ++par) {   // --pipeline-windows: the odd windows' verifier too
+                        strata::core::Verifier& vk = stage_ver_p(k, par);
+                        auto d = std::make_unique<Drive>();
+                        d->d.n_expert = g.n_expert;
+                        d->d.usage_into = &drive.d.usage;
+                        d->d.plan = vk.plan_sink();
+                        d->d.cache_base = split_drive.cache_base[k];
+                        d->d.cache_slot_off = split_drive.cache_slot_off[k];
+                        d->d.pcie_num = split_drive.pcie_num[k];
+                        drive_sync(*d, drive);
+                        sv->vers.push_back(&vk);
+                        sv->drives.push_back(std::move(d));
+                    }
                     sv->start();
                     if (!sv->pool_err.empty()) {
                         std::fprintf(stderr, "strata serve: STRATA_STAGE_SERVE: stage %d's pool: %s; off\n", k + 1,
@@ -11793,13 +11816,26 @@ int main(int argc, char** argv) {
                 if (!ok) stsv.clear();
                 for (int k = 0; k < (int) stsv.size(); ++k) {
                     StageServe& sv = *stsv[(size_t) k];
-                    split_drive.own[k] = &sv.drive;
-                    split_drive_b.own[k] = &sv.drive;
+                    split_drive.own[k] = sv.drives[0].get();
+                    split_drive_b.own[k] = sv.drives.back().get();
+                    for (size_t i = 0; i < sv.vers.size(); ++i) {   // run() and the pipelined windows: served by sv
+                        Drive* dr = sv.drives[i].get();
+                        StageServe* svp = &sv;
+                        sv.vers[i]->set_external_server([svp] { svp->wake(); }, [dr, &drive] {
+                            drive_fold(*dr, drive);
+                            drive_sync(*dr, drive);
+                        });
+                    }
+                    prompt_pool.push_back(sv.pool.get());
                     std::fprintf(stderr, "strata serve: STRATA_STAGE_SERVE: stage %d (CUDA%d, layers %lld-%lld) %s, %d "
                                          "pool workers%s\n", k + 1, stage_ver(k).device(),
                                  (long long) (k ? split_drive.end[k - 1] : 0), (long long) (split_drive.end[k] - 1),
                                  strata::program::stage_cores_text(sv.cores).c_str(), sv.pool->workers(),
                                  sv.host_works ? " + the service thread" : "");
+                }
+                if (!stsv.empty() && share_pool) {   // the prompt paths: their stage's pool from now on
+                    sp.set_cpu_pool(prompt_pool_of(0));
+                    for (size_t i = 0; i < stages.size(); ++i) stages[i]->sp.set_cpu_pool(prompt_pool_of(i + 1));
                 }
                 if (!stsv.empty() && piped) {
                     for (int k = 0; k < n_pipe; ++k) {
@@ -11809,10 +11845,10 @@ int main(int argc, char** argv) {
                     stage_serving = true;
                 }
                 if (!stsv.empty())
-                    std::fprintf(stderr, "strata serve: STRATA_STAGE_SERVE: %s; the prompt path keeps the engine's pool "
-                                         "(%d workers)\n", stage_serving ? "the pipelined groups' doorbells are served "
-                                         "by one thread per stage" : "the verify windows use each stage's pool on the "
-                                         "host thread", pool.workers());
+                    std::fprintf(stderr, "strata serve: STRATA_STAGE_SERVE: every verify window's doorbells are served by "
+                                         "its stage's thread%s; the prompt path %s; the engine's pool (%d workers) "
+                                         "idles\n", stage_serving ? " (the pipelined groups too)" : "",
+                                 share_pool ? "uses the stage pools" : "takes no pool (--batch)", pool.workers());
             }
 #endif
         }
@@ -11874,7 +11910,7 @@ int main(int argc, char** argv) {
                 const int r = vk.batch_poll(win_pool_fn, win_pool_user, err);
                 if (r < 0) { std::printf("ERR %s\n", err.c_str()); return false; }
                 if (r == 0) continue;
-                if (stage_serving) drive_fold(stsv[(size_t) k]->drive, drive);   // its window is served: the Drive is idle
+                if (stage_serving) drive_fold(*stsv[(size_t) k]->drives[0], drive);   // its window is served: the Drive is idle
                 if (batch_telemetry_enabled) stage_in_flight.complete(k, Clock::now());
                 stage_group[(size_t) k] = -1;
                 PGroup& G = pg[(size_t) gi];
@@ -11980,8 +12016,7 @@ int main(int argc, char** argv) {
                 strata::core::progress().busy.store(true);
                 if (batch_telemetry_enabled) stage_in_flight.launch(k, Clock::now());
                 if (stage_serving) {
-                    drive_sync(stsv[(size_t) k]->drive, drive);
-                    stsv[(size_t) k]->drive.d.plan = split_drive.plan[k];
+                    drive_sync(*stsv[(size_t) k]->drives[0], drive);
                 }
                 if (!stage_verifier(k).batch_launch(pick * GS, G.S, G.tok, G.pos, err)) {
                     std::printf("ERR %s\n", err.c_str());
