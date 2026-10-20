@@ -1,5 +1,5 @@
 #pragma once
-// CUDA virtual memory (the elastic K/V, --kv-grow): an address range reserved once, whose physical memory is mapped and
+// CUDA virtual memory (the elastic K/V, --kv-grow; the elastic --batch slot sessions): an address range reserved once, whose physical memory is mapped and
 // unmapped in chunks of the device's granularity (2 MiB).  The K/V pools grow with the context by taking chunks the
 // expert cache gives up, and neither moves: every captured graph and stored pointer stays valid.  The driver calls
 // are reached through the runtime's entry-point query, so nothing links the driver library.  Not under HIP.
@@ -12,12 +12,12 @@ namespace strata::core {
 /// A physical chunk: the driver's allocation handle (CUmemGenericAllocationHandle); 0 = none.
 using VmmChunk = unsigned long long;
 
-/// The current device supports it and the entry points resolved.
-bool vmm_available();
-/// The chunk size (0 when not available).
-uint64_t vmm_granularity();
-/// A new physical chunk on the current device (0: out of memory), and its release.
-VmmChunk vmm_chunk_new();
+/// Device `dev` (-1: the current one) supports it and the entry points resolved.
+bool vmm_available(int dev = -1);
+/// That device's chunk size (0 when not available).
+uint64_t vmm_granularity(int dev = -1);
+/// A new physical chunk on device `dev` (-1: the current one; 0: out of memory), and its release.
+VmmChunk vmm_chunk_new(int dev = -1);
 void vmm_chunk_free(VmmChunk h);
 
 class VmmRange {
@@ -27,11 +27,13 @@ public:
     VmmRange(const VmmRange&) = delete;
     VmmRange& operator=(const VmmRange&) = delete;
 
-    /// Reserves `bytes` (rounded up to whole chunks) of addresses, nothing mapped.
-    bool reserve(uint64_t bytes);
+    /// Reserves `bytes` (rounded up to whole chunks) of addresses for device `dev` (-1: the current one), nothing mapped.
+    bool reserve(uint64_t bytes, int dev = -1);
     /// Unmaps and frees every chunk, then the addresses.
     void release();
     uint8_t* base() const { return (uint8_t*) (uintptr_t) base_; }
+    int device() const { return dev_; }
+    uint64_t granularity() const { return gran_; }
     int64_t chunks() const { return (int64_t) h_.size(); }
     bool mapped(int64_t i) const { return i >= 0 && i < chunks() && h_[(std::size_t) i] != 0; }
     int64_t mapped_count() const;
@@ -48,6 +50,8 @@ private:
     /// chunk counts as mapped without access.
     bool commit_run(int64_t lo, int64_t hi);
     unsigned long long base_ = 0;
+    uint64_t gran_ = 0;
+    int dev_ = -1;
     std::vector<VmmChunk> h_;   // per chunk: its physical chunk, 0 = unmapped
 };
 
@@ -62,7 +66,7 @@ template <class Take> bool VmmRange::map_range(int64_t lo, int64_t hi, Take take
             continue;
         }
         VmmChunk h = take();
-        if (h == 0) h = vmm_chunk_new();
+        if (h == 0) h = vmm_chunk_new(dev_);
         if (h == 0 || !map_one(i, h)) {
             if (h != 0) vmm_chunk_free(h);
             if (run >= 0) commit_run(run, i);
