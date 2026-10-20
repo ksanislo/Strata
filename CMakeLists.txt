@@ -333,7 +333,7 @@ target_link_libraries(strata-plan PRIVATE strata_plan)
 # ---- strata_core (GPU runtime) ---------------------------------------------
 # Only built when a GPU backend is on, so the Phase 1 targets keep working without a toolkit.
 if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
-  add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp src/core/weights.cpp
+  add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/platform/numa.cpp src/core/numa_place.cpp src/core/graph.cpp src/core/weights.cpp
                                src/core/layout.cpp)
   target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   # the DFlash2 drafter (src/core/dflash2.cpp, src/kernels/cuda/dflash2.cu) exists in the CUDA and HIP builds; the Metal and SYCL builds compile without it
@@ -1555,6 +1555,10 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME spec_start_test COMMAND spec_start_test)
 endif()
 if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
+  # STRATA_NUMA_PLACE's helpers (CPU only): the layer -> node map, the spans, a bound mapping read back
+  add_executable(platform_numa_test src/platform/numa_test.cpp src/platform/numa.cpp)
+  target_include_directories(platform_numa_test PRIVATE include)
+  add_test(NAME platform_numa_test COMMAND platform_numa_test)
   add_executable(message_boundary_test src/program/message_boundary_test.cpp)
   target_include_directories(message_boundary_test PRIVATE include)
   add_test(NAME message_boundary_test COMMAND message_boundary_test)
