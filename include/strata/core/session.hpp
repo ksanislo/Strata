@@ -110,6 +110,8 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
 /// short).  `trim` first gives back what `cells` does not need - only with no window touching the session in flight.
 /// Does nothing for any other session.
 bool session_slot_fit(SessionState& s, int64_t cells, bool trim);
+/// Chunks an elastic slot session still lacks to hold `cells` cells (0 for any other session).
+int64_t session_slot_need(const SessionState& s, int64_t cells);
 /// Physical bytes its elastic arrays hold now, and their reserved addresses (0 for any other session).
 uint64_t session_slot_backed(const SessionState& s);
 uint64_t session_slot_reserved(const SessionState& s);
