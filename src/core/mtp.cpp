@@ -1551,36 +1551,17 @@ struct DraftTiming {
 DraftTiming g_dt;
 }  // namespace
 
-bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
-                       float* probs, float min_p, int* n_drafts) {
-#if defined(STRATA_GPU_METAL)
-    {
-        if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
-        const int max_steps = (int) std::min<int64_t>(std::min(max_t_ - 1, max_drafts_), (int64_t) 1 << 30);
-        const Clock::time_point t0 = Clock::now();
-        int n = 0;
-        if (!strata::metal_engine::mtp_draft(T, tokens, p, a, max_steps, drafts, probs, min_p, &n, err)) return false;
-        for (int j = n; j < max_t_ - 1; ++j) { drafts[j] = 0; if (probs) probs[j] = 0.0f; }
-        if (n_drafts) *n_drafts = n;
-        ms_draft += ms_since(t0);
-        ++rounds;
-        return true;
-    }
-#endif
-    const OnDevice on_device(device_);
-    if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
-    if (chain_live_) { err = "mtp: a pipelined chain is still in flight"; return false; }
+bool MtpDrafter::stage_round(int& T, const int32_t* tokens, int64_t p, int a, bool cp, int& max_steps,
+                             std::string& err) {
     // #783 PR-i (stuchapin909): the round runs for the cells up to the accepted row a (T = a + 1): the K/V of the rejected
     // rows is not caught up - no later read reaches a cell past the one being drafted and the next round writes it first
     if (!mtp_catchup_all()) T = a + 1;
-    const bool cp = coupled_active_;   // coupled draft sampling for this request: its own graphs
     if (!capture_round(T, cp, err)) return false;
     // Draft j writes its K/V at cell p + a + j, and the K/V ends at max_cells (its page table has no page past it):
     // near the context's end the round drafts only the cells that exist
-    const int max_steps = (int) std::min<int64_t>(std::min(max_t_ - 1, max_drafts_), st_.max_cells - (p + a));
+    max_steps = (int) std::min<int64_t>(std::min(max_t_ - 1, max_drafts_), st_.max_cells - (p + a));
     for (int j = 1; j < max_steps; ++j)
         if (!capture_step(j, cp, err)) return false;
-    const Clock::time_point t0 = Clock::now();
     const int64_t NH = g_->n_head;
     auto put = [&](int row, int64_t cell) {
         h_step_[row * 4 + 0] = (int32_t) cell;
@@ -1602,6 +1583,80 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     if (h_force_ != nullptr) for (int j = 0; j < 16; ++j) h_force_[j] = -1;   // the forcing kernels: no-ops here
     std::atomic_thread_fence(std::memory_order_seq_cst);
     if (!stage_source_R(T, err)) return false;
+    return true;
+}
+
+bool MtpDrafter::prepare_rounds(int max_T, std::string& err) {
+    const OnDevice on_device(device_);
+    for (int T = 1; T <= std::min(max_T, max_t_); ++T)
+        if (!capture_round(T, false, err)) return false;
+    for (int j = 1; j < std::min(max_t_ - 1, max_drafts_); ++j)
+        if (!capture_step(j, false, err)) return false;
+    return true;
+}
+
+bool MtpDrafter::draft_launch(int T, const int32_t* tokens, int64_t p, int a, std::string& err) {
+    const OnDevice on_device(device_);
+    if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
+    if (chain_live_ || async_live_) { err = "mtp: a draft is still in flight"; return false; }
+    const bool cp = coupled_active_;
+    int max_steps = 0;
+    async_t0_ = Clock::now();
+    if (!stage_round(T, tokens, p, a, cp, max_steps, err)) return false;
+    if (max_steps > 0) {
+        if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
+            err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+        for (int j = 1; j < max_steps; ++j)
+            if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
+                err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+        (void) cudaStreamQuery(cs_);
+    }
+    async_steps_ = max_steps;
+    async_live_ = true;
+    return true;
+}
+
+int MtpDrafter::draft_poll(int32_t* drafts, std::string& err) {
+    if (!async_live_) return 1;
+    const OnDevice on_device(device_);
+    const cudaError_t q = cudaStreamQuery(cs_);
+    if (q == cudaErrorNotReady) return 0;
+    async_live_ = false;
+    if (q != cudaSuccess) { err = std::string("mtp draft: ") + cudaGetErrorString(q); return -1; }
+    for (int j = 0; j < async_steps_; ++j) drafts[j] = ((volatile int32_t*) h_out_)[j];
+    for (int j = async_steps_; j < max_t_ - 1; ++j) drafts[j] = 0;
+    ms_draft += ms_since(async_t0_);
+    ++rounds;
+    return 1;
+}
+
+bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
+                       float* probs, float min_p, int* n_drafts) {
+#if defined(STRATA_GPU_METAL)
+    {
+        if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
+        const int max_steps = (int) std::min<int64_t>(std::min(max_t_ - 1, max_drafts_), (int64_t) 1 << 30);
+        const Clock::time_point t0 = Clock::now();
+        int n = 0;
+        if (!strata::metal_engine::mtp_draft(T, tokens, p, a, max_steps, drafts, probs, min_p, &n, err)) return false;
+        for (int j = n; j < max_t_ - 1; ++j) { drafts[j] = 0; if (probs) probs[j] = 0.0f; }
+        if (n_drafts) *n_drafts = n;
+        ms_draft += ms_since(t0);
+        ++rounds;
+        return true;
+    }
+#endif
+    const OnDevice on_device(device_);
+    if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
+    if (chain_live_ || async_live_) { err = "mtp: a pipelined chain is still in flight"; return false; }
+    const bool cp = coupled_active_;   // coupled draft sampling for this request: its own graphs
+    int max_steps = 0;
+    const Clock::time_point t0 = Clock::now();
+    if (!stage_round(T, tokens, p, a, cp, max_steps, err)) return false;
 
     SessionState* const pss = ple_ss_ ? ple_ss_ : ss_;
     const bool do_ple = pss != nullptr && pss->ple.ready() && pss->ple.table != nullptr;
