@@ -12,6 +12,7 @@
 #include "strata/core/pinned_ring.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/numa_place.hpp"
 #include "strata/platform/aux_cpus.hpp"
 
 #include "strata/core/layout.hpp"
@@ -1070,7 +1071,7 @@ void Prefill::release() {
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
     }
     for (int b = 0; b < 2; ++b) {
-        if (impl_->hand[b]) cudaFreeHost(impl_->hand[b]);
+        if (impl_->hand[b]) core::numa_host_free(impl_->hand[b]);
         if (impl_->hand_done[b]) cudaEventDestroy(impl_->hand_done[b]);
         for (cudaEvent_t& e : impl_->hand_ev[b])
             if (e) cudaEventDestroy(e);
@@ -1402,7 +1403,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     // the CPU share's staged-chunk limit, before the ring is sized below (a caller that sizes loans first armed it)
     arm_cpu_share(cpu_pool_ != nullptr);
     for (int b = 0; next_ != nullptr && b < 2; ++b)
-        if (!m.hand[b] && cudaHostAlloc((void**) &m.hand[b], (size_t) chunk * D * 4, cudaHostAllocPortable) != cudaSuccess) {
+        if (!m.hand[b] && core::numa_host_alloc((void**) &m.hand[b], (size_t) chunk * D * 4, cudaHostAllocPortable,
+                                                hand_node_) != cudaSuccess) {
             err = "prefill: the layer split's hand-off buffers";
             return false;
         }
