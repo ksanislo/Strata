@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iterator>
+#include <vector>
 
 using strata::program::batch_read_piece;
 using strata::program::concurrent_read_off;
@@ -11,6 +12,11 @@ using strata::program::ConcurrentReadSetup;
 using strata::program::piped_decode_budget_ms;
 using strata::program::piped_read_lead_in;
 using strata::program::piped_read_piece;
+using strata::program::admit_turn_cut;
+using strata::program::group_pads_reading;
+using strata::program::slot_admit_direct;
+using strata::program::slot_admit_off;
+using strata::program::SlotAdmitSetup;
 
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
@@ -80,6 +86,48 @@ int main() {
     CHECK(!piped_read_lead_in(true, true, -1.0, 400.0));
     CHECK(!piped_read_lead_in(false, true, 0.0, 400.0));
     CHECK(!piped_read_lead_in(true, false, 0.0, 400.0));
+    // slot_admit_off (STRATA_SLOT_ADMIT): needs the switch and the pipelined groups; each blocker named
+    {
+        SlotAdmitSetup s;
+        CHECK(slot_admit_off(s) != nullptr);
+        s.asked = true;
+        CHECK(slot_admit_off(s) != nullptr);
+        s.piped = true;
+        CHECK(slot_admit_off(s) == nullptr);
+        SlotAdmitSetup m = s; m.batch_mtp = true; CHECK(m.batch_mtp && slot_admit_off(m) != nullptr);
+        SlotAdmitSetup c = s; c.cvec = true; CHECK(slot_admit_off(c) != nullptr);
+        SlotAdmitSetup h = s; h.head_alias = true; CHECK(slot_admit_off(h) != nullptr);
+        SlotAdmitSetup r = s; r.conc_off = "x"; CHECK(std::strcmp(slot_admit_off(r), "x") == 0);
+    }
+    // slot_admit_direct: beside decoding slots, text, unless another cache holds `gain` tokens more
+    CHECK(!slot_admit_direct(false, false, 0, 0, 16384));      // nothing decodes: the old way stops nobody
+    CHECK(!slot_admit_direct(true, true, 0, 0, 16384));        // pictures
+    CHECK(slot_admit_direct(true, false, 0, 0, 16384));
+    CHECK(slot_admit_direct(true, false, 1000, 17000, 16384));
+    CHECK(!slot_admit_direct(true, false, 0, 16384, 16384));   // a promoted solo request: its main session holds it
+    CHECK(slot_admit_direct(true, false, 0, 1 << 20, 0));      // gain 0: always beside
+    // admit_turn_cut: the last turn token after resume; a short trailing turn of the tail role moves it back
+    {
+        const std::vector<int32_t> ids = {1, 9, 2, 3, 9, 4, 5, 9, 7, 6};
+        CHECK(admit_turn_cut(ids, 0, 9, -1) == 7);
+        CHECK(admit_turn_cut(ids, 7, 9, -1) == -1);            // none after resume
+        CHECK(admit_turn_cut(ids, 0, -1, -1) == -1);
+        CHECK(admit_turn_cut(ids, 0, 9, 7) == 7);              // the turn before it (4) is not the tail role
+        const std::vector<int64_t> t = {1, 9, 2, 9, 4, 3, 9, 8};
+        CHECK(admit_turn_cut(t, 0, 9, 7) == 6);                // turn 6's predecessor turn 3 is not the tail role
+        const std::vector<int64_t> u = {1, 9, 2, 9, 7, 9, 8};
+        CHECK(admit_turn_cut(u, 0, 9, 7) == 3);                // the turn before 5 is the tail role's: moved to 3
+        CHECK(admit_turn_cut(u, 3, 9, 7) == 5);                // not past resume
+    }
+    // group_pads_reading: a reading slot below an active one would be a pad row
+    {
+        const bool a1[4] = {false, false, true, false}, r1[4] = {false, true, false, false};
+        CHECK(group_pads_reading(a1, r1, 4));
+        const bool a2[4] = {true, false, false, false}, r2[4] = {false, true, false, false};
+        CHECK(!group_pads_reading(a2, r2, 4));
+        const bool a3[1] = {false}, r3[1] = {true};
+        CHECK(!group_pads_reading(a3, r3, 1));
+    }
     if (fails == 0) std::printf("batch_read_test: ok\n");
     return fails == 0 ? 0 : 1;
 }
