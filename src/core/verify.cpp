@@ -2828,6 +2828,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const int G = groups_[T] > 0 ? groups_[T] : 1;
     const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
     const int64_t steps = (le_ - lb_) * G;
+    struct OnExit {
+        std::function<void()> f;
+        ~OnExit() { if (f) f(); }
+    } unstage;   // a next stage staged ahead for a window that then failed stages again
     if (ar_on() && !test_stall) {
         if (flag_raised) {
             // up before the launch (early_ple_flag_mode)
@@ -2841,6 +2845,30 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         } else {
             *flag = 1;
         }
+    } else if (!test_stall && external_window()) {
+        // STRATA_STAGE_SERVE: the stage's own thread serves the layers; this one waits, and meanwhile stages the next
+        // stage's window (idle: its last window was synced) unless the overlapped split launches it already
+        start_external(T, G, steps, do_ple, ple_rows);
+        progress_at("verify window: the stage's service thread serves layers from", lb_);
+        bool next_staged = chain || next_ == nullptr || le_ >= g.n_layers;
+        uint32_t spins = 0;
+        while (x_k_.load(std::memory_order_acquire) < steps) {
+            if (!next_staged) {
+                next_->stage_inputs(T, tokens, pos0);
+                unstage.f = [this] { next_->staged_ = false; };
+                next_staged = true;
+                continue;
+            }
+            _mm_pause();
+            if ((++spins & 1023u) != 0) continue;
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+            const int r = check_external([&] { return launch_o ? launch_o->query() : cudaStreamQuery(cs_); }, err);
+#else
+            const int r = check_external([&] { return cudaStreamQuery(cs_); }, err);
+#endif
+            if (r < 0) return false;
+        }
+        if (xserved_) xserved_();
     } else
     for (int64_t k = 0; k < steps; ++k) {
         const int64_t l = lb_ + k / G;
@@ -3004,6 +3032,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
     if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
         ++windows;
+        unstage.f = nullptr;
         return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
@@ -3929,6 +3958,115 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
     return 1;
 }
 
+bool Verifier::external_window() const {
+    return xwake_ && remote_opt_ == nullptr && h_bal_ == nullptr &&
+           !(adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire));
+}
+
+void Verifier::start_external(int T, int G, int64_t total, bool ple, const uint32_t* ple_rows) {
+    x_T_ = T;
+    x_G_ = G;
+    x_total_ = total;
+    x_ple_ = ple;
+    if (ple) x_ple_rows_.assign(ple_rows, ple_rows + (size_t) T * strata::kernels::PLE_N_HEADS);
+    x_failed_.store(false, std::memory_order_relaxed);
+    x_nopool_.store(false, std::memory_order_relaxed);
+    x_k_.store(0, std::memory_order_relaxed);
+    x_since_ = Clock::now();
+    ring_now();
+    x_running_.store(true, std::memory_order_release);   // last: the server reads the rest after it
+    xwake_();
+}
+
+int Verifier::serve_external(PoolMultiFn pool, void* user) {
+    if (!x_running_.load(std::memory_order_acquire)) return 1;
+    const ModelGeometry& g = *g_;
+    SessionState& ss = *ss_;
+    const int T = x_T_, G = x_G_;
+    const int64_t total = x_total_;
+    const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
+    for (int64_t k = x_k_.load(std::memory_order_relaxed); k < total; ++k) {
+        const uint32_t want = (uint32_t) (k + 1);
+        if (*(volatile uint32_t*) h_seq_ < want) return 0;
+        // the same service as run()'s loop, step for step
+        const Clock::time_point b = Clock::now();
+        ms_wait += std::chrono::duration<double, std::milli>(b - x_since_).count();
+        const int64_t l = lb_ + k / G;
+        const int grp = (int) (k % G);
+        if (g_trace) trace_ev("RANG", k, l, 0);
+        cur_layer_ = want - 1;
+        set_plan_slot(grp);
+        const int tb = gtb[grp], n = gte[grp] - gtb[grp];
+        progress_at("verify window: the CPU experts of layer", l);
+        if (pool != nullptr && !x_nopool_.load(std::memory_order_relaxed))
+            pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
+                 h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+        if (g_trace) trace_ev(*(volatile uint32_t*) h_flagA_ == want ? "SERVED" : "SERVED-NO-PLAN-YET", k, l,
+                              (int64_t) ms_since(b));
+        progress_tick();
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        _mm_sfence();
+        if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
+            sink_.counts[0] = 0;
+            sink_.counts[1] = 0;
+            sink_.counts[2] = 0;
+            sink_.start[0] = 0;
+            sink_.start2[0] = 0;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            *(volatile uint32_t*) h_flagA_ = want;
+            raise_flag(h_flagB_, want);
+        }
+        if (k == 0 && x_ple_) {
+            const Clock::time_point tp = Clock::now();
+            if (!ss.ple.table->gather_batch(x_ple_rows_.data(), (size_t) T, h_ple_, x_err_)) {
+                x_failed_.store(true, std::memory_order_release);
+                x_running_.store(false, std::memory_order_release);
+                return -1;
+            }
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            _mm_sfence();
+            ms_host += ms_since(tp);
+        }
+        *(volatile uint32_t*) h_flag_ = want;
+        ms_pool += ms_since(b);
+        x_since_ = Clock::now();
+        ring_now();
+        if (k + 1 == total) {   // the last layer: nothing of this verifier is touched after the store
+            x_running_.store(false, std::memory_order_relaxed);   // (published by the store below)
+            x_k_.store(k + 1, std::memory_order_release);
+            return 1;
+        }
+        x_k_.store(k + 1, std::memory_order_release);
+    }
+    return 1;
+}
+
+int Verifier::check_external(const std::function<cudaError_t()>& query, std::string& err) {
+    auto give_up = [&](std::string e) {
+        err = std::move(e);
+        x_running_.store(false, std::memory_order_release);
+        return -1;
+    };
+    if (x_failed_.load(std::memory_order_acquire)) return give_up("verify: " + x_err_ + released_note(release_gpu_waits(5000)));
+    const auto now = Clock::now();
+    if (now - last_ring() <= std::chrono::milliseconds(2) || now - ext_checked_ < std::chrono::milliseconds(1)) return 0;
+    ext_checked_ = now;
+    const int64_t k = x_k_.load(std::memory_order_acquire);
+    if (k >= x_total_) return 0;
+    const int64_t l = lb_ + k / std::max(x_G_, 1);
+    const cudaError_t q = query();
+    if (q != cudaErrorNotReady && *(volatile uint32_t*) h_seq_ < (uint32_t) (k + 1)) {
+        trace_ev("NEVER-RANG", k, l, (int64_t) q);
+        return give_up("verify: layer " + std::to_string(l) + " never rang (" +
+                       (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")");
+    }
+    if (now - last_ring() > std::chrono::seconds(20)) {
+        trace_ev("TIMEOUT", k, l, (int64_t) q);
+        return give_up("verify: timed out at layer " + std::to_string(l) + released_note(release_gpu_waits(5000)));
+    }
+    return 0;
+}
+
 // #879: STRATA_NAN_GUARD=0 turns the guard off (no kernel is recorded; the graphs are captured once, so it is read once)
 bool Verifier::nan_guard_on() {
     static const bool on = [] {
@@ -4010,7 +4148,7 @@ void Verifier::diag_pipelined(std::FILE* f, const char* name) const {
     };
     std::fprintf(f, "  %s: %s T=%d pos %lld served %lld/%lld; GPU rang %u, flags served %u A %u B %u; window event %s, "
                     "commit event %s (commit launched %d)\n", name, fl_active_ ? "IN FLIGHT" : "idle", last_t_,
-                 (long long) last_pos0_, (long long) fl_k_, (long long) fl_total_, rd(h_seq_), rd(h_flag_), rd(h_flagA_),
+                 (long long) last_pos0_, (long long) (fl_ext_ ? x_k_.load() : fl_k_), (long long) fl_total_, rd(h_seq_), rd(h_flag_), rd(h_flagA_),
                  rd(h_flagB_), ev(ev_done_), ev(ev_commit_), (int) commit_live_);
 }
 
@@ -4105,12 +4243,28 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     (void) cudaStreamQuery(cs_);   // WDDM: submit now
     fl_active_ = true;
     fl_since_ms_ = fl_flush_ms_ = fl_launch_ms_ = now_ms();
+    fl_ext_ = !ar_on() && external_window();   // STRATA_STAGE_SERVE: the stage's thread serves it, service() checks
+    if (fl_ext_) start_external(T, G, fl_total_, fl_ple_, pl_ple_rows_.data());
     return true;
 }
 
 int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
     if (!fl_active_) return 1;
     if (fl_k_ >= fl_total_) return 1;
+    if (fl_ext_) {   // served by the stage's thread: done, or still running, or stuck
+        if (pool == nullptr) x_nopool_.store(true, std::memory_order_relaxed);   // (a window whose picks are dropped)
+        if (x_k_.load(std::memory_order_acquire) >= fl_total_) {
+            fl_k_ = fl_total_;
+            fl_since_ms_ = fl_flush_ms_ = now_ms();
+            if (xserved_) xserved_();
+            return 1;
+        }
+        return check_external([&] {
+            const OnDevice on_device(device_);
+            (void) cudaStreamQuery(cs_);   // (flushes WDDM, as below)
+            return cudaEventQuery(ev_done_);
+        }, err);
+    }
     // Nothing rang yet and neither the WDDM flush nor the timeout below is due: return before any CUDA call.  The
     // pipelined loop asks both stages' windows this millions of times a second while they wait on their doorbells,
     // and the device switch (OnDevice: cudaGetDevice and two cudaSetDevice) made that a few driver calls each time:
