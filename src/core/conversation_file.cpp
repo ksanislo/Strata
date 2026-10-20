@@ -29,6 +29,7 @@
 #include <process.h>
 #else
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
@@ -384,6 +385,7 @@ public:
         size = (uint64_t) st.st_size;
         return true;
     }
+    int fd() const { return fd_; }   // session_file_map
     bool is_open() const { return fd_ >= 0; }
     bool direct() const { return direct_; }
     bool write_all(const uint8_t* p, size_t n) {
@@ -687,12 +689,19 @@ void put_checkpoint(Out& o, const ConversationCheckpoint& c) {
     o.u64(c.used);
 }
 
-void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr) {
+// `pick`: the checkpoints to write by index (nullptr: all of them)
+void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr,
+                 const std::vector<size_t>* pick = nullptr) {
     for (int64_t g : s.geometry) o.i64(g);
     o.i64(s.layer_lo); o.i64(s.layer_hi); o.u64(s.cvec ? 1 : 0);
     put_checkpoint(o, s.live);
-    o.u64(s.checkpoints.size());
-    for (const auto& c : s.checkpoints) put_checkpoint(o, c);
+    if (pick) {
+        o.u64(pick->size());
+        for (size_t i : *pick) put_checkpoint(o, s.checkpoints[i]);
+    } else {
+        o.u64(s.checkpoints.size());
+        for (const auto& c : s.checkpoints) put_checkpoint(o, c);
+    }
     if (sources) {
         o.u64(sources->size());
         for (const auto& k : *sources) {
@@ -711,12 +720,30 @@ void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKv
 // The whole payload: the first stage's, then (v2) the stage count and each later stage's.  `stage_sources`, when
 // given, has one source list per stage image.
 void put_all(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources,
-             const std::vector<std::vector<SessionKvSource>>* stage_sources) {
-    put_payload(o, s, sources);
+             const std::vector<std::vector<SessionKvSource>>* stage_sources, const std::vector<size_t>* pick) {
+    put_payload(o, s, sources, pick);
     if (s.stage_images.empty()) return;
     o.u64(s.stage_images.size());
     for (size_t k = 0; k < s.stage_images.size(); ++k)
-        put_payload(o, s.stage_images[k], stage_sources ? &(*stage_sources)[k] : nullptr);
+        put_payload(o, s.stage_images[k], stage_sources ? &(*stage_sources)[k] : nullptr, pick);
+}
+
+// SessionWriteOptions::deepest_checkpoint_only: the deepest checkpoint's index, written for every stage (the
+// stages' lists are parallel: conversation_checkpoints_split); none when they do not line up
+std::vector<size_t> deepest_pick(const SavedConversation& s) {
+    if (s.checkpoints.empty()) return {};
+    for (const auto& st : s.stage_images)
+        if (st.checkpoints.size() != s.checkpoints.size()) return {};
+    // as session_deepest_checkpoint: with a pinned shared prefix in the chain, the deepest PINNED one
+    bool any_pinned = false;
+    for (const auto& c : s.checkpoints) any_pinned = any_pinned || c.pinned;
+    size_t best = s.checkpoints.size();
+    for (size_t i = 0; i < s.checkpoints.size(); ++i)
+        if ((!any_pinned || s.checkpoints[i].pinned) &&
+            (best == s.checkpoints.size() || s.checkpoints[i].ids.size() > s.checkpoints[best].ids.size())) best = i;
+    for (const auto& st : s.stage_images)
+        if (st.checkpoints[best].ids != s.checkpoints[best].ids) return {};
+    return {best};
 }
 
 // ---- parsing: every count is checked against the bytes left and the caller's limits before anything is allocated
@@ -728,10 +755,19 @@ struct In {
     const SessionReadLimits* lim;   // the bounds of the image being parsed (a v2 read moves it to each stage's)
     SessionError kind = SessionError::invalid;
     size_t kv_layer = 0;
+    // session_file_map: the payload is read from a mapping, and the K/V buffers become views into it
+    const uint8_t* mem = nullptr;
+    std::shared_ptr<const void> keep;
     bool fail(const std::string& m) { if (error.empty()) error = "session file: " + m; return false; }
     bool raw(void* p, size_t c) {
         if (c > left) return fail("payload ends early");
-        if (c && !f->read(p, c)) { kind = f->kind(); return fail("read error: " + f->error()); }
+        if (mem) {
+            std::memcpy(p, mem, c);
+            mem += c;
+        } else if (c && !f->read(p, c)) {
+            kind = f->kind();
+            return fail("read error: " + f->error());
+        }
         hash.update(p, c);
         left -= c;
         return true;
@@ -758,6 +794,13 @@ struct In {
         const uint64_t limit = kv_layer < lim->max_kv_bytes.size() ? lim->max_kv_bytes[kv_layer][part] : UINT64_MAX;
         if (!count(n, 1, limit)) return false;
         b = {};
+        if (mem) {   // a view into the mapping: hashed here (this pass reads every page), never copied
+            b = ConversationBuffer::view(mem, (size_t) n, keep);
+            hash.update(mem, (size_t) n);
+            mem += n;
+            left -= n;
+            return true;
+        }
         b.resize((size_t) n);
         return b.visit(0, b.size(), [&](uint8_t* p, size_t c, size_t) { return raw(p, c); });
     }
@@ -1090,8 +1133,11 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
         for (const auto& st_img : image.stage_images)
             if (!st_img.kv.empty()) { error = "session file: K/V given both in a stage image and as sources"; return false; }
     const uint32_t version = image.stage_images.empty() ? kVersion : kVersionSplit;
+    std::vector<size_t> pick_list;
+    const std::vector<size_t>* pick = nullptr;
+    if (opt.deepest_checkpoint_only) { pick_list = deepest_pick(image); pick = &pick_list; }
     Out sizing;
-    put_all(sizing, image, sources, stage_sources);
+    put_all(sizing, image, sources, stage_sources, pick);
     if (sizing.overflow || sizing.n > UINT64_MAX - kHeader - kTrailer ||
         sizing.n + kHeader + kTrailer > (uint64_t) std::numeric_limits<size_t>::max()) {
         error = "session file: the state is too large for this build";
@@ -1134,7 +1180,7 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     Out out;
     out.f = &f;
     out.hash = &hash;
-    if (ok) put_all(out, image, sources, stage_sources);
+    if (ok) put_all(out, image, sources, stage_sources, pick);
     ok = ok && out.ok && out.n == payload;
     if (ok) {
         const uint64_t ph = hash.digest();
@@ -1319,6 +1365,145 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
     }
     if (status) *status = st;
     return ok;
+}
+
+
+bool session_file_peek(const std::string& path, const SessionFileIdentity& id, SessionPeek& out, std::string& error) {
+    error.clear();
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) { error = "session file: cannot open " + path + ": " + std::strerror(errno); return false; }
+    struct Close { std::FILE* f; ~Close() { std::fclose(f); } } close_f{f};
+    auto fail = [&](const std::string& m) { error = "session file: " + path + ": " + m; return false; };
+    if (std::fseek(f, 0, SEEK_END) != 0) return fail("seek failed");
+    const long long size = std::ftell(f);
+    if (size < (long long) (kHeader + kTrailer) || std::fseek(f, 0, SEEK_SET) != 0) return fail("too short");
+    uint8_t h[kHeader];
+    if (std::fread(h, 1, kHeader, f) != kHeader) return fail("header read error");
+    uint32_t version = 0, hsize = 0;
+    uint64_t model = 0, config = 0, payload = 0, hh = 0;
+    std::memcpy(&version, h + 8, 4); std::memcpy(&hsize, h + 12, 4);
+    std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8); std::memcpy(&payload, h + 32, 8);
+    std::memcpy(&hh, h + 56, 8);
+    if (std::memcmp(h, kMagic, 8) != 0) return fail("not a Strata session file (magic)");
+    if (hh != session_hash64(h, 56, 0)) return fail("header checksum mismatch");
+    if (version != kVersion && version != kVersionSplit) return fail("unsupported version " + std::to_string(version));
+    if (hsize != kHeader) return fail("invalid header fields");
+    if (model != id.model) return fail("saved with another model (model fingerprint differs)");
+    if (config != id.config) return fail("saved with another engine configuration (config fingerprint differs)");
+    if ((uint64_t) size != kHeader + payload + kTrailer) return fail("size does not match the header");
+    uint64_t left = payload;
+    auto get = [&](void* p, size_t n) {
+        if (n > left || std::fread(p, 1, n, f) != n) return false;
+        left -= n;
+        return true;
+    };
+    auto skip = [&](uint64_t n) {
+        if (n > left || std::fseek(f, (long) n, SEEK_CUR) != 0) return false;   // long is 64-bit on LP64 Linux
+        left -= n;
+        return true;
+    };
+    auto u64 = [&](uint64_t& v) { return get(&v, 8); };
+    // ids, imgs; then (state) five length-prefixed arrays and `used`, skipped
+    auto head = [&](ConversationCheckpoint& c, bool keep) {
+        uint64_t n = 0;
+        if (!u64(n) || n > left / 4) return false;
+        if (keep) { c.ids.resize((size_t) n); if (!get(c.ids.data(), (size_t) n * 4)) return false; }
+        else if (!skip(n * 4)) return false;
+        if (!u64(n) || n > left / 16) return false;
+        if (keep) c.imgs.resize((size_t) n);
+        for (uint64_t i = 0; i < n; ++i) {
+            int64_t start = 0; uint64_t hash = 0;
+            if (!get(&start, 8) || !u64(hash)) return false;
+            if (keep) c.imgs[(size_t) i] = {start, hash};
+        }
+        for (int a = 0; a < 5; ++a) { if (!u64(n) || !skip(n)) return false; }
+        return skip(8);   // used
+    };
+    SessionPeek p;
+    p.version = version;
+    p.bytes = (uint64_t) size;
+    if (!skip(18 * 8 + 2 * 8)) return fail("payload ends early");   // geometry, layer range
+    uint64_t cvec = 0;
+    if (!u64(cvec) || cvec > 1) return fail("invalid cvec flag");
+    p.cvec = cvec == 1;
+    if (!head(p.live, true)) return fail("payload ends early (live state)");
+    uint64_t n = 0;
+    if (!u64(n) || n > left / 72) return fail("invalid checkpoint count");
+    for (uint64_t i = 0; i < n; ++i) {
+        ConversationCheckpoint c;
+        if (!head(c, true)) return fail("payload ends early (checkpoint)");
+        if (c.ids.size() > p.deepest.ids.size()) p.deepest = std::move(c);
+    }
+    out = std::move(p);
+    return true;
+}
+
+
+bool session_file_map(const std::string& path, const SessionFileIdentity& id, SavedConversation& image, size_t& bytes,
+                      std::string& error, const SessionReadLimits& limits, SessionStatus* status) {
+#ifdef _WIN32
+    return session_file_read(path, id, image, bytes, error, limits, status);
+#else
+    SessionStatus st;
+    st.error = SessionError::invalid;
+    auto done = [&](bool ok) { if (status) *status = st; return ok; };
+    error.clear();
+    try {
+        RawFile raw;
+        uint64_t size = 0;
+        if (!raw.open_session(path, size)) {
+            st.error = raw.refused() ? SessionError::invalid : raw.kind();
+            error = "session file: " + path + ": " + raw.error();
+            return done(false);
+        }
+        if (size < kHeader + kTrailer) { error = "session file: size " + std::to_string(size) + " is below the minimum"; return done(false); }
+        const uint64_t max_size = session_read_max_file_bytes(limits);
+        if (size > max_size || size > (uint64_t) std::numeric_limits<size_t>::max()) {
+            error = "session file: size " + std::to_string(size) + " exceeds this engine's limit";
+            return done(false);
+        }
+        void* m = ::mmap(nullptr, (size_t) size, PROT_READ, MAP_PRIVATE, raw.fd(), 0);
+        if (m == MAP_FAILED) { st.error = errno_kind(errno); error = std::string("session file: mmap: ") + std::strerror(errno); return done(false); }
+        const size_t len = (size_t) size;
+        std::shared_ptr<const void> keep(m, [len](const void* p) { ::munmap(const_cast<void*>(p), len); });
+        ::madvise(m, len, MADV_SEQUENTIAL);
+        const uint8_t* h = static_cast<const uint8_t*>(m);
+        uint32_t version = 0, hsize = 0;
+        uint64_t model = 0, config = 0, payload = 0, r0 = 0, r1 = 0, hh = 0;
+        std::memcpy(&version, h + 8, 4); std::memcpy(&hsize, h + 12, 4);
+        std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8); std::memcpy(&payload, h + 32, 8);
+        std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
+        if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return done(false); }
+        if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return done(false); }
+        if (version != kVersion && version != kVersionSplit) { error = "session file: unsupported version " + std::to_string(version); return done(false); }
+        if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields"; return done(false); }
+        if (model != id.model) { error = "session file: saved with another model (model fingerprint differs)"; return done(false); }
+        if (config != id.config) { error = "session file: saved with another engine configuration (config fingerprint differs)"; return done(false); }
+        if (payload > size || size - kHeader - kTrailer != payload) { error = "session file: size does not match the header"; return done(false); }
+        SavedConversation parsed;
+        In in{nullptr, SessionHasher(0), payload, error, &limits};
+        in.mem = h + kHeader;
+        in.keep = keep;
+        if (!get_all(in, parsed, version)) { st.error = in.kind; return done(false); }
+        if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return done(false); }
+        uint64_t ph = 0;
+        std::memcpy(&ph, h + kHeader + payload, 8);
+        if (ph != in.hash.digest()) { error = "session file: payload checksum mismatch"; return done(false); }
+        if (std::memcmp(h + kHeader + payload + 8, kEnd, 8) != 0) { error = "session file: bad end marker"; return done(false); }
+        if (limits.admit) {   // what was copied: the running state, checkpoints and token lists
+            std::string why;
+            if (!limits.admit(parsed.bytes(), why)) { st.error = SessionError::memory; error = "session file: " + why; return done(false); }
+        }
+        image = std::move(parsed);
+        bytes = len;
+        st.error = SessionError::none;
+        return done(true);
+    } catch (const std::bad_alloc&) {
+        error = "session file: out of memory while mapping " + path;
+        st.error = SessionError::memory;
+        return done(false);
+    }
+#endif
 }
 
 } // namespace strata::core
