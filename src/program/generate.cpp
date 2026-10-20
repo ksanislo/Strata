@@ -40,6 +40,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
+#include "strata/core/slot_sizing.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/cpu/expert.hpp"
@@ -171,6 +172,28 @@ std::string vram_free_note() {
     std::snprintf(buf, sizeof buf, " (%llu MiB of %llu MiB VRAM free on this GPU)", (unsigned long long) (free_b >> 20),
                   (unsigned long long) (total_b >> 20));
     return buf;
+}
+
+// STRATA_ELASTIC_SLOTS (read once; off by default): the --batch slot sessions keep only their sequence state and borrow
+// the stage's RoPE table ("lean"), and with "1" their K/V and indexer arrays are also reserved, not backed, and grow with
+// the conversation from a per-card budget of STRATA_ELASTIC_SLOTS_MIB (default 1024), in steps of
+// STRATA_ELASTIC_SLOTS_STEP cells (default 4096).  CUDA only (one VMM device per stage); 0 = off, 1 = lean, 2 = elastic
+int elastic_slots_mode() {
+    static const int m = [] {
+        const char* v = std::getenv("STRATA_ELASTIC_SLOTS");
+        if (v == nullptr || v[0] == '\0' || v[0] == '0') return 0;
+        if (std::strcmp(v, "lean") == 0) return 1;
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
+        return 1;
+#else
+        return 2;
+#endif
+    }();
+    return m;
+}
+int64_t elastic_slots_env(const char* name, int64_t dflt) {
+    const char* v = std::getenv(name);
+    return v != nullptr && std::atoll(v) > 0 ? std::atoll(v) : dflt;
 }
 
 // STRATA_PIPE_BYIELD_NODRAIN=1 (read once; off by default): with the pipelined groups, a BYIELD that reaches the main
@@ -5347,21 +5370,27 @@ int main(int argc, char** argv) {
                              "one group\n", o.batch_groups, o.batch);
         o.batch_groups = 1;
     }
+    uint64_t slot_bytes0 = 0, slot_budget0 = 0;   // CUDA0's: each slot session's carve, and the elastic slots' budget
     if (o.batch > 0) {
         bslot_ss.resize(1 + stages.size());
         int fit = o.batch;   // the slots every stage could carve
-        uint64_t bytes0 = 0;
         for (size_t k = 0; k < bslot_ss.size(); ++k) {
             const int dev = k == 0 ? 0 : stages[k - 1]->dev;
             const int64_t lo = k == 0 ? 0 : stages[k - 1]->lb;
             const int64_t hi = k == 0 ? (multi_gpu ? split_at[0] : -1) : stages[k - 1]->le;
             const strata::core::OnDevice on_k(dev);
-            const uint64_t bytes = strata::core::session_bytes(g, o.max_context, K, lo, hi);
-            if (k == 0) bytes0 = bytes;
+            // STRATA_ELASTIC_SLOTS: 1 = only the sequence state, the stage session's RoPE table; 2 = and elastic arrays
+            const strata::core::SessionState& stage_ss = k == 0 ? ss : stages[k - 1]->ss;
+            const strata::core::QsaState* rope =
+                g.n_qsa_layers() > 0 ? &stage_ss.qsa_states[stage_ss.qsa_primary()] : nullptr;
+            const int slot_kind = elastic_slots_mode() == 0 ? 0
+                                : elastic_slots_mode() == 2 && strata::core::vmm_available(dev) ? 2 : 1;
+            const uint64_t bytes = strata::core::session_bytes(g, o.max_context, K, lo, hi, slot_kind);
             for (int b = 0; b < fit; ++b) {
                 auto u = std::make_unique<strata::core::SessionState>();
                 void* buf = nullptr;
-                if (cudaMalloc(&buf, bytes) != cudaSuccess || strata::core::session_init(g, o.max_context, K, buf, *u, lo, hi) == 0) {
+                if (cudaMalloc(&buf, bytes) != cudaSuccess ||
+                    strata::core::session_init(g, o.max_context, K, buf, *u, lo, hi, slot_kind, rope) == 0) {
                     cudaGetLastError();
                     if (buf != nullptr) cudaFree(buf);
                     size_t fb = 0, tb = 0;
@@ -5372,14 +5401,46 @@ int main(int argc, char** argv) {
                     fit = b;
                     break;
                 }
-                strata::core::session_zero(*u, g, nullptr, nullptr);
+                if (slot_kind == 0) strata::core::session_zero(*u, g, nullptr, nullptr);
                 bslot_ss[k].push_back(std::move(u));
             }
+            uint64_t budget = 0, reserved = 0;
+            const bool elastic = !bslot_ss[k].empty() && bslot_ss[k][0]->slot_cells >= 0;
+            if (elastic) {
+                // the budget the slots grow into, made now: the expert cache is sized around it
+                for (auto& u : bslot_ss[k]) reserved += strata::core::session_slot_reserved(*u);
+                budget = strata::core::qsa_slot_budget_add(
+                    dev, std::min<uint64_t>((uint64_t) elastic_slots_env("STRATA_ELASTIC_SLOTS_MIB", 1024) << 20, reserved));
+                for (size_t b = 0; b < bslot_ss[k].size(); ++b)
+                    if (!strata::core::session_slot_fit(*bslot_ss[k][b], 1, false)) {
+                        std::fprintf(stderr, "strata generate: WARNING: --batch %d: elastic slot %zu has no budget left "
+                                             "on CUDA%d; %zu slot%s\n", o.batch, b, dev, b, b == 1 ? "" : "s");
+                        fit = std::min(fit, (int) b);
+                        bslot_ss[k].resize(b);
+                        break;
+                    }
+            }
+            if (slot_kind != 0)
+                for (auto& u : bslot_ss[k]) strata::core::session_zero(*u, g, nullptr, nullptr);
             cudaDeviceSynchronize();
+            if (k == 0) { slot_bytes0 = bytes; slot_budget0 = budget; }
             size_t fb = 0, tb = 0;
             cudaMemGetInfo(&fb, &tb);
             std::fprintf(stderr, "strata generate: --batch: %d slot sessions on CUDA%d (%.2f GiB each); %.2f GiB free\n",
                          (int) bslot_ss[k].size(), dev, (double) bytes / 1073741824.0, (double) fb / 1073741824.0);
+            if (elastic) {
+                uint64_t backed = 0, bt = 0, bf = 0;
+                for (auto& u : bslot_ss[k]) backed += strata::core::session_slot_backed(*u);
+                strata::core::qsa_slot_budget(dev, bt, bf);
+                const double n = (double) std::max<size_t>(bslot_ss[k].size(), 1);
+                std::fprintf(stderr, "strata generate: elastic slots on CUDA%d: per slot %.1f MiB carved + %.1f MiB "
+                                     "reserved, %.1f MiB backed; budget %.0f MiB, %.0f MiB of it free\n", dev,
+                             (double) bytes / 1048576.0, (double) reserved / n / 1048576.0,
+                             (double) backed / n / 1048576.0, (double) bt / 1048576.0, (double) bf / 1048576.0);
+            } else if (slot_kind != 0) {
+                std::fprintf(stderr, "strata generate: lean slots on CUDA%d (sequence state only, the stage's RoPE "
+                                     "table%s)\n", dev, elastic_slots_mode() == 2 ? "; no VMM on this device" : "");
+            }
         }
         for (auto& v : bslot_ss) if ((int) v.size() > fit) v.resize((size_t) fit);   // the same count on every stage
         if (fit < 2) {
@@ -5401,7 +5462,7 @@ int main(int argc, char** argv) {
             // the sessions' VRAM is the expert cache's: say what it costs (docs/BATCHING.md has the measured trade)
             std::fprintf(stderr, "strata generate: --batch %d: the slot sessions take %.2f GiB of VRAM on CUDA0 that the "
                                  "expert cache would otherwise hold\n", o.batch,
-                         (double) bytes0 * o.batch / 1073741824.0);
+                         (double) (slot_bytes0 * o.batch + slot_budget0) / 1073741824.0);
         }
     }
 
@@ -11248,8 +11309,111 @@ int main(int argc, char** argv) {
             if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
             return true;
         };
+        // STRATA_ELASTIC_SLOTS: slot b's sessions on every stage backed for `need` cells - whole steps past it, else
+        // just `need`.  `trim` gives back first what that does not need: only with no window in flight
+        const int64_t eslot_step = elastic_slots_env("STRATA_ELASTIC_SLOTS_STEP", 4096);
+        const bool eslots_on = !bslot_ss.empty() && [&] {
+            for (const auto& v : bslot_ss) if (!v.empty() && v[0]->slot_cells >= 0) return true;
+            return false;
+        }();
+        auto eslot_dev = [&](size_t k) { return k == 0 ? 0 : stages[k - 1]->dev; };
+        auto slot_fit = [&](int b, int64_t need, bool trim) -> bool {
+            const int64_t target = strata::core::slot_grow_target(need, eslot_step, o.max_context);
+            for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                strata::core::SessionState& u = *bslot_ss[k][(size_t) b];
+                if (u.slot_cells < 0 || (!trim && need <= u.slot_cells)) continue;
+                const strata::core::OnDevice on_k(eslot_dev(k));
+                if (!strata::core::session_slot_fit(u, target, trim) && !strata::core::session_slot_fit(u, need, false))
+                    return false;
+            }
+            return true;
+        };
+        // per card: MiB the slot's elastic arrays hold, and the budget's free MiB
+        auto slot_mem_note = [&](int b) {
+            std::string r;
+            for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                const strata::core::SessionState& u = *bslot_ss[k][(size_t) b];
+                if (u.slot_cells < 0) continue;
+                uint64_t bt = 0, bf = 0;
+                strata::core::qsa_slot_budget(eslot_dev(k), bt, bf);
+                char x[96];
+                std::snprintf(x, sizeof x, "%sCUDA%d %.0f MiB (budget %.0f free)", r.empty() ? "" : ", ", eslot_dev(k),
+                              (double) strata::core::session_slot_backed(u) / 1048576.0, (double) bf / 1048576.0);
+                r += x;
+            }
+            return r;
+        };
+        // an admission into slot b (everything drained): it is trimmed to its new conversation and backed for it; when the
+        // budget is short, idle slots give their memory back and drop the conversations they keep (parked reads last)
+        auto slot_admit_fit = [&](int b, int64_t upto, std::string& e) -> bool {
+            if (!eslots_on) return true;
+            for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                const strata::core::OnDevice on_k(eslot_dev(k));
+                if (cudaDeviceSynchronize() != cudaSuccess) { e = "elastic slots: device sync failed"; return false; }
+            }
+            bool ok = slot_fit(b, upto + 1, true);
+            for (int pass = 0; !ok && pass < 2; ++pass)
+                for (int j = 0; !ok && j < (int) bs.size(); ++j) {
+                    BSlot& sj = bs[(size_t) j];
+                    bool big = false;
+                    for (const auto& v : bslot_ss) big = big || v[(size_t) j]->slot_cells > 1;
+                    if (j == b || sj.active || sj.partial != (pass == 1) || !big) continue;
+                    for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                        strata::core::SessionState& u = *bslot_ss[k][(size_t) j];
+                        if (u.slot_cells < 0) continue;
+                        const strata::core::OnDevice on_k(eslot_dev(k));
+                        (void) strata::core::session_slot_fit(u, 1, true);
+                        strata::core::session_zero(u, g, nullptr, nullptr);   // its K/V map named the slots given back
+                        if (cudaDeviceSynchronize() != cudaSuccess) { e = "elastic slots: device sync failed"; return false; }
+                    }
+                    std::fprintf(stderr, "strata batch: elastic slots: slot %d gives its memory to slot %d and drops the "
+                                         "%zu tokens it kept%s\n", j, b, sj.ids.size(), sj.partial ? " (a parked read)" : "");
+                    sj.cached = false;
+                    sj.partial = false;
+                    ok = slot_fit(b, upto + 1, true);
+                }
+            // a trimmed slot's K/V map may name page slots given back: it starts over before anything reads it (the copy
+            // after this, or a pad row when the admission fails)
+            for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                strata::core::SessionState& u = *bslot_ss[k][(size_t) b];
+                if (u.slot_cells < 0) continue;
+                const strata::core::OnDevice on_k(eslot_dev(k));
+                strata::core::session_zero(u, g, nullptr, nullptr);
+                if (cudaDeviceSynchronize() != cudaSuccess) { e = "elastic slots: device sync failed"; return false; }
+            }
+            if (!ok) {
+                e = "elastic slots: the slot budget (STRATA_ELASTIC_SLOTS_MIB) has no room for " + std::to_string(upto) +
+                    " cells in slot " + std::to_string(b);
+                return false;
+            }
+            std::fprintf(stderr, "strata batch: elastic slot %d holds %lld cells: %s\n", b, (long long) upto,
+                         slot_mem_note(b).c_str());
+            return true;
+        };
+        // a decoding slot whose next window would need memory the budget does not have ends there (`length`); its state
+        // is whole (no window of it is in flight), so it stays a cache
+        auto slot_grow_or_end = [&](int b, int64_t need) -> bool {
+            BSlot& sl = bs[(size_t) b];
+            bool backed = true;
+            for (const auto& v : bslot_ss) backed = backed && (v[(size_t) b]->slot_cells < 0 || need <= v[(size_t) b]->slot_cells);
+            if (backed) return true;
+            if (slot_fit(b, need, false)) {
+                std::fprintf(stderr, "strata batch: elastic slot %d grows at %lld cells: %s\n", b, (long long) need,
+                             slot_mem_note(b).c_str());
+                return true;
+            }
+            std::fprintf(stderr, "strata batch: elastic slot %d ends at %lld tokens: the slot budget has no room to grow "
+                                 "(STRATA_ELASTIC_SLOTS_MIB)\n", b, (long long) sl.p);
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+            std::printf("BDONE %d %lld length %.1f\n", b, (long long) sl.produced, ms);
+            std::fflush(stdout);
+            sl.active = false;
+            sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
+            return false;
+        };
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
+            if (!slot_admit_fit(b, upto, e)) return false;
             if (slot_copy_direct) {
                 if (!direct_slot_copy(true, b, ids, e)) return false;
             } else
@@ -11348,6 +11512,9 @@ int main(int argc, char** argv) {
             int first[strata::kernels::kVerifyMaxT] = {}, active[strata::kernels::kVerifyMaxT] = {};
             static size_t next_slot = 0;
             // Each MTP slot uses two rows; rotate slots when more than four are active.
+            if (eslots_on)
+                for (int b = 0; b < (int) bs.size(); ++b)
+                    if (bs[(size_t) b].active) (void) slot_grow_or_end(b, bs[(size_t) b].p + (batch_mtp ? 3 : 2));
             int A = 0;
             for (size_t offset = 0; offset < bs.size() && S + (batch_mtp ? 2 : 1) <= strata::kernels::kVerifyMaxT; ++offset) {
                 const int b = (int) ((next_slot + offset) % bs.size());
@@ -11779,6 +11946,11 @@ int main(int argc, char** argv) {
                     }
                     if (pick < 0) continue;
                     rr = pick + 1;
+                    if (eslots_on) {   // its rows' slots backed on every stage before the window starts (pad rows: cell 0)
+                        for (int t = 0; t < GS; ++t)
+                            if (bs[(size_t) (pick * GS + t)].active) (void) slot_grow_or_end(pick * GS + t, bs[(size_t) (pick * GS + t)].p + 2);
+                        if (!group_active(pick)) continue;
+                    }
                     PGroup& G = pg[(size_t) pick];
                     G.S = 0;
                     G.active = 0;
