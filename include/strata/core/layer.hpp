@@ -336,6 +336,14 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
 /// slot states map as their conversations grow and give back when trimmed.
 uint64_t qsa_slot_budget_add(int dev, uint64_t bytes);   ///< returns the bytes made
 void qsa_slot_budget(int dev, uint64_t& total, uint64_t& free);
+/// STRATA_ELASTIC_SLOTS_GIVE: the expert cache hands a chunk of its own to the budget, and takes up to `n` free ones back
+/// (appended to `out`; returns how many).
+void qsa_slot_budget_give(int dev, VmmChunk h);
+int64_t qsa_slot_budget_take(int dev, int64_t n, std::vector<VmmChunk>& out);
+/// Chunks the budget holds now; `free` of them unused, `made` made at load.
+int64_t qsa_slot_budget_chunks(int dev, int64_t* free, int64_t* made);
+/// Chunks the states still lack to hold `cells` cells.
+int64_t qsa_slots_need(const std::vector<const QsaState*>& states, int64_t cells);
 /// Backs `cells` cells in every state (all on one device): all or nothing, false when the budget is short.  New chunks
 /// are zeroed on a stream of their own; a window in flight on other memory is not waited for.
 bool qsa_slots_grow(const std::vector<const QsaState*>& states, int64_t cells);
