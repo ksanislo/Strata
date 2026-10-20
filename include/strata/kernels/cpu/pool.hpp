@@ -210,6 +210,12 @@ public:
     ExpertPool& operator=(const ExpertPool&) = delete;
 
     int workers() const { return n_; }
+    /// The prompt path's CPU share takes the pool for a chunk only when no other stage's prompt path holds it.
+    bool try_hold() {
+        bool expect = false;
+        return hold_.compare_exchange_strong(expect, true, std::memory_order_acq_rel);
+    }
+    void release_hold() { hold_.store(false, std::memory_order_release); }
     /// What bounded the default worker count (pool_plan.hpp; "" when a count was configured), the physical cores
     /// and logical processors counted - for the start-up line.
     const char* plan_limit() const { return plan_limit_; }
@@ -416,6 +422,7 @@ private:
     std::string numa_counters() const;
     PoolAffinity affinity_ = PoolAffinity::All;
     CpuTopology topo_;
+    std::atomic<bool> hold_{false};   // try_hold
     int stage_slot_ = -1;   // STRATA_STAGE_SERVE: its place in the watchdog's list of stage pools
 };
 
