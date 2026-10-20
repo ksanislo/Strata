@@ -1,6 +1,8 @@
 
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
 #include "strata/core/layer.hpp"
+#include "strata/core/on_device.hpp"
+#include "strata/core/slot_sizing.hpp"
 #include "strata/core/pin_budget.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
@@ -45,7 +47,9 @@
 #ifndef _WIN32
 #include <sys/mman.h>
 #endif
+#include <map>
 #include <memory>
+#include <mutex>
 #include <vector>
 namespace strata::core {
 namespace { bool g_shared_early = true; bool g_fused_gr = false; bool g_fast_attn = true; bool g_publish_kernel = true; bool g_fused_gdn = true; bool g_fast_select = true; }
@@ -764,25 +768,193 @@ uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8
     return int8 ? (uint64_t) pages * s.page_size * strata::kernels::kv_q8_bytes_per_cell(s) + 64
                 : (uint64_t) pages * s.n_head_kv * s.page_size * s.head_dim * 2 * 2;
 }
+/// Bytes per page slot of each K/V pool array, in the order qsa_state_init assigns them.
+std::vector<uint64_t> kv_per_slot(const QsaShapes& s, bool hybrid, bool q4, bool int8) {
+    const uint64_t slot_rows = (uint64_t) s.n_head_kv * s.page_size;
+    const uint64_t scale_row = (uint64_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
+    const uint64_t q4_row = strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
+    if (hybrid) return {slot_rows * s.head_dim, slot_rows * scale_row, slot_rows * q4_row};
+    if (q4) return {slot_rows * q4_row, slot_rows * q4_row};
+    if (int8) return {slot_rows * s.head_dim, slot_rows * s.head_dim, slot_rows * scale_row, slot_rows * scale_row};
+    return {slot_rows * s.head_dim * 2, slot_rows * s.head_dim * 2};
+}
+
+// ---- the elastic --batch slot sessions (STRATA_ELASTIC_SLOTS, qsa_slot_*): a slot state's arrays larger than a chunk
+// in a VMM range of its own on its device, backed from that device's slot budget as its conversation grows
+struct SlotPool {
+    strata::core::VmmRange range;
+    std::vector<strata::core::SlotArray> arr;
+    int64_t page_size = 0, idx_block = 0;
+};
+std::vector<std::unique_ptr<SlotPool>> g_slot_pools;
+struct SlotBudget {
+    std::vector<strata::core::VmmChunk> free;
+    int64_t total = 0;
+    cudaStream_t zero = nullptr;   // non-blocking: clearing a new chunk never waits for a window in flight
+};
+std::map<int, SlotBudget> g_slot_budget;
+std::mutex g_slot_mu;
+
+/// Mapped chunks from the start of array a of pool p.
+int64_t slot_mapped_prefix(const SlotPool& p, size_t a) {
+    const uint64_t G = p.range.granularity();
+    const int64_t c0 = (int64_t) (p.arr[a].off / G);
+    const int64_t end = a + 1 < p.arr.size() ? (int64_t) (p.arr[a + 1].off / G) : p.range.chunks();
+    int64_t c = 0;
+    while (c0 + c < end && p.range.mapped(c0 + c)) ++c;
+    return c;
+}
+/// Units of kind `kv` every such array of the pool holds now (`full` when the pool has none of that kind).
+int64_t slot_units_mapped(const SlotPool& p, bool kv, int64_t full) {
+    int64_t u = full;
+    for (size_t a = 0; a < p.arr.size(); ++a)
+        if (p.arr[a].kv == kv)
+            u = std::min<int64_t>(u, strata::core::slot_units_in(p.arr[a], slot_mapped_prefix(p, a), p.range.granularity()));
+    return u;
+}
+int64_t slot_need_locked(const SlotPool& p, int64_t cells) {
+    const uint64_t G = p.range.granularity();
+    int64_t n = 0;
+    for (const auto& a : p.arr) {
+        const int64_t c0 = (int64_t) (a.off / G);
+        const int64_t c1 = c0 + strata::core::slot_chunks(a, strata::core::slot_units(a, cells, p.page_size, p.idx_block), G);
+        for (int64_t c = c0; c < c1; ++c) n += !p.range.mapped(c);
+    }
+    return n;
+}
 }  // namespace
+
+uint64_t qsa_slot_budget_add(int dev, uint64_t bytes) {
+    const strata::core::OnDevice on(dev);
+    const uint64_t G = strata::core::vmm_granularity(dev);
+    if (G == 0) return 0;
+    std::lock_guard<std::mutex> lk(g_slot_mu);
+    SlotBudget& b = g_slot_budget[dev];
+    if (b.zero == nullptr && cudaStreamCreateWithFlags(&b.zero, cudaStreamNonBlocking) != cudaSuccess) {
+        (void) cudaGetLastError();
+        b.zero = nullptr;
+        return 0;
+    }
+    uint64_t made = 0;
+    for (; made + G <= bytes; made += G) {
+        const strata::core::VmmChunk h = strata::core::vmm_chunk_new(dev);
+        if (h == 0) break;
+        b.free.push_back(h);
+        ++b.total;
+    }
+    return made;
+}
+void qsa_slot_budget(int dev, uint64_t& total, uint64_t& free) {
+    const uint64_t G = strata::core::vmm_granularity(dev);
+    std::lock_guard<std::mutex> lk(g_slot_mu);
+    const auto it = g_slot_budget.find(dev);
+    total = it == g_slot_budget.end() ? 0 : (uint64_t) it->second.total * G;
+    free = it == g_slot_budget.end() ? 0 : (uint64_t) it->second.free.size() * G;
+}
+bool qsa_slots_grow(const std::vector<const QsaState*>& states, int64_t cells) {
+    std::lock_guard<std::mutex> lk(g_slot_mu);
+    int dev = -1;
+    int64_t need = 0;
+    for (const QsaState* st : states) {
+        if (st->slot_elastic < 0) continue;
+        const SlotPool& p = *g_slot_pools[(size_t) st->slot_elastic];
+        dev = p.range.device();
+        need += slot_need_locked(p, cells);
+    }
+    if (need == 0) return true;
+    SlotBudget& b = g_slot_budget[dev];
+    if ((int64_t) b.free.size() < need || b.zero == nullptr) return false;   // all or nothing: the budget is short
+    const strata::core::OnDevice on(dev);
+    for (const QsaState* st : states) {
+        if (st->slot_elastic < 0) continue;
+        SlotPool& p = *g_slot_pools[(size_t) st->slot_elastic];
+        const uint64_t G = p.range.granularity();
+        for (const auto& a : p.arr) {
+            const int64_t c0 = (int64_t) (a.off / G);
+            const int64_t c1 = c0 + strata::core::slot_chunks(a, strata::core::slot_units(a, cells, p.page_size, p.idx_block), G);
+            std::vector<int64_t> fresh;
+            for (int64_t c = c0; c < c1; ++c)
+                if (!p.range.mapped(c)) fresh.push_back(c);
+            if (fresh.empty()) continue;
+            if (!p.range.map_range(c0, c1, [&b] {
+                    if (b.free.empty()) return (strata::core::VmmChunk) 0;
+                    const strata::core::VmmChunk h = b.free.back();
+                    b.free.pop_back();
+                    return h;
+                })) {
+                std::fprintf(stderr, "strata: elastic slots: mapping %zu chunks on CUDA%d failed\n", fresh.size(), dev);
+                for (const int64_t c : fresh)   // never mapped and not cleared
+                    if (const strata::core::VmmChunk h = p.range.unmap(c)) b.free.push_back(h);
+                return false;
+            }
+            // a chunk taken back from another slot still holds that slot's cells: zeroed, as a new session is
+            for (const int64_t c : fresh)
+                if (cudaMemsetAsync(p.range.base() + (uint64_t) c * G, 0, (size_t) G, b.zero) != cudaSuccess) {
+                    std::fprintf(stderr, "strata: elastic slots: clearing a chunk failed: %s\n",
+                                 cudaGetErrorString(cudaGetLastError()));
+                    return false;
+                }
+        }
+    }
+    return cudaStreamSynchronize(b.zero) == cudaSuccess;
+}
+int64_t qsa_slot_trim(const QsaState& st, int64_t cells) {
+    if (st.slot_elastic < 0) return 0;
+    std::lock_guard<std::mutex> lk(g_slot_mu);
+    SlotPool& p = *g_slot_pools[(size_t) st.slot_elastic];
+    SlotBudget& b = g_slot_budget[p.range.device()];
+    const uint64_t G = p.range.granularity();
+    int64_t n = 0;
+    for (size_t a = 0; a < p.arr.size(); ++a) {
+        const int64_t c0 = (int64_t) (p.arr[a].off / G);
+        const int64_t c1 = c0 + strata::core::slot_chunks(p.arr[a], strata::core::slot_units(p.arr[a], cells, p.page_size, p.idx_block), G);
+        const int64_t end = a + 1 < p.arr.size() ? (int64_t) (p.arr[a + 1].off / G) : p.range.chunks();
+        for (int64_t c = c1; c < end; ++c)
+            if (const strata::core::VmmChunk h = p.range.unmap(c)) {
+                b.free.push_back(h);
+                ++n;
+            }
+    }
+    return n;
+}
+uint64_t qsa_slot_backed_bytes(const QsaState& st) {
+    if (st.slot_elastic < 0) return 0;
+    std::lock_guard<std::mutex> lk(g_slot_mu);
+    const SlotPool& p = *g_slot_pools[(size_t) st.slot_elastic];
+    return (uint64_t) p.range.mapped_count() * p.range.granularity();
+}
+uint64_t qsa_slot_reserved_bytes(const QsaState& st) {
+    if (st.slot_elastic < 0) return 0;
+    std::lock_guard<std::mutex> lk(g_slot_mu);
+    const SlotPool& p = *g_slot_pools[(size_t) st.slot_elastic];
+    return (uint64_t) p.range.chunks() * p.range.granularity();
+}
 
 void qsa_set_kv_resident(int64_t cells) { g_kv_resident = cells > 0 ? cells : 0; }
 int64_t qsa_kv_resident() { return g_kv_resident; }
 int64_t qsa_kv_resident_min() { return 20480; }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
 
-uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
+uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells,
+                         bool elastic_slot) {
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
+    const uint64_t G = elastic_slot ? strata::core::vmm_granularity() : 0;
     uint64_t n = 0;
-    if (!(g_kv_elastic && p.mode == 0))   // the elastic K/V's pools are in their own VMM range
+    if (G > 0) {   // an elastic slot: only the arrays that stay carved (qsa_state_init)
+        const bool hybrid = g_kv_hybrid && ring_cells <= 0;
+        for (const uint64_t b : kv_per_slot(s, hybrid, !hybrid && g_kv_q4, !hybrid && g_kv_int8 && !g_kv_q4))
+            if (!strata::core::slot_array_elastic((uint64_t) p.slots * b, G)) n += align_up16((uint64_t) p.slots * b);
+        n += 64 + 4 * 16;
+    } else if (!(g_kv_elastic && p.mode == 0))   // the elastic K/V's pools are in their own VMM range
         n += kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0,
                            g_kv_int8 || g_kv_hybrid) + 4 * 16;   // K/V pools (the VRAM slots)
     n += (uint64_t) p.pages * 4;                                               // page_table
     if (p.mode == 1) n += strata::kernels::kv_stream_map_bytes(p.slots) + 6 * 16;   // the residency map
     n += (uint64_t) (s.idx_block - 1) * s.idx_dim * 4;                         // tail
     n += (uint64_t) s.idx_dim * 4;                                             // dead
-    n += (uint64_t) p.pooled_rows * s.idx_dim * 4;                             // pooled
+    if (!strata::core::slot_array_elastic((uint64_t) p.pooled_rows * s.idx_dim * 4, G))
+        n += (uint64_t) p.pooled_rows * s.idx_dim * 4;                         // pooled
     n += 16;                                                                   // block_pos
     if (with_rope) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;          // cos + sin tables
     n += strata::kernels::qsa_step_bytes() + 16;                               // counts and aligned attention status
@@ -791,7 +963,7 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
 }
 
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope, int64_t ring_cells) {
+                        const QsaState* share_rope, int64_t ring_cells, bool elastic_slot) {
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     const int64_t pages = p.pages;
@@ -811,15 +983,46 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     const uint64_t rows = (uint64_t) p.slots * s.n_head_kv * s.page_size;   // VRAM rows: the slots
     const uint64_t q4_row = strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
     st.kv_elastic = -1;
+    st.slot_elastic = -1;
+    // the pool arrays' pointers, in kv_per_slot's order
+    auto assign = [&st](uint8_t* const* a) {
+        if (st.kv_hybrid) { st.k_q = (int8_t*) a[0]; st.k_scale = (uint16_t*) a[1]; st.v_q4 = a[2]; }
+        else if (st.kv_q4) { st.k_q4 = a[0]; st.v_q4 = a[1]; }
+        else if (st.kv_int8) {
+            st.k_q = (int8_t*) a[0];
+            st.v_q = (int8_t*) a[1];
+            st.k_scale = (uint16_t*) a[2];
+            st.v_scale = (uint16_t*) a[3];
+        } else { st.k_pool = (uint16_t*) a[0]; st.v_pool = (uint16_t*) a[1]; }
+    };
+    const uint64_t slot_G = elastic_slot ? strata::core::vmm_granularity() : 0;   // as qsa_state_bytes decided
+    std::unique_ptr<SlotPool> spool;
+    std::vector<int> in_range;   // per pool array (then the pooled rows, last): its index in spool->arr, or -1
+    if (slot_G > 0) {
+        spool = std::make_unique<SlotPool>();
+        spool->page_size = s.page_size;
+        spool->idx_block = s.idx_block;
+        auto add = [&](uint64_t per, int64_t units, bool kv) {
+            if (!strata::core::slot_array_elastic((uint64_t) units * per, slot_G)) { in_range.push_back(-1); return; }
+            in_range.push_back((int) spool->arr.size());
+            spool->arr.push_back({per, units, kv, 0});
+        };
+        for (const uint64_t b : kv_per_slot(s, st.kv_hybrid, st.kv_q4, st.kv_int8)) add(b, p.slots, true);
+        add((uint64_t) s.idx_dim * 4, p.pooled_rows, false);
+        if (!spool->arr.empty() && !spool->range.reserve(strata::core::slot_layout(spool->arr, slot_G))) {
+            std::fprintf(stderr, "strata: elastic slots: reserving a slot state's addresses failed\n");
+            return 0;
+        }
+        const std::vector<uint64_t> per = kv_per_slot(s, st.kv_hybrid, st.kv_q4, st.kv_int8);
+        uint8_t* a[4] = {};
+        for (size_t i = 0; i < per.size(); ++i)
+            a[i] = in_range[i] >= 0 ? spool->range.base() + spool->arr[(size_t) in_range[i]].off
+                                    : c.take_bytes((uint64_t) p.slots * per[i]);
+        assign(a);
+    } else
     if (g_kv_elastic && p.mode == 0) {
         // the elastic K/V: each array at a chunk boundary of the state's own range, the first cells mapped
-        const uint64_t slot_rows = (uint64_t) s.n_head_kv * s.page_size;
-        const uint64_t scale_row = (uint64_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
-        std::vector<uint64_t> per;   // bytes per page slot of each array, in the order they are assigned below
-        if (st.kv_hybrid) per = {slot_rows * s.head_dim, slot_rows * scale_row, slot_rows * q4_row};
-        else if (st.kv_q4) per = {slot_rows * q4_row, slot_rows * q4_row};
-        else if (st.kv_int8) per = {slot_rows * s.head_dim, slot_rows * s.head_dim, slot_rows * scale_row, slot_rows * scale_row};
-        else per = {slot_rows * s.head_dim * 2, slot_rows * s.head_dim * 2};
+        const std::vector<uint64_t> per = kv_per_slot(s, st.kv_hybrid, st.kv_q4, st.kv_int8);
         auto pool = std::make_unique<ElasticPool>();
         const uint64_t G = strata::core::vmm_granularity();
         uint64_t at = 0;
@@ -834,16 +1037,9 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             std::fprintf(stderr, "strata: the elastic K/V could not reserve or map its pools\n");
             return 0;
         }
-        uint8_t* b = pool->range.base();
-        const uint64_t* o = pool->off.data();
-        if (st.kv_hybrid) { st.k_q = (int8_t*) (b + o[0]); st.k_scale = (uint16_t*) (b + o[1]); st.v_q4 = b + o[2]; }
-        else if (st.kv_q4) { st.k_q4 = b + o[0]; st.v_q4 = b + o[1]; }
-        else if (st.kv_int8) {
-            st.k_q = (int8_t*) (b + o[0]);
-            st.v_q = (int8_t*) (b + o[1]);
-            st.k_scale = (uint16_t*) (b + o[2]);
-            st.v_scale = (uint16_t*) (b + o[3]);
-        } else { st.k_pool = (uint16_t*) (b + o[0]); st.v_pool = (uint16_t*) (b + o[1]); }
+        uint8_t* a[4] = {};
+        for (size_t i = 0; i < per.size(); ++i) a[i] = pool->range.base() + pool->off[i];
+        assign(a);
         st.kv_elastic = (int32_t) g_pools.size();
         g_pools.push_back(std::move(pool));
     } else if (st.kv_hybrid) {
@@ -880,7 +1076,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.idx_tail = c.take<float>((uint64_t) (s.idx_block - 1) * s.idx_dim);
     st.idx_dead = c.take<float>((uint64_t) s.idx_dim);
     st.idx_pooled_rows = p.pooled_rows;
-    st.idx_pooled = c.take<float>((uint64_t) p.pooled_rows * s.idx_dim);
+    if (spool && in_range.back() >= 0) st.idx_pooled = (float*) (spool->range.base() + spool->arr[(size_t) in_range.back()].off);
+    else st.idx_pooled = c.take<float>((uint64_t) p.pooled_rows * s.idx_dim);
     st.idx_block_pos = c.take<int32_t>(1);
     if (share_rope != nullptr) {
         st.cos_tab = share_rope->cos_tab;
@@ -961,6 +1158,11 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         strata::kernels::kv_ring_table(st.page_table, pages, p.slots, nullptr);
     }
     cudaDeviceSynchronize();
+    if (spool && !spool->arr.empty()) {   // nothing backed yet: qsa_slots_grow, from the device's slot budget
+        std::lock_guard<std::mutex> lk(g_slot_mu);
+        st.slot_elastic = (int32_t) g_slot_pools.size();
+        g_slot_pools.push_back(std::move(spool));
+    }
     return c.used;
 }
 
@@ -968,7 +1170,14 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     const QsaShapes s = qsa_shapes(g);
     cudaStream_t cs = (cudaStream_t) stream;
     // an elastic state zeroes what is mapped (the rest is zeroed when it is mapped)
-    const int64_t live_slots = st.kv_elastic >= 0 ? pool_slots_mapped(*g_pools[(size_t) st.kv_elastic]) : st.n_slots;
+    int64_t live_slots = st.kv_elastic >= 0 ? pool_slots_mapped(*g_pools[(size_t) st.kv_elastic]) : st.n_slots;
+    int64_t pooled_rows = st.idx_pooled_rows;
+    if (st.slot_elastic >= 0) {
+        std::lock_guard<std::mutex> lk(g_slot_mu);
+        const SlotPool& p = *g_slot_pools[(size_t) st.slot_elastic];
+        live_slots = slot_units_mapped(p, true, st.n_slots);
+        pooled_rows = slot_units_mapped(p, false, pooled_rows);
+    }
     const size_t rows = (size_t) live_slots * s.n_head_kv * s.page_size;
     if (st.kv_hybrid) {
         cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);
@@ -992,7 +1201,7 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, stream);
     cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);
-    cudaMemsetAsync(st.idx_pooled, 0, (size_t) st.idx_pooled_rows * s.idx_dim * 4, cs);
+    cudaMemsetAsync(st.idx_pooled, 0, (size_t) pooled_rows * s.idx_dim * 4, cs);
 }
 
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {
