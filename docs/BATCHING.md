@@ -361,13 +361,17 @@ thread's core, are cut between the stages on it by their layers, at least one ea
 stage's service thread, the rest are its pool's workers (the start-up log prints each stage's line). `--pool-workers N`
 caps the workers of all stages together, split by layers; the service threads are not counted.
 
-- With pipelined groups (`--batch-groups` > 1) each stage's service thread serves that stage's doorbells for good (the
-  `STRATA_PIPED_CONCURRENT` doorbell thread is not started); the host thread only launches the windows and polls them
-  (the 20 s timeout and the "never rang" check stay there). Between windows a service thread spins 20 ms, then sleeps
-  until the next launch wakes it.
-- The other verify windows (the serial decode, a slot's first token, `--batch-groups 1`, `--pipeline-windows`) still
-  serve their doorbells on the host thread, one stage after another, but each stage's layers run on that stage's pool.
-- The prompt path keeps the engine's own pool.
+- Every verify window's doorbells are served by its stage's service thread: the pipelined groups' batch windows (the
+  `STRATA_PIPED_CONCURRENT` doorbell thread is not started), the serial decode's and a slot's first token's windows
+  (`Verifier::run`: the host thread waits, and meanwhile stages the next stage's window), and `--pipeline-windows`
+  (both parities of a stage on its thread: the front stages' guessed window and the last stage's verify are served at
+  once, each on its own node). The host thread launches and polls; the 20 s timeout and the "never rang" check stay
+  there. Between windows a service thread spins 20 ms, then sleeps until the next launch wakes it.
+- A window with the adaptive tier's overlap gate active, the PCIe balance or `--remote-expert-opt` still serves itself
+  on the host thread, on its stage's pool.
+- The prompt path's CPU share (`STRATA_PREFILL_CPU_SHARE`, off by default on a layer split) takes each stage's own pool,
+  so the stages no longer take turns. The engine's own pool stays (it is built before the stages are known, and the
+  single-GPU paths use it) but idles: its workers sleep.
 - Off (with a log line) beside what also keeps `STRATA_PIPED_CONCURRENT` off, the routing-aware prefetch, a peer
   device, `--dump-routing`, `--no-pool` and `--split-device 0`. Not measured yet.
 
