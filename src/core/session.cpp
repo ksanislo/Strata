@@ -172,6 +172,13 @@ bool session_slot_fit(SessionState& s, int64_t cells, bool trim) {
     return true;
 }
 
+int64_t session_slot_need(const SessionState& s, int64_t cells) {
+    if (s.slot_cells < 0) return 0;
+    std::vector<const QsaState*> sts;
+    for (int64_t j = 0; j < s.qsa_alloc; ++j) sts.push_back(&s.qsa_states[s.qsa_ord0 + j]);
+    return qsa_slots_need(sts, std::min<int64_t>(std::max<int64_t>(cells, 1), s.max_cells));
+}
+
 uint64_t session_slot_backed(const SessionState& s) {
     uint64_t n = 0;
     for (int64_t j = 0; s.slot_cells >= 0 && j < s.qsa_alloc; ++j) n += qsa_slot_backed_bytes(s.qsa_states[s.qsa_ord0 + j]);
