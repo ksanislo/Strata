@@ -1470,6 +1470,10 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(batch_groups_test src/program/batch_groups_test.cpp)
   target_include_directories(batch_groups_test PRIVATE include)
   add_test(NAME batch_groups_test COMMAND batch_groups_test)
+  # which --batch slot conversation --session-dir saves before the slot is overwritten (header-only, CPU)
+  add_executable(slot_persist_test src/program/slot_persist_test.cpp)
+  target_include_directories(slot_persist_test PRIVATE include)
+  add_test(NAME slot_persist_test COMMAND slot_persist_test)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp

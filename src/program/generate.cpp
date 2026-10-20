@@ -73,6 +73,7 @@
 #endif
 #include "strata/core/native_dense.hpp"
 #include "strata/program/batch_read.hpp"
+#include "strata/program/slot_persist.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/program/split_rules.hpp"
@@ -9354,34 +9355,51 @@ int main(int argc, char** argv) {
         // (the client re-rendered the last reply) - parking keeps that old tail in RAM cheaply, a synchronous disk
         // write of the whole conversation for it is not worth it; a real switch resumes far earlier (or not at all)
         bool spill_skip_rewind = false;
-        auto spill_current = [&]() {
-            if (!sdir || !live_ok || live.empty() || spill_skip_rewind) return;
+        // what a park or a spill images: the main sessions' conversation (slot -1), or a --batch slot's (its sessions
+        // on every stage, bslot_ss; --session-dir saves it before the slot is overwritten)
+        struct ParkFrom {
+            const std::vector<int32_t>& ids;
+            const std::vector<ImgKey>& imgs;
+            std::vector<ConvCheckpoint>& checks;
+            bool cvec;
+            int slot;
+        };
+        auto park_ss = [&](const ParkFrom& f, size_t k) -> strata::core::SessionState& {   // k 0: stage 0, else stages[k - 1]
+            if (f.slot >= 0) return *bslot_ss[k][(size_t) f.slot];
+            return k == 0 ? ss : stages[k - 1]->ss;
+        };
+        // a slot without its own drafter (no --batch-mtp) saves the main drafter's K/V in its place: drafts only
+        // propose, and it is what that conversation drafts with after copy_from_slot too
+        auto park_draft = [&](const ParkFrom& f) -> const strata::core::QsaState* {
+            return f.slot >= 0 && batch_mtp ? &slot_mtp[(size_t) f.slot]->kv_state() : &mtp.kv_state();
+        };
+        auto spill_from = [&](const ParkFrom& f) {
+            if (!sdir || f.ids.empty()) return;
             std::string e;
             try {
                 const size_t n_st = stages.size();
                 std::vector<ConvCheckpoint> disk_checks;
-                if (const ConvCheckpoint* d = strata::core::session_deepest_checkpoint(checks)) disk_checks.push_back(*d);
+                if (const ConvCheckpoint* d = strata::core::session_deepest_checkpoint(f.checks)) disk_checks.push_back(*d);
                 strata::core::ConversationCheckpointSplit dcs;
                 if (n_st > 0) dcs = strata::core::conversation_checkpoints_split(std::move(disk_checks), n_st);
-                const strata::core::ConversationView view{live, live_imgs, n_st > 0 ? dcs.stage0 : disk_checks,
-                                                          cvec_cached};
+                const strata::core::ConversationView view{f.ids, f.imgs, n_st > 0 ? dcs.stage0 : disk_checks, f.cvec};
                 strata::core::SavedConversation meta;
                 std::vector<strata::core::SessionKvSource> sources;
                 std::vector<std::vector<strata::core::SessionKvSource>> stage_sources;
                 // the draft K/V where a parked image keeps it: the last stage's (or the only one's)
-                if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g,
-                        use_mtp && n_st == 0 ? &mtp.kv_state() : nullptr, e)) {
+                if (!strata::core::conversation_snapshot_sources(meta, sources, view, park_ss(f, 0), g,
+                        use_mtp && n_st == 0 ? park_draft(f) : nullptr, e)) {
                     std::fprintf(stderr, "strata serve: session dir: spill skipped (%s)\n", e.c_str());
                     return;
                 }
                 for (size_t k = 0; k < n_st; ++k) {
                     const int dev = stages[k]->dev;
                     const strata::core::OnDevice on(dev);
-                    const strata::core::ConversationView view_k{live, live_imgs, dcs.parts[k], cvec_cached};
+                    const strata::core::ConversationView view_k{f.ids, f.imgs, dcs.parts[k], f.cvec};
                     strata::core::SavedConversation part;
                     std::vector<strata::core::SessionKvSource> ps;
-                    if (!strata::core::conversation_snapshot_sources(part, ps, view_k, stages[k]->ss, g,
-                            use_mtp && k + 1 == n_st ? &mtp.kv_state() : nullptr, e)) {
+                    if (!strata::core::conversation_snapshot_sources(part, ps, view_k, park_ss(f, k + 1), g,
+                            use_mtp && k + 1 == n_st ? park_draft(f) : nullptr, e)) {
                         std::fprintf(stderr, "strata serve: session dir: spill skipped (stage CUDA%d: %s)\n", dev,
                                      e.c_str());
                         return;
@@ -9397,13 +9415,20 @@ int main(int argc, char** argv) {
                     stage_sources.push_back(std::move(ps));
                 }
                 size_t bytes = 0;
-                sdir->write_now(meta, sources, stage_sources, bytes, e, &checks);   // logs its own result
+                sdir->write_now(meta, sources, stage_sources, bytes, e, &f.checks);   // logs its own result
             } catch (const std::bad_alloc&) {
                 std::fprintf(stderr, "strata serve: session dir: spill skipped (allocation failed)\n");
             }
         };
-        auto park_current_body = [&](size_t held) -> bool {
-            if (!live_ok || live.empty()) return true;
+        auto spill_current = [&]() {
+            if (!sdir || !live_ok || live.empty() || spill_skip_rewind) return;
+            spill_from(ParkFrom{live, live_imgs, checks, cvec_cached, -1});
+        };
+        auto park_body = [&](const ParkFrom& f, size_t held) -> bool {
+            if (f.ids.empty()) return true;
+            auto spill = [&]() { if (f.slot < 0) spill_current(); else spill_from(f); };
+            // " (batch slot N)" after a slot's lines; the main sessions' lines as they were
+            const std::string who = f.slot < 0 ? std::string() : " (batch slot " + std::to_string(f.slot) + ")";
             // #2049: parking copies the outgoing conversation's running checkpoints and K/V into host memory, which
             // is a silent stretch of the "request" stage; when the OS has paged that memory out it takes minutes.
             // Named, so a stall report says "parking"; its copies beat (conversation_copy.hpp), so the watchdog
@@ -9412,38 +9437,41 @@ int main(int argc, char** argv) {
                 ParkStage() { strata::core::progress_at("request: parking the previous conversation"); }
                 ~ParkStage() { strata::core::progress_at("request"); strata::core::progress_beat(); }
             } park_stage;
-            if (!conversations.enabled()) { spill_current(); return true; }   // parking off: disk only
+            if (!conversations.enabled()) { spill(); return true; }   // parking off: disk only
             // --conversation-cache-min-tokens: a short conversation is not worth one of the slots.  Parking is a
             // switch-time decision, so a client's small side requests would otherwise park themselves and, once the
             // cache is full, evict the long conversation they were interleaved with (oldest first) - the reuse it
             // wanted.  Returning true is the same non-error skip the byte-budget and RAM-floor paths below take.
-            if (!conversations.wants((int64_t) live.size())) {
+            if (!conversations.wants((int64_t) f.ids.size())) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (%zu tokens, below the %lld "
-                                     "minimum; parked=%zu)\n",
-                             live.size(), (long long) o.conversation_cache_min_tokens, conversations.size());
+                                     "minimum; parked=%zu)%s\n",
+                             f.ids.size(), (long long) o.conversation_cache_min_tokens, conversations.size(),
+                             who.c_str());
                 return true;
             }
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
             // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
-            if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached))
+            if (const size_t dropped = conversations.drop_superseded(f.ids, f.imgs, f.checks, f.cvec))
                 std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
-                             "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
+                             "conversation; parked=%zu%s\n", dropped, dropped == 1 ? "y" : "ies", conversations.size(),
+                             who.c_str());
             // A layer split parks one image per stage: the first stage's (with the draft layer's K/V) and one per
             // later stage (without it - the draft ring is saved once).  The checkpoints are MOVED apart into their
             // stage parts for the capture and put back together whichever way this ends (no running state copied).
             const size_t n_st = stages.size();
             // the draft layer's K/V lives on the last stage's GPU (the drafter is loaded there): with a split it is
             // saved with that stage's image, under its device; stage 0's image holds none
-            const strata::core::QsaState* draft0 = (n_st > 0 && !mtp_first) || !use_mtp ? nullptr : &mtp.kv_state();   // no --mtp: no draft K/V (snapshots accept null)
-            auto draft_of = [&](size_t k) -> const strata::core::QsaState* { return use_mtp && !mtp_first && k + 1 == n_st ? &mtp.kv_state() : nullptr; };
+            const strata::core::QsaState* draft0 = (n_st > 0 && !mtp_first) || !use_mtp ? nullptr : park_draft(f);   // no --mtp: no draft K/V (snapshots accept null)
+            auto draft_of = [&](size_t k) -> const strata::core::QsaState* { return use_mtp && !mtp_first && k + 1 == n_st ? park_draft(f) : nullptr; };
             strata::core::ConversationCheckpointSplit cs;
-            if (n_st > 0) cs = strata::core::conversation_checkpoints_split(std::move(checks), n_st);   // #752: two-phase; a bad_alloc leaves `checks` whole
+            if (n_st > 0) cs = strata::core::conversation_checkpoints_split(std::move(f.checks), n_st);   // #752: two-phase; a bad_alloc leaves `checks` whole
             struct MergeBack {
                 strata::core::ConversationCheckpointSplit& cs; std::vector<ConvCheckpoint>& checks; bool on;
                 ~MergeBack() { if (on && !strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear(); }
-            } merge_back{cs, checks, n_st > 0};
-            const strata::core::ConversationView view{live, live_imgs, n_st > 0 ? cs.stage0 : checks, cvec_cached};
-            auto reuse = conversations.take_reuse();
+            } merge_back{cs, f.checks, n_st > 0};
+            const strata::core::ConversationView view{f.ids, f.imgs, n_st > 0 ? cs.stage0 : f.checks, f.cvec};
+            // (the retained K/V buffers are the main sessions' last restore: a slot's park captures fresh)
+            auto reuse = f.slot < 0 ? conversations.take_reuse() : strata::core::ConversationKvReuse{};
             std::vector<strata::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
             stage_reuse.resize(n_st);
             reuse.stages.clear();
@@ -9452,9 +9480,9 @@ int main(int argc, char** argv) {
             for (size_t k = 0; k < n_st; ++k) {
                 auto& st = stages[k];
                 const strata::core::OnDevice on(st->dev);
-                const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
+                const strata::core::ConversationView view_k{f.ids, f.imgs, cs.parts[k], f.cvec};
                 size_t b = 0;
-                if (!strata::core::conversation_snapshot_bytes(view_k, st->ss, g, draft_of(k), b, err)) {
+                if (!strata::core::conversation_snapshot_bytes(view_k, park_ss(f, k + 1), g, draft_of(k), b, err)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (stage CUDA%d: %s)\n",
                                  st->dev, err.c_str());
                     err.clear();
@@ -9462,7 +9490,7 @@ int main(int argc, char** argv) {
                 }
                 if (!stage_reuse[k].kv.empty()) {
                     size_t r = 0;
-                    if (strata::core::conversation_snapshot_capture_bytes(stage_reuse[k], view_k, st->ss, g, draft_of(k),
+                    if (strata::core::conversation_snapshot_capture_bytes(stage_reuse[k], view_k, park_ss(f, k + 1), g, draft_of(k),
                                                                           r, err)) {
                         b = r;
                         stage_retained += stage_reuse[k].bytes();
@@ -9474,14 +9502,14 @@ int main(int argc, char** argv) {
                 stage_estimate += b;
             }
             size_t estimate = 0;
-            if (!strata::core::conversation_snapshot_bytes(view, ss, g, draft0, estimate, err)) {
+            if (!strata::core::conversation_snapshot_bytes(view, park_ss(f, 0), g, draft0, estimate, err)) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s)\n", err.c_str());
                 err.clear(); // A recoverable miss must not poison the batched draft prefill's error channel.
                 return true;
             }
             const size_t fresh_estimate = estimate;
             if (!reuse.kv.empty() && !strata::core::conversation_snapshot_capture_bytes(
-                    reuse, view, ss, g, draft0, estimate, err)) {
+                    reuse, view, park_ss(f, 0), g, draft0, estimate, err)) {
                 reuse = {};
                 estimate = fresh_estimate;
                 err.clear();
@@ -9496,7 +9524,7 @@ int main(int argc, char** argv) {
             if (!conversations.make_room(estimate, held)) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
                              estimate >> 20);
-                spill_current();
+                spill();
                 return true;
             }
             const auto t0 = Clock::now();
@@ -9528,7 +9556,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked)\n",
                                  additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
                                  evicted, conversations.size());
-                    spill_current();
+                    spill();
                     return true;
                 }
                 if (evicted)
@@ -9537,15 +9565,15 @@ int main(int argc, char** argv) {
                                  (long long) o.conversation_cache_min_free_mib);
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
-                if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
+                if (!strata::core::conversation_snapshot_save(image, view, park_ss(f, 0), g, draft0, err,
                         std::move(reuse), &reused_bytes)) return false;
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                     auto& st = stages[k];
                     const strata::core::OnDevice on(st->dev);
                     if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
-                    const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
+                    const strata::core::ConversationView view_k{f.ids, f.imgs, cs.parts[k], f.cvec};
                     strata::core::SavedConversation part;
-                    if (!strata::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
+                    if (!strata::core::conversation_snapshot_save(part, view_k, park_ss(f, k + 1), g, draft_of(k), err,
                             std::move(stage_reuse[k]), &reused_bytes))
                         return false;
                     image.stage_images.push_back(std::move(part));
@@ -9556,7 +9584,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (RAM floor after capture: %lld MiB needed, %s)\n",
                                  (long long) o.conversation_cache_min_free_mib, ram_note(mem_after).c_str());
                     image = {};   // the copy goes before the direct write
-                    spill_current();
+                    spill();
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
@@ -9564,15 +9592,16 @@ int main(int argc, char** argv) {
                 if (stored && sdir) sdir->write(conversations.newest());   // written behind, after its delay
                 if (stored) {   // the server's log: a conversation going out, to RAM
                     std::printf("INFO sess_event=parked sess_tokens=%zu sess_bytes=%zu sess_ms=%.0f sess_why=ram\n",
-                                live.size(), snapshot_bytes,
+                                f.ids.size(), snapshot_bytes,
                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                     std::fflush(stdout);
                 }
-                if (!stored) spill_current();
-                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
-                             stored ? "parked" : "skipped", live.size(),
+                if (!stored) spill();
+                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu%s\n",
+                             stored ? "parked" : "skipped", f.ids.size(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
-                             conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes, reused_bytes);
+                             conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes, reused_bytes,
+                             who.c_str());
             } catch (const std::bad_alloc&) {
                 // The active state has not been touched. Continue with normal
                 // prompt processing rather than killing a serving process.
@@ -9583,7 +9612,10 @@ int main(int argc, char** argv) {
         // #752: the whole park (the checkpoint split included) is under one try, so a host OOM skips parking instead of
         // ending the server
         auto park_current = [&](size_t held) -> bool {
-            try { return park_current_body(held); }
+            try {
+                if (!live_ok || live.empty()) return true;
+                return park_body(ParkFrom{live, live_imgs, checks, cvec_cached, -1}, held);
+            }
             catch (const std::bad_alloc&) {
                 std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking\n");
                 return true;
@@ -11818,6 +11850,9 @@ int main(int argc, char** argv) {
                         BSlot& sl = bs[(size_t) (pick * GS + t)];
                         G.tok[t] = sl.active ? sl.x : 0;
                         G.pos[t] = sl.active ? sl.p : 0;
+                        if (!sl.active && sl.cached && sdir)
+                            std::fprintf(stderr, "strata batch: slot %d's conversation is not saved: a pipelined "
+                                                 "group's pad row overwrites it\n", pick * GS + t);
                         if (!sl.active) sl.cached = false;   // its pad row writes its state
                     }
                     G.inflight = true;
@@ -11879,10 +11914,48 @@ int main(int argc, char** argv) {
                 if (!pump(false)) return false;
             return true;
         };
+        // --session-dir: slot b's kept conversation, before `next` overwrites the slot - parked like the main sessions'
+        // (RAM, written behind) or written straight from the GPU (slot_persist_wanted says when it is not needed).
+        // Never while pipelined groups are in flight: the device syncs would wait on windows only this thread serves.
+        auto persist_slot = [&](int b, bool from_this_slot, const std::vector<int32_t>& next, bool exiting,
+                                const char* why) {
+            if (!sdir || b < 0 || b >= (int) bs.size()) return;
+            BSlot& sl = bs[(size_t) b];
+            std::vector<const std::vector<int32_t>*> others;   // the slots saved in their turn (at exit: the kept ones)
+            for (size_t c = 0; c < bs.size(); ++c)
+                if ((int) c != b && (bs[c].cached || (!exiting && bs[c].active && !bs[c].tainted && !bs[c].img)))
+                    others.push_back(&bs[c].ids);
+            if (!strata::program::slot_persist_wanted(sl.cached && !sl.active, from_this_slot, sl.ids, next, others))
+                return;
+            std::string e = pipe_inflight() ? "pipelined groups in flight" : "";
+            for (size_t k = 0; e.empty() && k < bslot_ss.size(); ++k) {
+                const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
+                if (cudaDeviceSynchronize() != cudaSuccess) e = "device sync failed";
+            }
+            if (e.empty() && use_mtp) {
+                const strata::core::OnDevice on_mtp(mtp.device());
+                if (!(batch_mtp ? slot_mtp[(size_t) b]->idle(e) : mtp.idle(e)) && e.empty()) e = "the drafter is busy";
+            }
+            if (!e.empty()) {
+                std::fprintf(stderr, "strata batch: slot %d's conversation not saved (%s)\n", b, e.c_str());
+                return;
+            }
+            std::fprintf(stderr, "strata batch: saving slot %d's conversation (%zu tokens) before %s\n", b,
+                         sl.ids.size(), why);
+            static const std::vector<ImgKey> no_imgs;   // a slot with pictures is never kept
+            bool ok = true;
+            try {
+                ok = park_body(ParkFrom{sl.ids, no_imgs, sl.checks, sl.cvec, b}, 0);
+            } catch (const std::bad_alloc&) {
+                err = "allocation failed";
+                ok = false;
+            }
+            if (!ok) std::fprintf(stderr, "strata batch: slot %d's conversation not saved (%s)\n", b, err.c_str());
+            err.clear();
+        };
         if (!o.session_dir.empty()) {
             std::string why;
             if (o.prompt_cache <= 0) why = "needs --prompt-cache > 0";   // parking optional: without it, disk only
-            else if (o.batch > 0) why = "does not support --batch";
             else if (o.peer_device >= 1) why = "does not support --peer-device";
             else if (multi_gpu && stages.empty()) why = "does not support this multi-GPU mode";
             strata::core::SessionDir::Options so;
@@ -13655,6 +13728,7 @@ int main(int argc, char** argv) {
                     std::string ye;
                     const auto ty = Clock::now();
                     std::vector<int32_t> pre(ids.begin(), ids.begin() + q);
+                    if (can) persist_slot(ys, slot_source == ys, pre, false, "a prompt read gives way into it");
                     if (can && copy_to_slot(ys, pre, ye)) {
                         BSlot& sl = bs[(size_t) ys];
                         sl = BSlot{};
@@ -15537,6 +15611,7 @@ int main(int argc, char** argv) {
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;
                 const auto tc0 = Clock::now();
+                if (cont) persist_slot(admit_slot, slot_source == admit_slot, live, false, "it takes another conversation");
                 if (cont && !copy_to_slot(admit_slot, live, err)) {
                     std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
                     bs[(size_t) admit_slot].cached = false;   // its sessions may be half written
@@ -15831,6 +15906,7 @@ int main(int argc, char** argv) {
         if (sdir) {   // --session-dir: the active conversation too, then everything queued, before the engine ends
             sdir->begin_exit();
             park_current(0);
+            for (int b = 0; b < (int) bs.size(); ++b) persist_slot(b, false, {}, true, "the engine ends");   // after it: they supersede it
             sdir->flush();
             std::fprintf(stderr, "strata serve: session dir: %zu file(s), %llu MiB on disk at exit\n", sdir->files(),
                          (unsigned long long) (sdir->bytes() >> 20));
