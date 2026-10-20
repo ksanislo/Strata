@@ -16,6 +16,7 @@
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
 #include "strata/platform/memory.hpp"
+#include "strata/platform/numa.hpp"
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/nv_defaults.hpp"
 #include "strata/kernels/gfx_arch.hpp"
@@ -5186,6 +5187,19 @@ int main(int argc, char** argv) {
                                  "follows)\n", st.dev, (double) fb / 1073741824.0);
         }
 
+    // STRATA_NUMA_PLACE=1: a split whose cards sit on different NUMA nodes keeps each stage's host memory (expert RAM of
+    // its layers, staging, hand-offs, KV copies) on its card's node; allocations under a stage's OnDevice follow it
+    std::string numa_why;
+    std::vector<int> numa_layer_nodes;
+    if (multi_gpu && !split_same) {
+        std::vector<int> devs = {primary_device};
+        for (const auto& st : stages) devs.push_back(st->dev);
+        if (strata::core::numa_place_configure(devs, numa_why)) {
+            std::vector<int> nodes;
+            for (const int d : devs) nodes.push_back(strata::core::numa_place_node(d));
+            numa_layer_nodes = strata::platform::numa_layer_nodes(g.n_layers, split_at, nodes);
+        }
+    }
     // ---- CUDA0's session, and the stages' sessions: sized to each device's own layer range (the carve).  A
     // stage that runs [lb, le) carves only those layers' GDN rows and QSA pools - before the carve every stage
     // held all 48 layers' state whatever layers it ran, which is the same disease the chunked-QSA-prefill PR
@@ -5903,6 +5917,7 @@ int main(int argc, char** argv) {
         // engine allocates after it (the verify window's staging: "mapped staging allocation failed", exit 1).  Keep a
         // reserve while the arena pins and hand it back after (pin_budget.hpp).
         strata::core::pin_reserve_take();
+        if (!numa_layer_nodes.empty()) arena_src.set_numa_layer_nodes(numa_layer_nodes);
         const bool arena_ok = arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
                                              o.shared_expert_arena);
         strata::core::pin_note_arena(arena_src.pinned_arena_bytes());
@@ -8781,6 +8796,7 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < stages.size(); ++i) {
                 GpuStage& st = *stages[i];
                 st.sp.set_stage(st.lb, i + 1 < stages.size() ? st.le : -1, i + 1 < stages.size() ? &stages[i + 1]->sp : nullptr);
+                if (i + 1 < stages.size()) st.sp.set_hand_node(strata::core::numa_place_node(stages[i + 1]->dev));
                 const strata::core::OnDevice on(st.dev);
                 void* sb = nullptr;              // this stage's own loan, out of its own cache
                 uint64_t sbb = 0;
@@ -8797,6 +8813,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
+            if (multi_gpu) sp.set_hand_node(strata::core::numa_place_node(stages[0]->dev));
             if (share_pool) sp.set_cpu_pool(&pool);
             if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes,
                          o.prefill_head_alias))
@@ -9018,9 +9035,13 @@ int main(int argc, char** argv) {
                                                                : strata::kernels::kVerifyMaxT;
             const size_t hb = (size_t) hrows * (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             std::vector<float*> hand((size_t) n_stages - 1, nullptr);
-            for (float*& h : hand) {
+            // STRATA_NUMA_PLACE: a hand-off on the reading card's node: the writer's stores are posted, the reader's
+            // loads would each cross the socket link
+            for (size_t i = 0; i < hand.size(); ++i) {
+                float*& h = hand[i];
                 float* hh = nullptr;
-                if (cudaHostAlloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                if (strata::core::numa_host_alloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable,
+                                                  strata::core::numa_place_node(stages[i]->dev)) != cudaSuccess ||
                     cudaHostGetDevicePointer((void**) &h, hh, 0) != cudaSuccess) {
                     std::fprintf(stderr, "strata serve: the layer-split hand-off allocation failed\n");
                     return 1;
@@ -9042,7 +9063,8 @@ int main(int argc, char** argv) {
             std::vector<uint32_t*> hflag_h((size_t) n_stages - 1, nullptr), hflag_d((size_t) n_stages - 1, nullptr);
             if (overlap)
                 for (size_t i = 0; i < hflag_h.size(); ++i) {
-                    if (cudaHostAlloc((void**) &hflag_h[i], 64, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                    if (strata::core::numa_host_alloc((void**) &hflag_h[i], 64, cudaHostAllocMapped | cudaHostAllocPortable,
+                                                      strata::core::numa_place_node(stages[i]->dev)) != cudaSuccess ||
                         cudaHostGetDevicePointer((void**) &hflag_d[i], hflag_h[i], 0) != cudaSuccess) {
                         std::fprintf(stderr, "strata serve: the layer-split hand-off flag allocation failed\n");
                         return 1;
@@ -9110,9 +9132,11 @@ int main(int argc, char** argv) {
             const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             std::vector<float*> hand_b((size_t) n_stages - 1, nullptr);   // the odd windows' hand-off per boundary
-            for (float*& h : hand_b) {
+            for (size_t i = 0; i < hand_b.size(); ++i) {
+                float*& h = hand_b[i];
                 float* hh = nullptr;
-                if (cudaHostAlloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                if (strata::core::numa_host_alloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable,
+                                                  strata::core::numa_place_node(stages[i]->dev)) != cudaSuccess ||
                     cudaHostGetDevicePointer((void**) &h, hh, 0) != cudaSuccess) {
                     std::fprintf(stderr, "strata serve: --pipeline-windows: the second hand-off allocation failed\n");
                     return 1;
@@ -9173,6 +9197,20 @@ int main(int argc, char** argv) {
         }
         if (prefill_head_alias_bound) mtp.set_window_R(ver.final_R_all());
         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)
+        if (strata::core::numa_place_on()) {
+            std::string placed;
+            const auto pb = strata::core::numa_host_placed();
+            for (size_t i = 0; i < pb.size(); ++i)
+                placed += (placed.empty() ? "" : ", ") + std::string("node ") + std::to_string(i) + " " +
+                          std::to_string(pb[i] >> 20) + " MiB";
+            std::fprintf(stderr, "strata serve: NUMA placement (STRATA_NUMA_PLACE, %s): %s; expert arena: %s; pinned "
+                                 "staging, hand-offs and KV copies: %s\n",
+                         strata::platform::numa_place_mode() == 2 ? "bind" : "preferred", numa_why.c_str(),
+                         arena_src.numa_note().empty() ? "not placed" : arena_src.numa_note().c_str(), placed.c_str());
+        } else if (strata::platform::numa_place_mode() != 0) {
+            std::fprintf(stderr, "strata serve: NUMA placement (STRATA_NUMA_PLACE): %s\n",
+                         numa_why.empty() ? "off: no layer split across GPUs" : numa_why.c_str());
+        }
         auto free_slot_mtp_rows = [](float* p) { if (p != nullptr) (void) cudaFree(p); };
         std::vector<std::unique_ptr<float, decltype(free_slot_mtp_rows)>> slot_mtp_rows;
         if (batch_mtp) {
