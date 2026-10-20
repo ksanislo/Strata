@@ -789,7 +789,7 @@ struct SlotPool {
 std::vector<std::unique_ptr<SlotPool>> g_slot_pools;
 struct SlotBudget {
     std::vector<strata::core::VmmChunk> free;
-    int64_t total = 0;
+    int64_t total = 0, made = 0;   // chunks it holds (made at load + given by the expert cache), and made at load
     cudaStream_t zero = nullptr;   // non-blocking: clearing a new chunk never waits for a window in flight
 };
 std::map<int, SlotBudget> g_slot_budget;
@@ -841,8 +841,40 @@ uint64_t qsa_slot_budget_add(int dev, uint64_t bytes) {
         if (h == 0) break;
         b.free.push_back(h);
         ++b.total;
+        ++b.made;
     }
     return made;
+}
+void qsa_slot_budget_give(int dev, strata::core::VmmChunk h) {
+    std::lock_guard<std::mutex> lk(g_slot_mu);
+    SlotBudget& b = g_slot_budget[dev];
+    b.free.push_back(h);
+    ++b.total;
+}
+int64_t qsa_slot_budget_take(int dev, int64_t n, std::vector<strata::core::VmmChunk>& out) {
+    std::lock_guard<std::mutex> lk(g_slot_mu);
+    SlotBudget& b = g_slot_budget[dev];
+    int64_t k = 0;
+    for (; k < n && !b.free.empty(); ++k) {
+        out.push_back(b.free.back());
+        b.free.pop_back();
+        --b.total;
+    }
+    return k;
+}
+int64_t qsa_slot_budget_chunks(int dev, int64_t* free, int64_t* made) {
+    std::lock_guard<std::mutex> lk(g_slot_mu);
+    const SlotBudget& b = g_slot_budget[dev];
+    if (free) *free = (int64_t) b.free.size();
+    if (made) *made = b.made;
+    return b.total;
+}
+int64_t qsa_slots_need(const std::vector<const QsaState*>& states, int64_t cells) {
+    std::lock_guard<std::mutex> lk(g_slot_mu);
+    int64_t need = 0;
+    for (const QsaState* st : states)
+        if (st->slot_elastic >= 0) need += slot_need_locked(*g_slot_pools[(size_t) st->slot_elastic], cells);
+    return need;
 }
 void qsa_slot_budget(int dev, uint64_t& total, uint64_t& free) {
     const uint64_t G = strata::core::vmm_granularity(dev);
