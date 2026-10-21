@@ -4097,9 +4097,10 @@ int kql_bits() {   // STRATA_KQL: 1 gate/up, 2 down, 3 both
     static const int env = env_int_or("STRATA_KQL", 0);
     return g_kql_force < 0 ? env : g_kql_force ? 3 : 0;
 }
-int kql_gu_p() { static const int v = env_int_or("STRATA_KQL_GU_P", 1); return v == 2 ? 2 : 1; }
+// unset: 2 for Q4_K / Q5_K (09-kq-layout: gu -20..-30%), 1 for Q8_0 (2 was +7-9%)
+int kql_gu_rows(int gt) { static const int v = env_int_or("STRATA_KQL_GU_P", 0); return v == 1 || v == 2 ? v : gt == 8 ? 1 : 2; }
 // unset: 4 for Q5_1 (80 registers), 2 for Q8_0 (4 takes 128: two blocks an SM)
-int kql_d_p(int dt) { static const int v = env_int_or("STRATA_KQL_D_P", 0); return v == 1 || v == 2 || v == 4 ? v : dt == 8 ? 2 : 4; }
+int kql_d_rows(int dt) { static const int v = env_int_or("STRATA_KQL_D_P", 0); return v == 1 || v == 2 || v == 4 ? v : dt == 8 ? 2 : 4; }
 int kql_warps() { static const int v = env_int_or("STRATA_KQL_WARPS", 8); return v == 4 ? 4 : 8; }
 
 // One warp: rows src[0 .. P) (contiguous, P * RB bytes) into s_w, 16 bytes a lane-load when aligned.
@@ -4157,6 +4158,66 @@ __device__ __forceinline__ float kql_dot(const uint8_t* row, const block_q8_1* x
     return s[0];
 }
 
+// kql_dot for NC entries (x + off[c]) with each weight part decoded once (S27 load / apply: bitwise Fmt<TY>::dot for
+// Q4_K, Q5_K and Q8_0, as KQ_SPLIT's row_dot_multi; Q5_1 has no such pair and takes kql_dot per entry)
+template<int TY, int K, int P, int NC>
+__device__ __forceinline__ void kql_dot_n(const uint8_t* row, const block_q8_1* x, const int (&off)[NC], int t, float (&out)[NC]) {
+    using F = Fmt<TY>;
+    using S = S27<TY>;
+    constexpr int SW = 32 / P;
+    float s[P][NC];
+#pragma unroll
+    for (int j = 0; j < P; ++j) {
+#pragma unroll
+        for (int c = 0; c < NC; ++c) s[j][c] = 0.0f;
+#pragma unroll
+        for (int i = 0; i < (K + 31) / 32; ++i) {
+            const int k = t + SW * j + 32 * i;
+            if (k < K) {
+                const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                const typename S::W w = S::load(row, kbx, iqs);
+#pragma unroll
+                for (int c = 0; c < NC; ++c) s[j][c] += S::apply(w, x + off[c] + kbx * (F::qk / 32), iqs);
+            }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+#pragma unroll
+        for (int o = P / 2; o >= 1; o >>= 1)
+#pragma unroll
+            for (int j = 0; j < o; ++j) s[j][c] = __fadd_rn(s[j][c], s[j + o][c]);
+#pragma unroll
+        for (int o = SW / 2; o > 0; o >>= 1) s[0][c] += __shfl_xor_sync(0xffffffffu, s[0][c], o);
+        out[c] = s[0][c];
+    }
+}
+// A group's entries e0 .. e1 against one staged row: off(e) = the entry's q8_1 offset, put(e, v) its store (lane t 0)
+template<int TY, int K, int P, typename Off, typename Put>
+__device__ __forceinline__ void kql_entries(const uint8_t* row, const block_q8_1* x, int e0, int e1, int t, Off off, Put put) {
+    if constexpr (TY == 12 || TY == 13 || TY == 8) {
+        for (int e = e0; e < e1; e += GRP_NC) {
+            const int n = min(GRP_NC, e1 - e);
+            auto pass = [&](auto nc) {
+                constexpr int NC = decltype(nc)::value;
+                int o[NC];
+                float v[NC];
+#pragma unroll
+                for (int c = 0; c < NC; ++c) o[c] = off(e + c);
+                kql_dot_n<TY, K, P, NC>(row, x, o, t, v);
+#pragma unroll
+                for (int c = 0; c < NC; ++c) put(e + c, v[c]);
+            };
+            if (n == 1) pass(std::integral_constant<int, 1>{});
+            else if (n == 2) pass(std::integral_constant<int, 2>{});
+            else if (n == 3) pass(std::integral_constant<int, 3>{});
+            else pass(std::integral_constant<int, 4>{});
+        }
+    } else {
+        for (int e = e0; e < e1; ++e) put(e, kql_dot<TY, K, P>(row, x + off(e), t));
+    }
+}
+
 // gate/up: n_embd = K dots of TG a row; warp w of block b takes rows (b W + w) P .. + P of gate | up (n_ff % P == 0)
 template<int TG, int K, int P>
 __global__ void __launch_bounds__(256) kql_gu_kernel(const unsigned long long* __restrict__ grp_ptr,
@@ -4182,10 +4243,8 @@ __global__ void __launch_bounds__(256) kql_gu_kernel(const unsigned long long* _
         const unsigned long long p = grp_ptr[g];
         kql_stage<P * RB>((const uint8_t*) p + w_off, s_w, lane);
         const int e0 = grp_start[g], e1 = grp_start[g + 1];
-        for (int e = e0; e < e1; ++e) {
-            const float v = kql_dot<TG, K, P>(s_w + sub * RB, xq + (size_t) ent_tok[e] * XB, t);
-            if (t == 0) dst[(size_t) e * L.n_ff + r0 + sub] = v;
-        }
+        kql_entries<TG, K, P>(s_w + sub * RB, xq, e0, e1, t, [&](int e) { return ent_tok[e] * XB; },
+                              [&](int e, float v) { if (t == 0) dst[(size_t) e * L.n_ff + r0 + sub] = v; });
     }
 }
 
@@ -4211,10 +4270,8 @@ __global__ void __launch_bounds__(256) kql_down_kernel(const unsigned long long*
         const unsigned long long p = grp_ptr[g];
         kql_stage<P * RB>((const uint8_t*) p + w_off, s_w, lane);
         const int e0 = grp_start[g], e1 = grp_start[g + 1];
-        for (int e = e0; e < e1; ++e) {
-            const float v = kql_dot<TD, K, P>(s_w + sub * RB, hq + (size_t) e * HB, t);
-            if (t == 0) out[(size_t) ent_dst[e] * L.n_embd + r0 + sub] = v;
-        }
+        kql_entries<TD, K, P>(s_w + sub * RB, hq, e0, e1, t, [&](int e) { return e * HB; },
+                              [&](int e, float v) { if (t == 0) out[(size_t) ent_dst[e] * L.n_embd + r0 + sub] = v; });
     }
 }
 
@@ -4245,7 +4302,7 @@ void kql_down_p(int64_t gy, cudaStream_t s, const unsigned long long* grp_ptr, c
 }
 void kql_gu(int64_t gy, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
             const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L, float* gate, float* up) {
-    const bool p2 = kql_gu_p() == 2;
+    const bool p2 = kql_gu_rows(L.gu_type) == 2;
 #define STRATA_KQL_GU(T) if (L.gu_type == T) { if (p2) kql_gu_p<T, 2>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); \
                                                else kql_gu_p<T, 1>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); }
     STRATA_KQL_GU(12) else STRATA_KQL_GU(13) else STRATA_KQL_GU(8)
@@ -4253,7 +4310,7 @@ void kql_gu(int64_t gy, cudaStream_t s, const unsigned long long* grp_ptr, const
 }
 void kql_down(int64_t gy, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
               const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L, float* out) {
-    const int p = kql_d_p(L.d_type);
+    const int p = kql_d_rows(L.d_type);
 #define STRATA_KQL_D(T) if (L.d_type == T) { if (p == 1) kql_down_p<T, 1>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); \
                                              else if (p == 2) kql_down_p<T, 2>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); \
                                              else kql_down_p<T, 4>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); }
