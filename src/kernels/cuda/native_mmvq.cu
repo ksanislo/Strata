@@ -1272,7 +1272,9 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
 //     51-68% -> 76-78%, q 2560->12288 74-80% -> 85-86%); 6144->2560 is slower there (79% -> 55-59%) and keeps two rows.
 //   sm_86 (RTX A4000): every n_out >= 2048 (+1-4% at 2-4 columns, 6144->2560 at 6 columns 70% -> 76%).
 // Other cards keep two rows until measured (STRATA_NO_MMVQ_ROWS2=1 forces one row everywhere; =0 keeps two everywhere).
-int dev_class() {   // 1 = gfx12, 2 = sm_86, 0 = the rest; per device
+// Turing: sm_86's rule with STRATA_SM75_Q8ROWS1=1 (opt-in until q8_gemv_bench / an A/B on a T4 says so).
+bool sm75_q8rows1_env() { const char* v = std::getenv("STRATA_SM75_Q8ROWS1"); return v != nullptr && v[0] == '1'; }
+int dev_class() {   // 1 = gfx12, 2 = sm_86 (or sm_75 with STRATA_SM75_Q8ROWS1=1), 0 = the rest; per device
     static int cls[16];   // 0 unknown, else class + 1
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return 0;
@@ -1284,7 +1286,8 @@ int dev_class() {   // 1 = gfx12, 2 = sm_86, 0 = the rest; per device
 #else
         int major = 0, minor = 0;
         if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
-            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess && major == 8 && minor == 6)
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess &&
+            ((major == 8 && minor == 6) || (strata::is_sm75(major, minor) && sm75_q8rows1_env())))
             c = 2;
 #endif
         (void) cudaGetLastError();
