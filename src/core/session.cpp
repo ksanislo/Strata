@@ -14,6 +14,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -53,7 +54,8 @@ static uint64_t ple_hist_bytes() {
     return (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM * sizeof(float);
 }
 
-uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo, int64_t layer_hi) {
+uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo, int64_t layer_hi,
+                       int slot) {
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
     if (layer_lo < 0) layer_lo = 0;
     // QSA layers are `l % interval == interval-1`, so exactly `bound / interval` of them live below `bound`
@@ -62,6 +64,13 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
     const int64_t q_n = std::max<int64_t>(q_hi - q_lo, g.n_qsa_layers() > 0 ? 1 : 0);
     const int64_t gdn_n = std::max<int64_t>((layer_hi - layer_lo) - std::max<int64_t>(q_hi - q_lo, 0), 0);
     uint64_t n = 0;
+    if (slot > 0) {   // a batch slot: its sequence state only (session_init)
+        n += (uint64_t) gdn_n * gdn_state_floats(g) * 4 + SESSION_STATE_ALIGN;
+        if (g.n_qsa_layers() > 0)
+            n += (uint64_t) q_n * (qsa_state_bytes(g, max_cells, false, 0, slot == 2) + SESSION_STATE_ALIGN);
+        n += ple_hist_bytes() + SESSION_STATE_ALIGN;
+        return align_up(n, SESSION_STATE_ALIGN) + 4096;
+    }
     n += gdn_buffers_bytes(g);
     n += (uint64_t) gdn_n * gdn_state_floats(g) * 4;
     // One QSA state carries the RoPE table; the others borrow it (P7: 64 MiB per layer at 262K).
@@ -75,7 +84,7 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
 }
 
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
-                      int64_t layer_lo, int64_t layer_hi) {
+                      int64_t layer_lo, int64_t layer_hi, int slot, const QsaState* share_rope) {
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
     if (layer_lo < 0) layer_lo = 0;
     uint8_t* p = (uint8_t*) base;
@@ -96,6 +105,24 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     s.qsa_alloc = std::max<int64_t>(q_n_range, g.n_qsa_layers() > 0 ? 1 : 0);
     s.gdn_ord0 = layer_lo - layer_lo / I;
     s.gdn_alloc = std::max<int64_t>((layer_hi - layer_lo) - q_n_range, 0);
+    if (slot > 0) {
+        if (g.n_qsa_layers() > 0 && share_rope == nullptr) return 0;
+        // a batch slot: the windows use the stage session's scratch and RoPE table, the slot's sequence state only
+        s.gdn_state = (float*) take((uint64_t) s.gdn_alloc * gdn_state_floats(g) * 4);
+        const uint64_t one = qsa_state_bytes(g, max_cells, false, 0, slot == 2);
+        s.qsa_state_arena = take(g.n_qsa_layers() > 0 ? (uint64_t) s.qsa_alloc * one : 0);
+        s.qsa_states = new QsaState[(size_t) g.n_qsa_layers()]();
+        for (int64_t j = 0; j < s.qsa_alloc; ++j)
+            if (qsa_state_init(g, max_cells, (uint8_t*) s.qsa_state_arena + (uint64_t) j * one,
+                               s.qsa_states[s.qsa_ord0 + j], share_rope, 0, slot == 2) == 0)
+                return 0;
+        s.ple_hist = (float*) take(ple_hist_bytes());
+        s.slot_cells = 0;
+        for (int64_t j = 0; s.slot_cells == 0 && j < s.qsa_alloc; ++j)
+            if (s.qsa_states[s.qsa_ord0 + j].slot_elastic < 0) s.slot_cells = -1;
+        if (s.qsa_alloc == 0) s.slot_cells = -1;
+        return used;
+    }
 
     gdn_buffers_init(g, take(gdn_buffers_bytes(g)), s.gdn);
     s.gdn_state = (float*) take((uint64_t) s.gdn_alloc * gdn_state_floats(g) * 4);
@@ -130,6 +157,40 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     return used;
 }
 
+bool session_slot_fit(SessionState& s, int64_t cells, bool trim) {
+    if (s.slot_cells < 0) return true;
+    cells = std::min<int64_t>(std::max<int64_t>(cells, 1), s.max_cells);
+    if (!trim && cells <= s.slot_cells) return true;
+    std::vector<const QsaState*> sts;
+    for (int64_t j = 0; j < s.qsa_alloc; ++j) sts.push_back(&s.qsa_states[s.qsa_ord0 + j]);
+    if (trim) {
+        for (const QsaState* st : sts) qsa_slot_trim(*st, cells);
+        s.slot_cells = std::min(s.slot_cells, cells);
+    }
+    if (!qsa_slots_grow(sts, cells)) return false;
+    s.slot_cells = std::max(s.slot_cells, cells);
+    return true;
+}
+
+int64_t session_slot_need(const SessionState& s, int64_t cells) {
+    if (s.slot_cells < 0) return 0;
+    std::vector<const QsaState*> sts;
+    for (int64_t j = 0; j < s.qsa_alloc; ++j) sts.push_back(&s.qsa_states[s.qsa_ord0 + j]);
+    return qsa_slots_need(sts, std::min<int64_t>(std::max<int64_t>(cells, 1), s.max_cells));
+}
+
+uint64_t session_slot_backed(const SessionState& s) {
+    uint64_t n = 0;
+    for (int64_t j = 0; s.slot_cells >= 0 && j < s.qsa_alloc; ++j) n += qsa_slot_backed_bytes(s.qsa_states[s.qsa_ord0 + j]);
+    return n;
+}
+
+uint64_t session_slot_reserved(const SessionState& s) {
+    uint64_t n = 0;
+    for (int64_t j = 0; s.slot_cells >= 0 && j < s.qsa_alloc; ++j) n += qsa_slot_reserved_bytes(s.qsa_states[s.qsa_ord0 + j]);
+    return n;
+}
+
 void session_release(SessionState& s) {
     for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
         if (s.qsa_states[j].owns_rope) {
@@ -159,11 +220,11 @@ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, 
     cudaStream_t cs = (cudaStream_t) stream;
     // the residual: `hc` copies of the one vector a caller hands in.  A real sequence's first token is the
     // embedding broadcast to every stream, which is the reference's own initial condition.
-    if (R_init != nullptr) {
+    if (R_init != nullptr && s.block.R != nullptr) {
         for (int64_t c = 0; c < g.hc; ++c)
             cudaMemcpyAsync(s.block.R + (size_t) c * g.n_embd, R_init, (size_t) g.n_embd * 4,
                             cudaMemcpyDeviceToDevice, cs);
-    } else {
+    } else if (s.block.R != nullptr) {   // (a batch slot has no residual of its own)
         cudaMemsetAsync(s.block.R, 0, (size_t) g.hc * g.n_embd * 4, cs);
     }
     // every owned GDN layer's recurrence and conv history
