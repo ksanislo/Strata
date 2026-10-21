@@ -140,48 +140,70 @@ int main() {
     }
     check(bg::piped_mtp_on(1, 2) && bg::piped_mtp_on(2, 2) && !bg::piped_mtp_on(3, 2), "gate: at most 2 conversations");
     check(!bg::piped_mtp_on(0, 0) && bg::piped_mtp_on(4, 4), "gate: 0 is never, the number otherwise");
-    check(bg::piped_mtp_hbase(0, 1) == 0 && bg::piped_mtp_hbase(3, 1) == 6 && bg::piped_mtp_hbase(1, 2) == 4,
-          "hbase: two hand-off rows per slot of each group");
-    check(bg::piped_mtp_handoff_rows(4, 8) == 8 && bg::piped_mtp_handoff_rows(8, 8) == 16,
-          "hand-off rows: 2 per slot, at least the window");
-    {   // groups never share a hand-off row: [hbase, hbase + S) disjoint for S <= 2 * gs, all inside the hand-off
+    check(bg::piped_mtp_group_rows(1, 3, 8) == 4 && bg::piped_mtp_group_rows(2, 3, 8) == 8 &&
+          bg::piped_mtp_group_rows(4, 3, 8) == 8 && bg::piped_mtp_group_rows(2, 1, 8) == 4,
+          "group rows: 1 + drafts per slot, at most the window");
+    check(bg::piped_mtp_hbase(3, 4) == 12 && bg::piped_mtp_handoff_rows(4, 4, 8) == 16 &&
+          bg::piped_mtp_handoff_rows(2, 2, 8) == 8, "hbase and hand-off rows");
+    {   // groups never share a hand-off row and all fit the hand-off
         for (int batch : {2, 4, 6, 8, 12, 16})
             for (int groups : {2, 3, 4})
-                if (batch % groups == 0) {
-                    const int gs = batch / groups, rows = bg::piped_mtp_handoff_rows(batch, 8);
-                    for (int gi = 0; gi < groups; ++gi)
-                        check(bg::piped_mtp_hbase(gi, gs) + 2 * gs <= rows &&
-                              (gi == 0 || bg::piped_mtp_hbase(gi - 1, gs) + 2 * gs <= bg::piped_mtp_hbase(gi, gs)),
-                              "hand-off ranges disjoint and in range");
-                }
+                for (int d : {1, 2, 3})
+                    if (batch % groups == 0) {
+                        const int gs = batch / groups, gr = bg::piped_mtp_group_rows(gs, d, 8);
+                        const int rows = bg::piped_mtp_handoff_rows(groups, gr, 8);
+                        for (int gi = 0; gi < groups; ++gi)
+                            check(bg::piped_mtp_hbase(gi, gr) + gr <= rows &&
+                                      (gi == 0 || bg::piped_mtp_hbase(gi - 1, gr) + gr <= bg::piped_mtp_hbase(gi, gr)),
+                                  "hand-off ranges disjoint and in range");
+                    }
     }
     {
-        const bool act[4] = {true, false, true, true}, rdy[4] = {true, true, false, true};
-        const int32_t x[4] = {10, 11, 12, 13}, dr[4] = {20, 21, 22, 23};
-        const int64_t p[4] = {100, 0, 200, 300};
-        auto L = bg::piped_mtp_layout(4, 4, act, rdy, x, dr, p, true, 8, 1000);
-        check(L.S == 5 && L.active == 3 && L.drafts, "layout: 2 + 1 + 2 rows, idle slot skipped");
+        const bool act[4] = {true, false, true, true};
+        const int nd[4] = {3, 3, 0, 3};
+        int32_t dr[32] = {};
+        for (int t = 0; t < 4; ++t)
+            for (int j = 0; j < 8; ++j) dr[t * 8 + j] = 20 + 10 * t + j;
+        const int32_t x[4] = {10, 11, 12, 13};
+        const int64_t p[4] = {100, 0, 200, 300}, left[4] = {50, 50, 50, 50};
+        auto L = bg::piped_mtp_layout(4, 4, act, nd, x, dr, p, left, true, 1, 8, 1000);
+        check(L.S == 5 && L.active == 3 && L.drafts, "layout, 1 draft: 2 + 1 + 2 rows, idle slot skipped");
         check(L.rows[0] == 4 && L.rows[1] == 4 && L.rows[2] == 6 && L.rows[3] == 7 && L.rows[4] == 7, "layout: row slots");
-        check(L.tok[0] == 10 && L.tok[1] == 20 && L.pos[1] == 101 && L.tok[2] == 12 && L.tok[4] == 23 && L.pos[4] == 301,
+        check(L.tok[0] == 10 && L.tok[1] == 20 && L.pos[1] == 101 && L.tok[2] == 12 && L.tok[4] == 50 && L.pos[4] == 301,
               "layout: token then draft at p + 1");
         check(L.first[0] == 0 && L.n[0] == 2 && L.first[1] == -1 && L.first[2] == 2 && L.n[2] == 1 && L.first[3] == 3,
               "layout: each slot's rows");
-        const char* why = strata::core::batch_rows_error(L.rows, L.S, L.pos, 8, 8, 8, true, 16);
-        check(why == nullptr, "layout: a valid batch row layout");
-        L = bg::piped_mtp_layout(4, 4, act, rdy, x, dr, p, false, 8, 1000);
+        check(strata::core::batch_rows_error(L.rows, L.S, L.pos, 8, 8, 8, true, 16) == nullptr, "layout: valid rows");
+        L = bg::piped_mtp_layout(4, 4, act, nd, x, dr, p, left, false, 3, 8, 1000);
         check(L.S == 3 && !L.drafts, "layout off: one row per live slot");
-        L = bg::piped_mtp_layout(4, 4, act, rdy, x, dr, p, true, 4, 1000);
-        check(L.S == 4 && L.n[0] == 2 && L.n[2] == 1 && L.n[3] == 1, "layout: the rows cap drops a draft, not a slot");
-        L = bg::piped_mtp_layout(4, 4, act, rdy, x, dr, p, true, 8, 302);
-        check(L.n[3] == 1 && L.n[0] == 2, "layout: no draft where the slot could not keep two");
+        L = bg::piped_mtp_layout(4, 4, act, nd, x, dr, p, left, true, 3, 8, 1000);
+        check(L.S == 8 && L.n[0] == 4 && L.n[2] == 1 && L.n[3] == 3, "layout, 3 drafts, 3 slots in 8 rows: shared in turn");
+        check(L.tok[1] == 20 && L.tok[2] == 21 && L.pos[2] == 102, "layout: drafts in order at p + 1 + j");
+        check(strata::core::batch_rows_error(L.rows, L.S, L.pos, 8, 8, 8, true, 16) == nullptr, "layout: valid rows (3)");
+        const bool one[4] = {true, false, false, false};
+        L = bg::piped_mtp_layout(0, 4, one, nd, x, dr, p, left, true, 3, 4, 1000);
+        check(L.S == 4 && L.n[0] == 4 && L.tok[3] == 22 && L.pos[3] == 103, "layout: one slot, 3 drafts, 4 rows");
+        const int64_t left2[4] = {2, 50, 50, 50};
+        L = bg::piped_mtp_layout(0, 4, one, nd, x, dr, p, left2, true, 3, 8, 1000);
+        check(L.n[0] == 2, "layout: no more drafts than tokens left");
+        L = bg::piped_mtp_layout(0, 4, one, nd, x, dr, p, left, true, 3, 8, 103);
+        check(L.n[0] == 2, "layout: no more drafts than the context holds (p + k + 1 <= max)");
+        L = bg::piped_mtp_layout(4, 4, act, nd, x, dr, p, left, true, 3, 4, 1000);
+        check(L.S == 4 && L.n[0] == 2 && L.n[3] == 1, "layout: 3 live slots in 4 rows: one draft, to the first");
     }
-    check(bg::piped_mtp_keep(2, 5, 5, false, false, 10, 100, 50, 1000) == 2, "keep: draft picked");
-    check(bg::piped_mtp_keep(2, 5, 6, false, false, 10, 100, 50, 1000) == 1, "keep: draft rejected");
-    check(bg::piped_mtp_keep(1, 5, 5, false, false, 10, 100, 50, 1000) == 1, "keep: no draft row");
-    check(bg::piped_mtp_keep(2, 5, 5, true, false, 10, 100, 50, 1000) == 1, "keep: eos first");
-    check(bg::piped_mtp_keep(2, 5, 5, false, true, 10, 100, 50, 1000) == 1, "keep: stopped");
-    check(bg::piped_mtp_keep(2, 5, 5, false, false, 99, 100, 50, 1000) == 1, "keep: one token left");
-    check(bg::piped_mtp_keep(2, 5, 5, false, false, 10, 100, 998, 1000) == 1, "keep: at the context's end");
+    {
+        const int32_t pick[4] = {5, 6, 7, 8}, tok[4] = {1, 5, 6, 9};
+        const bool no[4] = {false, false, false, false}, e1[4] = {false, true, false, false};
+        check(bg::piped_mtp_keep(4, pick, tok, no, false, 10, 100, 50, 1000) == 3, "keep: two drafts picked, third not");
+        check(bg::piped_mtp_keep(2, pick, tok, no, false, 10, 100, 50, 1000) == 2, "keep: one draft picked");
+        check(bg::piped_mtp_keep(1, pick, tok, no, false, 10, 100, 50, 1000) == 1, "keep: no draft row");
+        check(bg::piped_mtp_keep(4, pick, tok, e1, false, 10, 100, 50, 1000) == 2, "keep: stops after an end pick");
+        check(bg::piped_mtp_keep(4, pick, tok, no, true, 10, 100, 50, 1000) == 1, "keep: stopped");
+        check(bg::piped_mtp_keep(4, pick, tok, no, false, 98, 100, 50, 1000) == 2, "keep: tokens left");
+        check(bg::piped_mtp_keep(4, pick, tok, no, false, 10, 100, 997, 1000) == 2, "keep: context's end");
+        const int32_t t1[2] = {1, 6};
+        check(bg::piped_mtp_keep(2, pick, t1, no, false, 10, 100, 50, 1000) == 1, "keep: draft rejected");
+    }
 
     std::printf("%s\n", g_fail == 0 ? "batch_groups_test: all passed" : "batch_groups_test: FAILED");
     return g_fail == 0 ? 0 : 1;
