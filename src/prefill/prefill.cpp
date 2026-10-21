@@ -198,6 +198,7 @@ inline int64_t stream_all_min() {
 // STRATA_PREFILL_CPU_SHARE=0 turns it off: the output is then the 0.1.40.3 bytes.  g_share_default is set by
 // Prefill::arm_cpu_share(.., true) from the paths that qualify; the layer split, batch slots and HIP stay off.
 bool g_share_default = false;
+int64_t g_share_default_max = kStreamAllMinDefault;   // the default's staged-chunk limit (STRATA_SHORT_READS: 3072)
 inline double cpu_share_explicit() {   // -2: the variable is not set; -1: measured
     static const double v = [] {
         const char* e = std::getenv("STRATA_PREFILL_CPU_SHARE");
@@ -221,7 +222,7 @@ inline int64_t cpu_share_max() {
         return e ? std::max<int64_t>(kStreamAllMinDefault, (int64_t) std::atoll(e)) : (int64_t) 3072;
     }();
     static const bool explicit_max = std::getenv("STRATA_PREFILL_CPU_SHARE_MAX") != nullptr;
-    if (g_share_default && cpu_share_explicit() == -2.0 && !explicit_max) return kStreamAllMinDefault;   // its measured range
+    if (g_share_default && cpu_share_explicit() == -2.0 && !explicit_max) return g_share_default_max;   // its measured range
     return v;
 }
 double g_pinned_share = 1.0;
@@ -2302,6 +2303,11 @@ int64_t Prefill::chain_experts_streamed() const {
     for (const Prefill* p = this; p != nullptr; p = p->next_) sum += p->stats_.experts_streamed;
     return sum;
 }
+int64_t Prefill::chain_experts_cpu() const {
+    int64_t sum = 0;
+    for (const Prefill* p = this; p != nullptr; p = p->next_) sum += p->stats_.experts_cpu;
+    return sum;
+}
 
 uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool src) {
     return bytes_needed_impl(g, ss, chunk, false, src);
@@ -2427,13 +2433,14 @@ std::string Prefill::enable_peer_handoff() {
     return what + " goes peer to peer into CUDA" + std::to_string(r) + "'s VRAM (2 x " +
            std::to_string(m.hand_bytes >> 20) + " MiB there)";
 }
+void Prefill::set_share_default_max(int64_t tokens) { g_share_default_max = std::max<int64_t>(kStreamAllMinDefault, tokens); }
 void Prefill::arm_cpu_share(bool applies, bool by_default) {
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
     if (applies && by_default && cpu_share_explicit() == -2.0 && !g_share_default) {
         g_share_default = true;
-        std::fprintf(stderr, "prefill: the CPU share is ON by default for prompt chunks below 1024 tokens (the idle CPU "
+        std::fprintf(stderr, "prefill: the CPU share is ON by default for prompt chunks below %lld tokens (the idle CPU "
                              "takes some of the experts the GPU would stream; answers can differ slightly from 0.1.40.3, "
-                             "mean KL ~0.004). STRATA_PREFILL_CPU_SHARE=0 turns it off.\n");
+                             "mean KL ~0.004). STRATA_PREFILL_CPU_SHARE=0 turns it off.\n", (long long) cpu_share_max());
     }
 #else
     (void) by_default;
