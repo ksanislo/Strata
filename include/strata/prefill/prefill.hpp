@@ -123,6 +123,7 @@ public:
     static void log_plan(int64_t n, int64_t chunk, int stages);
     /// The expert blobs this stage and the later ones copied host -> device so far (PrefillStats::experts_streamed).
     int64_t chain_experts_streamed() const;
+    int64_t chain_experts_cpu() const;   ///< the same chain's experts the CPU share took
     /// #340: the streamed ring's slot count for chunks that stream every expert, instead of the pinned-share rule
     /// (0 = that rule). Set before any `bytes_needed`/`init` (both count the ring); STRATA_PREFILL_RING still wins.
     static void set_ring_override(int slots);
@@ -245,6 +246,8 @@ public:
     /// `by_default`: this path is one the share was measured on (CUDA, one GPU, no batch slots), so with the variable unset
     /// the share is on for chunks below 1024 tokens (STRATA_PREFILL_CPU_SHARE=0 turns it off).
     static void arm_cpu_share(bool applies, bool by_default = false);
+    /// The staged-chunk limit of a default-armed share (1024; STRATA_SHORT_READS raises it).  Call before arm_cpu_share.
+    static void set_share_default_max(int64_t tokens);
 
 private:
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
