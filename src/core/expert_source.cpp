@@ -10,6 +10,7 @@
 
 #include "strata/core/pinned.hpp"
 #include "strata/platform/memory.hpp"
+#include "strata/platform/numa_cpus.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
@@ -5675,6 +5676,109 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst, const strata:
     return st;
 }
 
+int parallel_load_mode() {
+#if defined(__linux__)
+    static const int m = [] { const char* v = std::getenv("STRATA_PARALLEL_LOAD"); return v != nullptr && v[0] == '1' ? 1 : 0; }();
+    return m;
+#else
+    return 0;   // pread and per-node threads: Linux only
+#endif
+}
+
+bool parallel_load_register_first() {
+    const char* v = std::getenv("STRATA_PARALLEL_LOAD_REGISTER");
+    return v != nullptr && std::string(v) == "first";
+}
+
+LoadStats load_experts_gguf_parallel(const std::string& gguf, uint8_t* dst, const strata::kernels::cpu::ExpertLayout& lay,
+                                     const std::vector<int>& layer_nodes, int threads_per_node, const PadMap* pad) {
+#if !defined(__linux__)
+    (void) layer_nodes;
+    return load_experts_gguf(gguf, dst, lay, threads_per_node, false, nullptr, pad);
+#else
+    LoadStats st;
+    st.layers = (uint64_t) lay.n_layers;
+    const auto t0 = std::chrono::steady_clock::now();
+    // one group per node (its layers, its CPUs), or one unpinned group over every layer
+    struct Group { std::vector<int64_t> layers; std::vector<int> cpus; std::atomic<size_t> next{0}; };
+    std::vector<std::unique_ptr<Group>> groups;
+    if ((int64_t) layer_nodes.size() == lay.n_layers) {
+        std::map<int, Group*> by_node;
+        for (int64_t l = 0; l < lay.n_layers; ++l) {
+            Group*& g = by_node[layer_nodes[(size_t) l]];
+            if (g == nullptr) {
+                groups.push_back(std::make_unique<Group>());
+                g = groups.back().get();
+                g->cpus = strata::platform::numa_node_cpus(layer_nodes[(size_t) l]);
+            }
+            g->layers.push_back(l);
+        }
+    }
+    if (groups.empty()) {
+        groups.push_back(std::make_unique<Group>());
+        for (int64_t l = 0; l < lay.n_layers; ++l) groups.back()->layers.push_back(l);
+    }
+    std::atomic<bool> bad{false};
+    std::mutex err_mu;
+    std::string err;
+    auto fail = [&](const std::string& what) {
+        std::lock_guard<std::mutex> g(err_mu);
+        if (err.empty()) err = what;
+        bad = true;
+    };
+    auto worker = [&](Group* G) {
+        strata::platform::pin_this_thread(G->cpus);   // first touch: the pages land on this node
+        int fd = -1;
+        std::string open_name;
+        for (size_t i; !bad && (i = G->next.fetch_add(1)) < G->layers.size();) {
+            const int64_t l = G->layers[i];
+            const auto& fm = lay.fmt[(size_t) l];
+            const uint64_t blob = lay.bytes[(size_t) l];
+            const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
+            const uint64_t at[3] = {0, fm.up_off, fm.down_off};
+            for (int r = 0; r < 3 && !bad; ++r) {
+                const std::string name = expert_gguf_file(gguf, lay, l, r);
+                if (name != open_name) {
+                    if (fd >= 0) ::close(fd);
+                    fd = ::open(name.c_str(), O_RDONLY | O_CLOEXEC);
+                    if (fd < 0) { fail("cannot open " + name); break; }
+                    open_name = name;
+                }
+                const uint64_t src = lay.gguf_off[(size_t) (3 * l + r)];
+                for (int64_t e = 0; e < lay.n_expert && !bad; ++e) {
+                    uint8_t* to = dst + (pad != nullptr ? pad->blob_off(l, e) : lay.blob_offset(l, e)) + at[r];
+                    const uint64_t from = src + (uint64_t) e * per[r];
+                    for (uint64_t got = 0; got < per[r];) {
+                        const ssize_t n = ::pread(fd, to + got, (size_t) (per[r] - got), (off_t) (from + got));
+                        if (n < 0 && errno == EINTR) continue;
+                        if (n <= 0) {
+                            fail("short read of layer " + std::to_string(l) + " in " + name);
+                            break;
+                        }
+                        got += (uint64_t) n;
+                    }
+                }
+            }
+        }
+        if (fd >= 0) ::close(fd);
+    };
+    std::vector<std::thread> pool;
+    const int per_group = std::max(1, threads_per_node);
+    for (auto& g : groups)
+        for (int t = 0; t < per_group; ++t) pool.emplace_back(worker, g.get());
+    for (auto& t : pool) t.join();
+    if (bad) {
+        st.seconds = -1.0;
+        st.ok = false;
+        st.error = err.empty() ? "short read or unreadable shard while reading the experts from the GGUF" : err;
+        return st;
+    }
+    st.bytes = lay.total;
+    st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    return st;
+#endif
+}
+
 ArenaExpertSource::~ArenaExpertSource() { close(); }
 
 bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, int threads,
@@ -5864,9 +5968,15 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
 #else
     const bool deferred = false;
 #endif
+    // STRATA_PARALLEL_LOAD: the GGUF's experts read by threads on each layer's node; by default into the unregistered
+    // arena (the readers fault the pages in, in parallel), registered after (cudaHostRegister faults on one thread)
+    const bool par = parallel_load_mode() == 1 && from_gguf && !by_need && !deferred && shared_arena_file.empty() &&
+                     !arena_mmap;
+    const bool fill_first = par && !parallel_load_register_first();
     PinnedArena* a = by_need ? new PinnedArena(arena_bytes + (uint64_t) blob, PinnedArena::ByNeed{}, need_ranges,
                                                max_pinned_bytes, shared_arena_file, pack_hash)
                    : deferred ? new PinnedArena(want + (uint64_t) blob, bounds, PinnedArena::Deferred{})
+                   : fill_first ? new PinnedArena(want + (uint64_t) blob, bounds, PinnedArena::FillFirst{}, max_pinned_bytes)
                               : new PinnedArena(want + (uint64_t) blob, bounds, max_pinned_bytes,
                                                 shared_arena_file, pack_hash);
     if (!a->valid()) {
@@ -5904,7 +6014,23 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         });
     }
     const std::atomic<int>* rp = deferred ? &ready : nullptr;
-    if (from_gguf) {
+    double register_s = -1.0;
+    if (par) {
+        const char* tv = std::getenv("STRATA_PARALLEL_LOAD_THREADS");   // per node (or in all, unpinned)
+        const int per_node = tv != nullptr && std::atoi(tv) > 0 ? std::atoi(tv) : 8;
+        st = load_experts_gguf_parallel(gguf_, a->data(), lay, load_nodes_, per_node, nullptr);
+        if (st.ok && fill_first) {
+            const auto tr = std::chrono::steady_clock::now();
+            a->register_filled();
+            register_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tr).count();
+        }
+        char pn[200];
+        std::snprintf(pn, sizeof pn, "parallel load (STRATA_PARALLEL_LOAD): %d threads per node, filled in %.1f s%s",
+                      per_node, st.seconds, fill_first ? ", registered after it in " : ", registered before it");
+        char rs[32] = "";
+        if (register_s >= 0.0) std::snprintf(rs, sizeof rs, "%.1f s", register_s);
+        a->note = std::string(pn) + rs + "; " + a->note;
+    } else if (from_gguf) {
         st = load_experts_gguf(gguf_, a->data(), lay, readers, unbuffered, rp, padded_ ? &pad_ : nullptr);
     } else {
         if (unbuffered && !padded_) st = load_experts_direct(path, a->data(), loff, lbytes, readers, /*chunk=*/8u << 20, rp);
