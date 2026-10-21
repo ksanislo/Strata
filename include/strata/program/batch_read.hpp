@@ -90,7 +90,6 @@ inline bool piped_read_lead_in(bool enabled, bool beside_slots, double ms_since_
 struct SlotAdmitSetup {
     bool asked = false;             ///< STRATA_SLOT_ADMIT=1
     bool piped = false;             ///< the pipelined slot groups (--batch-groups > 1 on a layer split)
-    bool batch_mtp = false;         ///< --batch-mtp (its per-slot drafts are made by the old admission)
     bool cvec = false;              ///< a control vector is loaded (switched per request, for every slot at once)
     bool head_alias = false;        ///< --prefill-head-alias (the output head is unloaded around a read)
     const char* conc_off = nullptr; ///< concurrent_read_off's reason (the read runs on a thread of its own)
@@ -98,7 +97,6 @@ struct SlotAdmitSetup {
 inline const char* slot_admit_off(const SlotAdmitSetup& s) {
     if (!s.asked) return "not asked (STRATA_SLOT_ADMIT=1)";
     if (!s.piped) return "not on the pipelined slot groups (--batch-groups > 1 on a layer split)";
-    if (s.batch_mtp) return "--batch-mtp";
     if (s.cvec) return "a control vector";
     if (s.head_alias) return "--prefill-head-alias";
     return s.conc_off;
