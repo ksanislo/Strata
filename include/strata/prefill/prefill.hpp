@@ -239,6 +239,10 @@ public:
     /// thread runs meanwhile (no batch slots); on a layer split every stage may have it - one stage at a time takes it
     /// for a chunk. Set before `init`.
     void set_cpu_pool(kernels::cpu::ExpertPool* pool);
+    /// STRATA_P2P_HANDOFF=2: hand each chunk to the next stage in that stage's VRAM (two buffers of the host hand-off's
+    /// size there, written peer to peer) where this GPU can reach it; otherwise the pinned host buffers stay.  After
+    /// every stage's `init`; once.  Returns the line for the log ("" when there is no next stage on another GPU).
+    std::string enable_peer_handoff();
     /// With STRATA_PREFILL_CPU_SHARE set and `applies` (a pool will be set): the chunks staged after their routing - the
     /// only ones the share applies to - go up to STRATA_PREFILL_CPU_SHARE_MAX tokens (default 3072) instead of 1024.
     /// Before any `bytes_needed` (the ring and the small-chunk buffers follow the limit); `init` also sets it.
@@ -265,6 +269,7 @@ private:
     bool force_single_ = false, force_planned_ = false;
     bool bind_stage_helper(int64_t T);  // binds the helper's buffers for a one-chunk prompt of T tokens
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
+    bool hand_in_peer_ = false;         ///< ... in this stage's VRAM instead (enable_peer_handoff)
     /// STRATA_HANDOFF_PIPE: the previous stage's per-piece "landed in hand_in_" events (cudaEvent_t[hand_pieces_],
     /// on its device) when it copies the chunk in pieces without a host wait; null with the one-copy hand-off
     const void* hand_ev_ = nullptr;

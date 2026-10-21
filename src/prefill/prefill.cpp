@@ -990,6 +990,8 @@ struct Prefill::Impl {
     // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn)
     int device = -1;
     float* hand[2] = {};
+    float* hand_peer[2] = {};   // STRATA_P2P_HANDOFF=2: the same buffers in the next stage's VRAM (enable_peer_handoff)
+    uint64_t hand_bytes = 0;
     // STRATA_HANDOFF_PIPE: per hand-off buffer, "the chunk's work is done" and one "landed" event per piece
     int hand_pieces = 0;
     cudaEvent_t hand_done[2] = {};
@@ -1401,11 +1403,13 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     }
     // the CPU share's staged-chunk limit, before the ring is sized below (a caller that sizes loans first armed it)
     arm_cpu_share(cpu_pool_ != nullptr);
-    for (int b = 0; next_ != nullptr && b < 2; ++b)
+    for (int b = 0; next_ != nullptr && b < 2; ++b) {
         if (!m.hand[b] && cudaHostAlloc((void**) &m.hand[b], (size_t) chunk * D * 4, cudaHostAllocPortable) != cudaSuccess) {
             err = "prefill: the layer split's hand-off buffers";
             return false;
         }
+        if (b == 0 && m.hand_bytes == 0) m.hand_bytes = (uint64_t) chunk * D * 4;
+    }
     if (next_ != nullptr && handoff_pipe_pieces() > 0 && m.hand_pieces == 0) {   // events only: no device memory
         bool ok = true;
         auto make = [](cudaEvent_t& e) { return e != nullptr || cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess; };
@@ -2401,6 +2405,38 @@ int64_t Prefill::ring_max_slots() {
 
 int64_t Prefill::ring_slots_for(int64_t chunk) { return ring_slots((size_t) chunk); }
 void Prefill::set_cpu_pool(kernels::cpu::ExpertPool* pool) { cpu_pool_ = pool; }
+
+std::string Prefill::enable_peer_handoff() {
+    Impl& m = *impl_;
+    if (next_ == nullptr || m.hand_peer[0] != nullptr || m.hand_bytes == 0) return "";
+    const int w = m.device, r = next_->impl_->device;
+    if (w < 0 || r < 0 || w == r) return "";
+    const std::string what = "the prompt path's hand-off CUDA" + std::to_string(w) + " -> CUDA" + std::to_string(r);
+    int can = 0;
+    if (cudaDeviceCanAccessPeer(&can, w, r) != cudaSuccess || can == 0) {
+        (void) cudaGetLastError();
+        return what + " stays in host memory (no peer access)";
+    }
+    {
+        const core::OnDevice on(w);
+        const cudaError_t e = cudaDeviceEnablePeerAccess(r, 0);
+        (void) cudaGetLastError();
+        if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) return what + " stays in host memory (peer access failed)";
+    }
+    const core::OnDevice on(r);
+    float* p[2] = {};
+    for (float*& q : p)
+        if (cudaMalloc((void**) &q, (size_t) m.hand_bytes) != cudaSuccess) {
+            (void) cudaGetLastError();
+            for (float* f : p) if (f != nullptr) cudaFree(f);
+            return what + " stays in host memory (2 x " + std::to_string(m.hand_bytes >> 20) + " MiB do not fit in CUDA" +
+                   std::to_string(r) + ")";
+        }
+    m.hand_peer[0] = p[0];
+    m.hand_peer[1] = p[1];
+    return what + " goes peer to peer into CUDA" + std::to_string(r) + "'s VRAM (2 x " +
+           std::to_string(m.hand_bytes >> 20) + " MiB there)";
+}
 void Prefill::arm_cpu_share(bool applies, bool by_default) {
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
     if (applies && by_default && cpu_share_explicit() == -2.0 && !g_share_default) {
@@ -2696,6 +2732,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         const auto tsetup = Clock::now();
         // ---- embeddings, broadcast to the four streams - or, in a later stage of a layer split, the rows the
         // previous stage handed on
+        const cudaMemcpyKind in_kind = hand_in_peer_ ? cudaMemcpyDefault : cudaMemcpyHostToDevice;
         if (hand_in_ != nullptr && hand_ev_ != nullptr) {
             // STRATA_HANDOFF_PIPE: each piece's upload waits on the GPU for its download on the stage before.  The
             // stage before split the chunk it handed on (n rows); one chunk here is all of it, otherwise (a smaller
@@ -2709,19 +2746,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 ok = cudaStreamWaitEvent(m.cs, ev[i], 0) == cudaSuccess;
                 if (ok && whole && nr > 0)
                     ok = cudaMemcpyAsync(m.R + (size_t) r0 * D, hand_in_ + (size_t) r0 * D, (size_t) nr * D * 4,
-                                         cudaMemcpyHostToDevice, m.cs) == cudaSuccess;
+                                         in_kind, m.cs) == cudaSuccess;
             }
             if (ok && !whole)
-                ok = cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice,
-                                     m.cs) == cudaSuccess;
+                ok = cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, in_kind, m.cs) == cudaSuccess;
             if (!ok) {
                 err = std::string("prefill: the layer split's hand-off upload failed (STRATA_HANDOFF_PIPE): ") +
                       cudaGetErrorString(cudaGetLastError());
                 return false;
             }
         } else if (hand_in_ != nullptr) {
-            if (cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice, m.cs) !=
-                cudaSuccess) {
+            if (cudaMemcpyAsync(m.R, hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, in_kind, m.cs) != cudaSuccess) {
                 err = "prefill: the layer split's hand-off upload failed";
                 return false;
             }
@@ -4850,7 +4885,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         pt.mark(kPfStart, cs);
         if (next_ != nullptr) {
             // The current hand-off slot was used two chunks ago.
-            float* h = m.hand[hand_buf_];
+            const bool peer = m.hand_peer[hand_buf_] != nullptr;
+            float* h = peer ? m.hand_peer[hand_buf_] : m.hand[hand_buf_];
+            const cudaMemcpyKind out_kind = peer ? cudaMemcpyDefault : cudaMemcpyDeviceToHost;
             const int hp = m.hand_pieces;
             if (hp > 0) {
                 // STRATA_HANDOFF_PIPE: the pieces' downloads stay queued; the host waits for the chunk's work only (the
@@ -4861,14 +4898,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     handoff_piece(T, hp, i, r0, nr);
                     if (nr > 0)
                         ok = cudaMemcpyAsync(h + (size_t) r0 * D, m.R + (size_t) r0 * D, (size_t) nr * D * 4,
-                                             cudaMemcpyDeviceToHost, m.cs) == cudaSuccess;
+                                             out_kind, m.cs) == cudaSuccess;
                     ok = ok && cudaEventRecord(m.hand_ev[hand_buf_][i], m.cs) == cudaSuccess;
                 }
                 if (!ok || cudaEventSynchronize(m.hand_done[hand_buf_]) != cudaSuccess) {
                     err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
                     return false;
                 }
-            } else if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
+            } else if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, out_kind, m.cs) != cudaSuccess ||
                        cudaStreamSynchronize(m.cs) != cudaSuccess) {
                 err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
@@ -4879,6 +4916,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
             next_err_.clear();
             next_->hand_in_ = h;
+            next_->hand_in_peer_ = peer;
             next_->hand_ev_ = hp > 0 ? static_cast<const void*>(m.hand_ev[hand_buf_]) : nullptr;
             next_->hand_pieces_ = hp;
             next_->single_chunk_ = single_chunk;
