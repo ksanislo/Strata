@@ -12346,6 +12346,7 @@ int main(int argc, char** argv) {
         };
         // an admission into slot b (everything drained): it is trimmed to its new conversation and backed for it; when the
         // budget is short, idle slots give their memory back and drop the conversations they keep (parked reads last)
+        std::function<void(int, const char*)> slot_drop_save;   // --session-dir: a kept conversation saved before it is dropped
         auto slot_admit_fit = [&](int b, int64_t upto, std::string& e) -> bool {
             if (!eslots_on) return true;
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
@@ -12359,6 +12360,7 @@ int main(int argc, char** argv) {
                     bool big = false;
                     for (const auto& v : bslot_ss) big = big || v[(size_t) j]->slot_cells > 1;
                     if (j == b || j == admit_slot || sj.active || sj.reading || sj.partial != (pass == 1) || !big) continue;
+                    if (slot_drop_save) slot_drop_save(j, "it gives its memory to another slot");
                     for (size_t k = 0; k < bslot_ss.size(); ++k) {
                         strata::core::SessionState& u = *bslot_ss[k][(size_t) j];
                         if (u.slot_cells < 0) continue;
@@ -13341,6 +13343,7 @@ int main(int argc, char** argv) {
             if (!ok) std::fprintf(stderr, "strata batch: slot %d's conversation not saved (%s)\n", b, err.c_str());
             err.clear();
         };
+        slot_drop_save = [&](int b, const char* why) { persist_slot(b, false, {}, false, why); };
         if (!o.session_dir.empty()) {
             std::string why;
             if (o.prompt_cache <= 0) why = "needs --prompt-cache > 0";   // parking optional: without it, disk only
