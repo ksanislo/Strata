@@ -903,14 +903,14 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     sink_.staging = (unsigned long long) staging_;
     sink_.staging_cap = kStagingBlobs;
     (void) TS;
-    // STRATA_PIPED_CONCURRENT=1 (opt-in): a prompt can run on the same GPU while the batch windows run, so the windows'
-    // streams get the device's highest priority (HIP: the default priority, as the drafter's)
+    // STRATA_PIPED_CONCURRENT=1 / STRATA_SLOT_ADMIT=1 (opt-in): a prompt can run on the same GPU while the batch windows
+    // run, so the windows' streams get the device's highest priority (HIP: the default priority, as the drafter's)
     auto make_stream = [](cudaStream_t* s) -> cudaError_t {
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
         static const bool hi = [] {   // (STRATA_PIPED_CONCURRENT_PRIO=0: the default priority)
-            const char* v = std::getenv("STRATA_PIPED_CONCURRENT");
+            auto on = [](const char* k) { const char* v = std::getenv(k); return v != nullptr && std::atoi(v) != 0; };
             const char* p = std::getenv("STRATA_PIPED_CONCURRENT_PRIO");
-            return v != nullptr && std::atoi(v) != 0 && (p == nullptr || std::atoi(p) != 0);
+            return (on("STRATA_PIPED_CONCURRENT") || on("STRATA_SLOT_ADMIT")) && (p == nullptr || std::atoi(p) != 0);
         }();
         int lo = 0, top = 0;
         if (hi) {
