@@ -11335,6 +11335,10 @@ int main(int argc, char** argv) {
                 why = "no VRAM for its PLE scratch";
             }
             slot_admit = why == nullptr;
+            if (slot_admit) {   // a prompt's PLE gather in pieces of 512 tokens: a window's waits behind one piece only
+                const char* gp = std::getenv("STRATA_PLE_GATHER_PIECE");
+                strata::kernels::PleTable::set_gather_piece(gp != nullptr ? (size_t) std::max(0, std::atoi(gp)) : 512);
+            }
             if (sa.asked)
                 std::fprintf(stderr, "strata batch: STRATA_SLOT_ADMIT: %s%s\n",
                              slot_admit ? "admissions read beside the decoding slots" : "off: ", slot_admit ? "" : why);
@@ -13327,6 +13331,7 @@ int main(int argc, char** argv) {
         std::vector<int64_t> adm_queued_len(bs.size(), 0);   // its prompt's length (the shorter-first test)
         std::vector<Clock::time_point> adm_queued_at(bs.size());
         int adm_reading = -1;               // the slot whose prompt is being read
+        std::vector<std::atomic<bool>*> adm_stop_of(bs.size(), nullptr);   // STRATA_SLOT_ADMIT_MULTI: a slot's queued read
         std::atomic<bool> adm_stop{false};  // BSTOP for it
         bool adm_active = false;            // a run of admissions (reads and the loan between them) is under way
         struct AdmReq {
@@ -13391,7 +13396,7 @@ int main(int argc, char** argv) {
             AdmReq r;
             bool direct = false;
             const bool ok = adm_parse(l, r) && !r.bias && mrope_identity && r.slot >= 0 && r.slot < (int) bs.size() &&
-                            !bs[(size_t) r.slot].active && !adm_queued[(size_t) r.slot] && !adm_paused[(size_t) r.slot] && adm_reading != r.slot &&
+                            !bs[(size_t) r.slot].active && !adm_queued[(size_t) r.slot] && !adm_paused[(size_t) r.slot] && adm_reading != r.slot && adm_stop_of[(size_t) r.slot] == nullptr &&
                             r.max_new >= 1 && !r.ids.empty();
             if (ok) {
                 const int64_t n = (int64_t) r.ids.size();
@@ -13453,7 +13458,8 @@ int main(int argc, char** argv) {
         // admission before it starts
         auto adm_bstop = [&](int b) {
             if (b < 0 || b >= (int) bs.size()) return;
-            if (adm_reading == b) adm_stop.store(true);
+            if (adm_stop_of[(size_t) b] != nullptr) adm_stop_of[(size_t) b]->store(true);
+            else if (adm_reading == b) adm_stop.store(true);
             else if (adm_queued[(size_t) b] || adm_paused[(size_t) b]) adm_cancel[(size_t) b] = 1;
             else bs[(size_t) b].stop = true;
         };
@@ -13505,6 +13511,14 @@ int main(int argc, char** argv) {
             if (!strata::aux_cpus::enabled()) (void) strata::aux_cpus::place_off_host();
 #endif
         };
+        // STRATA_SLOT_ADMIT_CHUNK=N: reads beside the slots lend for chunks of at most N tokens (0: the prompt path's own)
+        static const int64_t adm_chunk_cap = [] {
+            const char* v = std::getenv("STRATA_SLOT_ADMIT_CHUNK");
+            return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0;
+        }();
+        auto adm_loan = [&](int64_t tokens) {
+            return adm_chunk_cap > 0 ? std::min(tokens, adm_chunk_cap) : tokens;
+        };
         // one admission's read, which a shorter admission can pause at a chunk boundary (it lives in its own slot, so
         // it goes on from there later): its request, where it stands, its turn checkpoint once taken
         struct AdmJob {
@@ -13517,6 +13531,19 @@ int main(int argc, char** argv) {
             double wait_ms = 0.0, read_ms = 0.0;
             int64_t rows = 0;
             int pauses = 0;
+            // STRATA_SLOT_ADMIT_MULTI: its pieces in the prompt path's queue, the set-up thread before them, the turn
+            // checkpoint's stage parts (each saved by its stage when that stage reaches turn_at)
+            std::atomic<int> inflight{0};
+            std::atomic<bool> stop{false}, failed{false}, set_up{false};
+            std::atomic<int64_t> done_at{0};
+            std::mutex mu;
+            std::string err;
+            std::thread setup;
+            bool setup_ok = true, queued = false;
+            std::vector<ConvCheckpoint> parts;
+            std::vector<char> part_ok;
+            Clock::time_point t_read{};
+            int64_t rows0 = 0;
         };
         enum class AdmEnd { done, paused, fatal, ready };
         int adm_main_dev = 0;
@@ -13539,6 +13566,7 @@ int main(int argc, char** argv) {
             }
             return false;
         };
+        std::function<bool()> adm_quiet;   // STRATA_SLOT_ADMIT_MULTI: until no queued read is in flight
         // a job's first step (main thread): refused (BRE, done), or the slot set up to be read into
         auto adm_prepare = [&](AdmJob& j) -> AdmEnd {
             const int b = j.r.slot;
@@ -13608,6 +13636,7 @@ int main(int argc, char** argv) {
             if (GS > 1 && pg[(size_t) (b / GS)].inflight && group_held(b / GS) && !pipe_drain()) return AdmEnd::fatal;
             std::string e;
             if (batch_mtp && !adm_mtp_ready[(size_t) b]) {   // its graphs captured with nothing in flight (#31), once
+                if (adm_quiet && !adm_quiet()) return AdmEnd::fatal;
                 if (!pipe_drain()) return AdmEnd::fatal;
                 if (!slot_mtp[(size_t) b]->reserve_prefill(sp.chunk(), e)) {
                     std::printf("ERR batch MTP slot %d: %s\n", b, e.c_str());
@@ -13638,7 +13667,7 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 return AdmEnd::done;
             }
-            const int64_t read_n = n - 1 - j.at;
+            const int64_t read_n = adm_loan(n - 1 - j.at);
             std::string e;
             if (read_n > 0 && !adm_lend_covers(read_n)) {   // the loan changes only with no window in flight
                 const auto tf = Clock::now();
@@ -13878,6 +13907,327 @@ int main(int argc, char** argv) {
         };
         // a run of admissions read beside the slots: the first is `first`, then every one that is next in line; the
         // doorbells are served on a thread of their own throughout, the loan is refilled once at the end
+        // STRATA_SLOT_ADMIT_MULTI=1: the admissions' reads go through the prompt path's queue (Prefill::enqueue), one
+        // job a piece of one chunk into the slot's sessions, so stage 0 reads the next piece (of this admission or the
+        // next) while the later stages finish this one.  A shorter admission's pieces go to the front of the pieces not
+        // started yet (at most half of what the one being read has left: as STRATA_SLOT_ADMIT's pause, between pieces).
+        static const bool adm_multi = [] {
+            const char* v = std::getenv("STRATA_SLOT_ADMIT_MULTI");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        auto adm_multi_run = [&](const std::string& first, int& n_adm) -> bool {
+            const size_t n_st = stages.size() + 1;
+            std::vector<std::unique_ptr<AdmJob>> live;
+            struct Joins {   // (after `live`: first to go) every set-up thread joined, no slot left marked queued
+                std::vector<std::unique_ptr<AdmJob>>& l;
+                std::vector<std::atomic<bool>*>& stops;
+                ~Joins() {
+                    for (auto& j : l)
+                        if (j->setup.joinable()) j->setup.join();
+                    for (auto& x : stops) x = nullptr;
+                }
+            } joins{live, adm_stop_of};
+            auto in_flight = [&] {
+                int t = 0;
+                for (const auto& j : live) t += j->inflight.load();
+                return t;
+            };
+            bool pump_ok = true;
+            auto pump_or_wait = [&] {
+                if (pump_ok && (batch_on() || pipe_inflight())) pump_ok = pump(true);
+                else std::this_thread::sleep_for(std::chrono::microseconds(500));
+                return pump_ok;
+            };
+            adm_quiet = [&]() -> bool {
+                while (in_flight() > 0)
+                    if (!pump_or_wait()) return false;
+                return true;
+            };
+            struct QuietOff {
+                std::function<bool()>& q;
+                ~QuietOff() { q = nullptr; }
+            } quiet_off{adm_quiet};
+            // every queued piece has run before this returns (the jobs hold references to `live`)
+            struct Drain {
+                strata::prefill::Prefill& p;
+                ~Drain() { p.drain_jobs(); }
+            } drain{sp};
+            // the loan: lent once for every piece of this run (a relayout waits for no queued read), refilled at the end
+            const int64_t piece = std::max<int64_t>(1, adm_loan(o.prefill_chunk));
+            if (!pf_parts.empty() && !adm_lend_covers(piece)) {
+                const auto tf = Clock::now();
+                std::string e;
+                if (!pipe_drain()) return false;
+                if (!adapt_tick(true)) { std::printf("ERR an adaptive refill failed\n"); return false; }
+                if (!lend(piece, e, 0)) { std::printf("ERR lending the prompt path its slots failed: %s\n", e.c_str()); return false; }
+                adm_fence_ms += std::chrono::duration<double, std::milli>(Clock::now() - tf).count();
+            }
+            const int64_t P = std::max<int64_t>(1, std::min(sp.chunk(), piece));
+            auto take = [&](const std::string& l) -> bool {
+                auto j = std::make_unique<AdmJob>();
+                if (!adm_parse(l, j->r) || j->r.slot < 0 || j->r.slot >= (int) bs.size()) {
+                    std::printf("ERR BGEN: a bad line\n");
+                    std::fflush(stdout);
+                    return true;
+                }
+                const size_t b = (size_t) j->r.slot;
+                adm_queued[b] = 0;
+                ++n_adm;
+                if (adm_cancel[b]) {
+                    adm_cancel[b] = 0;
+                    std::printf("BRA %d 0 cancel\n", j->r.slot);
+                    std::fflush(stdout);
+                    return true;
+                }
+                j->t_bgen = adm_queued_at[b];
+                j->wait_ms = std::chrono::duration<double, std::milli>(Clock::now() - j->t_bgen).count();
+                const AdmEnd e = adm_prepare(*j);
+                if (e == AdmEnd::fatal) return false;
+                if (e == AdmEnd::done) return true;
+                strata::core::SessionState& s0 = *bslot_ss[0][b];
+                if (ss.ple.ready()) {   // the stage's PLE tables and weights, the slot's history, the reads' scratch
+                    s0.ple = ss.ple;
+                    s0.ple.hist = s0.ple_hist;
+                    s0.ple.prev = s0.ple_prev;
+                    s0.ple.token = &s0.ple_token;
+                    s0.ple.scratch = adm_ple_scratch;
+                    s0.ple.emb_dev = adm_ple_emb;
+                }
+                adm_stop_of[b] = &j->stop;
+                AdmJob* jp = j.get();
+                // the slot's state to `resume` (its checkpoint or zero) and its drafter, on a thread: a restore waits
+                // for the devices, which may be reading another admission's piece
+                jp->setup = std::thread([&, jp, b] {
+                    AdmJob& jr = *jp;
+                    adm_thread_cpus();
+                    std::string e2;
+                    bool ok = true;
+                    try {
+                        strata::core::MtpDrafter* dr = batch_mtp ? slot_mtp[b].get() : nullptr;
+                        for (size_t k = 0; k < n_st && ok; ++k) {
+                            const strata::core::OnDevice on(k == 0 ? adm_main_dev : stages[k - 1]->dev);
+                            strata::core::SessionState& x = *bslot_ss[k][b];
+                            if (jr.ck != nullptr) {
+                                ok = checkpoint_restore(k == 0 ? *jr.ck : jr.ck->stage_parts[k - 1], x, g);
+                                if (!ok) e2 = "restoring the slot's turn checkpoint failed";
+                            } else if (jr.resume == 0) {
+                                strata::core::session_zero(x, g, nullptr, (void*) stage_stream(k));
+                                ok = cudaStreamSynchronize(stage_stream(k)) == cudaSuccess;
+                                if (!ok) e2 = "zeroing the slot failed";
+                            }
+                        }
+                        if (ok && dr != nullptr) {   // the drafter's K/V below `resume` is what it held (stale is allowed)
+                            const strata::core::OnDevice on(dr->device());
+                            ok = dr->idle(e2);
+                            if (ok && jr.resume > 0) dr->kv_restore(jr.resume);
+                            dr->set_prompt_len(jr.n);
+                        }
+                        strata::core::SessionState& x0 = *bslot_ss[0][b];
+                        x0.ple_prev[0] = jr.at >= 2 ? (int32_t) jr.r.ids[(size_t) jr.at - 2] : -1;
+                        x0.ple_prev[1] = jr.at >= 1 ? (int32_t) jr.r.ids[(size_t) jr.at - 1] : -1;
+                    } catch (const std::exception& x) {
+                        ok = false;
+                        e2 = std::string("setting the slot up failed: ") + x.what();
+                    }
+                    jr.setup_ok = ok;
+                    jr.err = e2;
+                    jr.ck = nullptr;
+                    jr.set_up.store(true, std::memory_order_release);
+                });
+                live.push_back(std::move(j));
+                return true;
+            };
+            // the pieces of a set-up admission into the queue: [at, n-1) in pieces of P tokens, one ending at turn_at
+            auto queue_pieces = [&](AdmJob& j) {
+                const int b = j.r.slot;
+                j.queued = true;
+                j.t_read = Clock::now();
+                j.rows0 = pipe_rows;
+                j.parts.assign(n_st, ConvCheckpoint{});
+                j.part_ok.assign(n_st, 0);
+                const bool ck = j.turn_at > j.at;
+                std::vector<std::pair<int64_t, int64_t>> cuts;
+                for (int64_t a = j.at; a < j.n - 1;) {
+                    int64_t z = std::min(j.n - 1, a + P);
+                    if (ck && a < j.turn_at && z > j.turn_at) z = j.turn_at;
+                    cuts.emplace_back(a, z);
+                    a = z;
+                }
+                // shorter first: before the pieces not started yet when it is at most half of what the head has left
+                bool front = false;
+                for (const auto& o2 : live)
+                    if (o2.get() != &j && o2->queued && o2->inflight.load() > 0) {
+                        const int64_t left = o2->n - 1 - o2->done_at.load();
+                        front = (j.n - 1 - j.at) * 2 <= left;
+                        break;
+                    }
+                std::vector<std::shared_ptr<strata::prefill::PromptJob>> jobs;
+                for (const auto& [a, z] : cuts) {
+                    auto pj = std::make_shared<strata::prefill::PromptJob>();
+                    pj->tokens.assign(j.r.ids.begin() + a, j.r.ids.begin() + z);
+                    pj->pos0 = a;
+                    for (size_t k = 0; k < n_st; ++k) pj->sessions.push_back(bslot_ss[k][(size_t) b].get());
+                    AdmJob* jp = &j;
+                    strata::core::MtpDrafter* dr = batch_mtp ? slot_mtp[(size_t) b].get() : nullptr;
+                    const int64_t n = j.n;
+                    pj->on_chunk = [jp, dr, b, n](const float* R_rows, int64_t T, int64_t p0, std::string& err) -> bool {
+                        if (dr != nullptr) {
+                            std::vector<int32_t> nxt((size_t) T);
+                            for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) jp->r.ids[(size_t) (p0 + t + 1)];
+                            if (!dr->prefill(R_rows, nxt.data(), T, p0, err)) return false;
+                        }
+                        const int64_t done = p0 + T;
+                        jp->done_at.store(done);
+                        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - jp->t_read).count();
+                        std::printf("BRP %d %lld %lld %.0f %.1f\n", b, (long long) done, (long long) n, ms,
+                                    ms > 0.0 ? 1000.0 * (double) (done - jp->resume) / ms : 0.0);
+                        std::fflush(stdout);
+                        strata::core::progress_at("reading a prompt into a batch slot, done up to token", done);
+                        strata::core::progress_beat();
+                        return true;
+                    };
+                    if (ck && z == j.turn_at)
+                        for (size_t k = 0; k < n_st; ++k)   // stage k's part of the turn checkpoint, as it reaches it
+                            pj->on_stage_chunk.push_back([&, jp, k, b](int64_t done, std::string& err) -> bool {
+                                if (done != jp->turn_at) return true;
+                                ConvCheckpoint& part = jp->parts[k];
+                                part.ids.assign(jp->r.ids.begin(), jp->r.ids.begin() + jp->turn_at);
+                                if (!checkpoint_save(part, *bslot_ss[k][(size_t) b], g)) {
+                                    err = "saving the slot's turn checkpoint failed";
+                                    return false;
+                                }
+                                jp->part_ok[k] = 1;
+                                return true;
+                            });
+                    pj->should_stop = [jp] { return jp->stop.load(std::memory_order_acquire) || jp->failed.load(); };
+                    pj->on_done = [jp](bool ok, const std::string& e) {
+                        if (!ok) {
+                            std::lock_guard<std::mutex> lk(jp->mu);
+                            if (!jp->failed.exchange(true)) jp->err = e;
+                        }
+                        jp->inflight.fetch_sub(1);
+                    };
+                    jobs.push_back(std::move(pj));
+                }
+                j.inflight.store((int) jobs.size());
+                if (front)
+                    for (auto it = jobs.rbegin(); it != jobs.rend(); ++it) sp.enqueue(*it, true);
+                else
+                    for (auto& pj : jobs) sp.enqueue(pj);
+                if (front)
+                    std::fprintf(stderr, "strata batch: slot %d: its %lld tokens go before the longer read's pieces\n", b,
+                                 (long long) (j.n - 1 - j.at));
+            };
+            // an admission whose pieces have all run: the slot decodes (BRA 1), or it was cancelled (BRA 0), or failed
+            auto finish = [&](AdmJob& j) -> bool {
+                const int b = j.r.slot;
+                BSlot& sl = bs[(size_t) b];
+                adm_stop_of[(size_t) b] = nullptr;
+                bslot_ss[0][(size_t) b]->ple = strata::core::PleRun{};
+                sl.reading = false;
+                j.read_ms = std::chrono::duration<double, std::milli>(Clock::now() - j.t_read).count();
+                j.rows = pipe_rows - j.rows0;
+                auto end_slot = [&] {
+                    sl.ids.clear();
+                    if (ckpt_pool.on())
+                        for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
+                    sl.checks.clear();
+                };
+                if (j.stop.load()) {
+                    end_slot();
+                    std::fprintf(stderr, "strata batch: slot %d: its admission was cancelled during the read (%.0f ms)\n",
+                                 b, j.read_ms);
+                    std::printf("BRA %d 0 cancel\n", b);
+                    std::fflush(stdout);
+                    return true;
+                }
+                if (!j.setup_ok || j.failed.load()) {
+                    end_slot();
+                    std::fprintf(stderr, "strata batch: slot %d: the prompt read failed: %s\n", b, j.err.c_str());
+                    std::printf("BRE %d %s\n", b, j.err.c_str());
+                    std::printf("ERR %s\n", j.err.c_str());
+                    std::fflush(stdout);
+                    return false;
+                }
+                const std::vector<int64_t>& ids = j.r.ids;
+                const int64_t n = j.n;
+                bool have_ck = j.turn_at > j.resume;
+                for (size_t k = 0; k < n_st && have_ck; ++k) have_ck = j.part_ok[k] != 0;
+                ConvCheckpoint turn_ck;
+                if (have_ck) {
+                    turn_ck = std::move(j.parts[0]);
+                    for (size_t k = 1; k < n_st; ++k) turn_ck.stage_parts.push_back(std::move(j.parts[k]));
+                }
+                if (ckpt_pool.on())
+                    for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
+                sl = BSlot{};
+                sl.active = true;
+                sl.x = (int32_t) ids[(size_t) n - 1];
+                sl.p = n - 1;
+                sl.max_new = j.r.max_new;
+                sl.t0 = Clock::now();
+                sl.ids.assign(ids.begin(), ids.end() - 1);
+                sl.cvec = cvec_cached;
+                if (have_ck) sl.checks.push_back(std::move(turn_ck));
+                sl.adm_log = true;
+                sl.adm_t0 = j.t_bgen;
+                sl.adm_read_ms = j.read_ms;
+                sl.adm_wait_ms = j.wait_ms;
+                sl.adm_rows = j.rows;
+                sl.adm_tokens = n;
+                sl.adm_reused = j.resume;
+                ver.set_slot_sampling(b, j.r.sp);
+                std::printf("BRA %d 1 prompt=%lld reused=%lld read_ms=%.1f wait_ms=%.1f\n", b, (long long) n,
+                            (long long) j.resume, j.read_ms, j.wait_ms);
+                std::fflush(stdout);
+                return true;
+            };
+            if (!take(first)) return false;
+            size_t seen = 0;
+            for (;;) {
+                if (!pump_ok) return false;
+                std::vector<std::string> fresh;
+                bool more = false;
+                {
+                    std::unique_lock<std::mutex> lk(in_mu);
+                    if (!(batch_on() || pipe_inflight()))
+                        in_cv.wait_for(lk, std::chrono::milliseconds(1), [&] { return in_lines.size() != seen; });
+                    adm_lines();
+                    while (!in_lines.empty() && !in_lines.front().empty() && in_lines.front()[0] == '\x01') {
+                        fresh.push_back(in_lines.front().substr(1));
+                        in_lines.pop_front();
+                    }
+                    seen = in_lines.size();
+                }
+                for (const std::string& l : fresh)
+                    if (!take(l)) return false;
+                for (auto& j : live)
+                    if (!j->queued && j->set_up.load(std::memory_order_acquire)) {
+                        if (j->setup.joinable()) j->setup.join();
+                        if (j->setup_ok && j->at < j->n - 1) queue_pieces(*j);
+                        else j->queued = true;   // (nothing to read, or its set-up failed: finished below)
+                    }
+                for (auto it = live.begin(); it != live.end();) {
+                    AdmJob& j = **it;
+                    if (j.queued && j.inflight.load() == 0) {
+                        if (j.setup.joinable()) j.setup.join();
+                        if (!finish(j)) return false;
+                        it = live.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                if (live.empty()) {
+                    std::lock_guard<std::mutex> lk(in_mu);
+                    adm_lines();
+                    more = !in_lines.empty() && !in_lines.front().empty() && in_lines.front()[0] == '\x01';
+                    if (!more) break;
+                    continue;
+                }
+                if (batch_on() || pipe_inflight()) pump_ok = pump(true);
+            }
+            return true;
+        };
         auto adm_run = [&](std::string first) -> bool {
             const auto t_run = Clock::now();
             cudaGetDevice(&adm_main_dev);
@@ -13949,6 +14299,22 @@ int main(int argc, char** argv) {
                 }
             });
             int n_adm = 0;
+            // the windows during these reads, per stage (the run's line): how many, and their doorbells' pool time
+            std::vector<std::pair<int64_t, double>> w0((size_t) n_pipe);
+            for (int k = 0; k < n_pipe; ++k) w0[(size_t) k] = {stage_verifier(k).windows, stage_verifier(k).ms_pool};
+            const int64_t rows_run0 = pipe_rows;
+            auto window_note = [&] {
+                std::string s;
+                for (int k = 0; k < n_pipe; ++k) {
+                    const auto& v = stage_verifier(k);
+                    const int64_t w = v.windows - w0[(size_t) k].first;
+                    char b[96];
+                    std::snprintf(b, sizeof b, "%sstage %d: %lld windows, pool %.1f ms each", k ? "; " : "", k + 1,
+                                  (long long) w, w > 0 ? (v.ms_pool - w0[(size_t) k].second) / (double) w : 0.0);
+                    s += b;
+                }
+                return s;
+            };
             bool fatal = false;
             std::vector<std::unique_ptr<AdmJob>> paused;   // reads a shorter one paused, the latest last
             // the job of a line taken out of in_lines: nullptr when it ends at once (a bad line, cancelled, refused)
@@ -13975,8 +14341,9 @@ int main(int argc, char** argv) {
                 else if (e == AdmEnd::done) j.reset();
                 return j;
             };
-            std::unique_ptr<AdmJob> cur = take(first);
-            for (;;) {
+            std::unique_ptr<AdmJob> cur = adm_multi ? nullptr : take(first);
+            if (adm_multi && !adm_multi_run(first, n_adm)) return false;
+            for (; !adm_multi;) {
                 if (fatal) return false;
                 if (cur) {
                     adm_paused[(size_t) cur->r.slot] = 0;
@@ -14017,9 +14384,11 @@ int main(int argc, char** argv) {
                 return false;
             }
             adm_fence_ms += std::chrono::duration<double, std::milli>(Clock::now() - tf).count();
-            std::fprintf(stderr, "strata batch: %d admission%s read beside the slots in %.0f ms; the groups stopped %.0f ms "
-                                 "for the loan (lend, refill)\n", n_adm, n_adm == 1 ? "" : "s",
-                         std::chrono::duration<double, std::milli>(Clock::now() - t_run).count(), adm_fence_ms);
+            std::fprintf(stderr, "strata batch: %d admission%s read beside the slots in %.0f ms%s; the groups stopped %.0f ms "
+                                 "for the loan (lend, refill) and decoded %lld rows (%s)\n", n_adm, n_adm == 1 ? "" : "s",
+                         std::chrono::duration<double, std::milli>(Clock::now() - t_run).count(),
+                         adm_multi ? " (queued, STRATA_SLOT_ADMIT_MULTI)" : "", adm_fence_ms,
+                         (long long) (pipe_rows - rows_run0), window_note().c_str());
             return true;
         };
         // --serve is driven by its server over stdin (QUIT, or EOF when the server is gone): a SIGTERM / SIGINT sent to
