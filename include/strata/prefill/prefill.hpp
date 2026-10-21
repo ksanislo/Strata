@@ -16,6 +16,7 @@
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <future>
@@ -44,6 +45,33 @@ struct PrefillStats {
 }  // namespace strata::prefill
 namespace strata::core { class MtpDrafter; }
 namespace strata::prefill {
+
+/// STRATA_PREFILL_MULTI: one prompt read into its own sessions, queued on a layer split's first stage (Prefill::enqueue).
+/// Its chunks follow the ones queued before it through every stage, so stage 0 reads this prompt while the later
+/// stages finish the one before. The callbacks are this prompt's (the Prefill's own members are not called).
+struct PromptJob {
+    std::vector<int64_t> tokens;
+    int64_t pos0 = 0;
+    /// The session each stage reads into, first stage first; null or missing: that stage's `init` session.
+    /// ple_prev of the first stage's session must be the two tokens before pos0 (advanced like run's).
+    std::vector<core::SessionState*> sessions;
+    std::function<bool(const float* R_rows, int64_t T, int64_t pos0, std::string& err)> on_chunk;   ///< the last stage
+    std::vector<std::function<bool(int64_t done, std::string& err)>> on_stage_chunk;            ///< per stage (optional)
+    std::function<bool()> should_stop;
+    const float* const* embd_rows = nullptr;
+    /// Once: from the last stage's thread when it has read the last chunk, or from the stage that failed.
+    std::function<void(bool ok, const std::string& err)> on_done;
+
+    bool failed() const { return failed_.load(); }
+    bool done() const { return done_.load(); }
+    void finish(bool ok, const std::string& err) {
+        if (!ok) failed_.store(true);
+        if (done_.exchange(true)) return;
+        if (on_done) on_done(ok, err);
+    }
+private:
+    std::atomic<bool> failed_{false}, done_{false};
+};
 
 /// HIP: one tiny BF16 and one tiny FP16 product on a private handle, so the first prompt does not pay hipBLAS's one-time
 /// library loads (about 2.5 s on an R9700); once per device, later calls wait for the first and return.  Safe to call from a
@@ -175,6 +203,16 @@ public:
 
     const PrefillStats& stats() const { return stats_; }
 
+    /// STRATA_PREFILL_MULTI, first stage only: queue a prompt (see PromptJob). Returns at once; a worker thread reads
+    /// the queued prompts in order, each without waiting for the later stages to finish the one before. Every stage's
+    /// buffers (and a loan they are carved from) serve all queued prompts: keep the loan until drain_jobs.
+    /// Not beside `run` (drain_jobs first).
+    void enqueue(std::shared_ptr<PromptJob> job);
+    /// Waits until every queued prompt has gone through every stage (each one's on_done has run).
+    void drain_jobs();
+    /// Prompts queued or being read on the first stage.
+    size_t jobs_pending() const;
+
     /// multi-GPU: the experts the peer GPU holds are computed THERE for every prompt chunk (up to `cap_rows` routed
     /// rows per layer; the rest of the peer's experts are read by this GPU over P2P).  Allocates the peer's buffers for
     /// chunks of up to init's `chunk` tokens.  Needs P2P between the two cards.
@@ -258,7 +296,10 @@ private:
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool
     // Stage-1 pipeline: intermediate stages return after handing their chunk to
     // the direct successor. The public run() drains the chain once at prompt end.
-    bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
+    bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err,
+                  const std::shared_ptr<PromptJob>& job = nullptr, size_t depth = 0, bool job_last = false);
+    struct JobQueue;
+    std::unique_ptr<JobQueue> jobs_;
     bool drain_pipeline(std::string& err);
 
     int64_t stage_lb_ = 0, stage_le_ = -1;
