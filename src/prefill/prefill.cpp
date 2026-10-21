@@ -5133,7 +5133,7 @@ bool Prefill::reserve_uploads(int64_t T) {
     return ok;
 }
 
-void Prefill::enqueue(std::shared_ptr<PromptJob> job) {
+void Prefill::enqueue(std::shared_ptr<PromptJob> job, bool front) {
     if (!jobs_) {
         jobs_ = std::make_unique<JobQueue>();
         jobs_->th = std::thread([this] {
@@ -5163,7 +5163,8 @@ void Prefill::enqueue(std::shared_ptr<PromptJob> job) {
     }
     {
         std::lock_guard<std::mutex> lk(jobs_->mu);
-        jobs_->q.push_back(std::move(job));
+        if (front) jobs_->q.push_front(std::move(job));
+        else jobs_->q.push_back(std::move(job));
     }
     jobs_->cv.notify_one();
 }

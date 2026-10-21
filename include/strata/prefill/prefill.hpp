@@ -207,7 +207,8 @@ public:
     /// the queued prompts in order, each without waiting for the later stages to finish the one before. Every stage's
     /// buffers (and a loan they are carved from) serve all queued prompts: keep the loan until drain_jobs.
     /// Not beside `run` (drain_jobs first).
-    void enqueue(std::shared_ptr<PromptJob> job);
+    /// `front`: before the prompts not started yet (a shorter one first; the one being read goes on).
+    void enqueue(std::shared_ptr<PromptJob> job, bool front = false);
     /// Waits until every queued prompt has gone through every stage (each one's on_done has run).
     void drain_jobs();
     /// Prompts queued or being read on the first stage.
