@@ -11236,7 +11236,10 @@ int main(int argc, char** argv) {
         auto stage_verifier = [&](int k) -> strata::core::Verifier& { return k == 0 ? ver : stages[(size_t) k - 1]->ver; };
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
         // so it keeps the conversation it holds
+        // STRATA_SHORT_READS beside --batch: a read holds the CPU pools (read_share): no slot window starts meanwhile
+        bool share_live = false;
         auto batch_step = [&]() -> bool {
+            if (share_live) return true;
             int S = 0;
             int rows[strata::kernels::kVerifyMaxT] = {};
             int32_t tok[strata::kernels::kVerifyMaxT] = {}, outb[strata::kernels::kVerifyMaxT] = {};
@@ -11591,7 +11594,7 @@ int main(int argc, char** argv) {
                             pick = gi;
                     if (pick < 0) continue;
                 } else {
-                    if (!may_start) continue;
+                    if (!may_start || share_live) continue;   // (a read holds the pools: STRATA_SHORT_READS)
                     for (int j = 0; j < (int) pg.size() && pick < 0; ++j) {
                         const int gi = (int) ((rr + j) % (int64_t) pg.size());
                         if (!pg[(size_t) gi].inflight && group_active(gi)) pick = gi;
@@ -13224,12 +13227,21 @@ int main(int argc, char** argv) {
             // STRATA_SHORT_READS beside --batch: the CPU share is a read's only while no slot decodes and no window is in
             // flight (the pools serve the slots' windows otherwise; none can start before such a read ends or pauses).
             // Called on the main thread before a read.
-            auto read_share = [&]() {
+            // The pools go back when the read ends (ShareScope), and while a read holds them no slot window starts
+            // (share_live: batch_step and the pump's group start wait), so a slot that begins decoding meanwhile never runs
+            // its windows on a pool a prompt chunk is using.
+            auto read_share_set = [&](bool on) {
                 if (!rt_share) return;
-                const bool on = !batch_on() && !pipe_inflight();
                 sp.set_cpu_pool(on ? &pool : nullptr);
                 for (size_t i = 0; i < stages.size(); ++i) stages[i]->sp.set_cpu_pool(on ? &pool : nullptr);
+                share_live = on;
             };
+            struct ShareScope {
+                std::function<void(bool)> set;
+                ShareScope(std::function<void(bool)> f, bool on) : set(std::move(f)) { set(on); }
+                ~ShareScope() { set(false); }
+            };
+            auto read_share_now = [&] { return rt_share && !batch_on() && !pipe_inflight(); };
             bool batch_fatal = false;
             int64_t il_parts = 0;   // the slots' windows run between this prompt's chunks
             double il_ms = 0;
@@ -13287,7 +13299,7 @@ int main(int argc, char** argv) {
                 } seg_plan_scope{seg_plan};
                 auto run = [&](int64_t q, int64_t r) -> bool {
                     if (planned) sp.force_chunk(plan.chunk, plan_single, plan.chunked);
-                    read_share();
+                    const ShareScope share_scope(read_share_set, read_share_now());
                     return sp.run(ids.data() + q, r - q, q, e);
                 };
                 // (a layer split reads its stages as a pipeline over one run's chunks: beside slots a chunk at a time, with
@@ -13512,7 +13524,7 @@ int main(int argc, char** argv) {
                         std::string read_err;
                         in_prompt_read = true;
                         sp.stop_at_chunk = [&] { return want_yield.load(std::memory_order_acquire) >= 0; };
-                        read_share();
+                        const ShareScope share_scope(read_share_set, read_share_now());   // (after the reader's join)
                         std::thread reader([&] {
                             conc_thread_cpus();
                             try {   // (an exception leaving a std::thread ends the process: a failed read instead)
