@@ -12008,6 +12008,7 @@ int main(int argc, char** argv) {
             } else if (fr > made + low + 32) {
                 bool lent = false;
                 for (const PfPart& p : pf_parts) lent = lent || (p.cache == gv[k].cache && !p.lent.empty());
+                lent = lent || !lazy_fly.empty();   // (STRATA_SHORT_READS: copies back into the loan still landing)
                 if (!lent) (void) take_back(k, fr - made - low - 16);
             }
         };
@@ -13152,7 +13153,9 @@ int main(int argc, char** argv) {
         const char* lazy_why = nullptr;
         if (short_reads_on) {
             short_reads::LazySetup ls;
-            ls.batch = o.batch > 0;
+            // --batch: a loan is lent again only after its copies landed (lend), and a request lands them before it ends
+            // (so before the slots' windows go on); slot windows meanwhile see those experts missing (the pool computes them)
+            ls.batch = false;
             ls.pipe = pipe;
             ls.kv_grow = kvg.on || o.vram_elastic;
             ls.peer = peer.valid();
@@ -13469,6 +13472,24 @@ int main(int argc, char** argv) {
                 }
             }
         };
+        // STRATA_SHORT_READS beside --batch: the CPU share is a read's only while no slot decodes and no window is in
+        // flight (the pools serve the slots' windows otherwise; none can start before such a read ends or pauses).
+        // Each stage's own pool with STRATA_STAGE_SERVE (prompt_pool_of).  Called on the main thread before a read.
+        // The pools go back when the read ends (ShareScope), and while a read holds them no slot window starts
+        // (share_live: batch_step and the pump's group start wait), so a slot that begins decoding meanwhile never runs
+        // its windows on a pool a prompt chunk is using.
+        auto read_share_set = [&](bool on) {
+            if (!rt_share) return;
+            sp.set_cpu_pool(on ? prompt_pool_of(0) : nullptr);
+            for (size_t i = 0; i < stages.size(); ++i) stages[i]->sp.set_cpu_pool(on ? prompt_pool_of(i + 1) : nullptr);
+            share_live = on;
+        };
+        struct ShareScope {
+            std::function<void(bool)> set;
+            ShareScope(std::function<void(bool)> f, bool on) : set(std::move(f)) { set(on); }
+            ~ShareScope() { set(false); }
+        };
+        auto read_share_now = [&] { return rt_share && !batch_on() && !pipe_inflight(); };
         auto adm_lend_covers = [&](int64_t tokens) {
             const int64_t want = lend_want(tokens);
             for (const PfPart& p : pf_parts)
@@ -13602,6 +13623,7 @@ int main(int argc, char** argv) {
             const int b = j.r.slot;
             BSlot& sl = bs[(size_t) b];
             const int64_t n = j.n;
+            const ShareScope share_scope(read_share_set, read_share_now());
             auto end_slot = [&] {   // nothing of it is kept
                 sl.reading = false;
                 sl.ids.clear();
@@ -15494,24 +15516,6 @@ int main(int argc, char** argv) {
                 const char* v = std::getenv("STRATA_BATCH_DECODE_SHARE");
                 return v != nullptr ? std::max(0.0, std::atof(v)) : 0.5;
             }();
-            // STRATA_SHORT_READS beside --batch: the CPU share is a read's only while no slot decodes and no window is in
-            // flight (the pools serve the slots' windows otherwise; none can start before such a read ends or pauses).
-            // Called on the main thread before a read.
-            // The pools go back when the read ends (ShareScope), and while a read holds them no slot window starts
-            // (share_live: batch_step and the pump's group start wait), so a slot that begins decoding meanwhile never runs
-            // its windows on a pool a prompt chunk is using.
-            auto read_share_set = [&](bool on) {
-                if (!rt_share) return;
-                sp.set_cpu_pool(on ? &pool : nullptr);
-                for (size_t i = 0; i < stages.size(); ++i) stages[i]->sp.set_cpu_pool(on ? &pool : nullptr);
-                share_live = on;
-            };
-            struct ShareScope {
-                std::function<void(bool)> set;
-                ShareScope(std::function<void(bool)> f, bool on) : set(std::move(f)) { set(on); }
-                ~ShareScope() { set(false); }
-            };
-            auto read_share_now = [&] { return rt_share && !batch_on() && !pipe_inflight(); };
             bool batch_fatal = false;
             int64_t il_parts = 0;   // the slots' windows run between this prompt's chunks
             double il_ms = 0;
