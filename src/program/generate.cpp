@@ -12539,7 +12539,10 @@ int main(int argc, char** argv) {
         auto stage_verifier = [&](int k) -> strata::core::Verifier& { return k == 0 ? ver : stages[(size_t) k - 1]->ver; };
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
         // so it keeps the conversation it holds
+        // STRATA_SHORT_READS beside --batch: a read holds the CPU pools (read_share): no slot window starts meanwhile
+        bool share_live = false;
         auto batch_step = [&]() -> bool {
+            if (share_live) return true;
             int S = 0;
             int rows[strata::kernels::kVerifyMaxT] = {};
             int32_t tok[strata::kernels::kVerifyMaxT] = {}, outb[strata::kernels::kVerifyMaxT] = {};
@@ -13201,7 +13204,7 @@ int main(int argc, char** argv) {
                             pick = gi;
                     if (pick < 0) continue;
                 } else {
-                    if (!may_start) continue;
+                    if (!may_start || share_live) continue;   // (a read holds the pools: STRATA_SHORT_READS)
                     for (int j = 0; j < (int) pg.size() && pick < 0; ++j) {
                         const int gi = (int) ((rr + j) % (int64_t) pg.size());
                         if (!pg[(size_t) gi].inflight && !pg[(size_t) gi].drafting && group_active(gi) && !group_held(gi) &&
@@ -13835,12 +13838,23 @@ int main(int argc, char** argv) {
         // STRATA_SHORT_READS beside --batch: the CPU share is a read's only while no slot decodes and no window is in
         // flight (the pools serve the slots' windows otherwise; none can start before such a read ends or pauses).
         // Each stage's own pool with STRATA_STAGE_SERVE (prompt_pool_of).  Called on the main thread before a read.
-        auto read_share = [&]() {
+        // The pools go back when the read ends (ShareScope), and while a read holds them no slot window starts
+        // (share_live: batch_step and the pump's group start wait), so a slot that begins decoding meanwhile never runs
+        // its windows on a pool a prompt chunk is using.  Queued reads (STRATA_SLOT_ADMIT_MULTI) run beside the windows
+        // by design: never with the share.
+        auto read_share_set = [&](bool on) {
             if (!rt_share) return;
-            const bool on = !batch_on() && !pipe_inflight();
             sp.set_cpu_pool(on ? prompt_pool_of(0) : nullptr);
             for (size_t i = 0; i < stages.size(); ++i) stages[i]->sp.set_cpu_pool(on ? prompt_pool_of(i + 1) : nullptr);
+            share_live = on;
         };
+        struct ShareScope {
+            std::function<void(bool)> set;
+            ShareScope(std::function<void(bool)> f, bool on) : set(std::move(f)) { set(on); }
+            ~ShareScope() { set(false); }
+        };
+        bool share_block = false;   // a run of queued reads (STRATA_SLOT_ADMIT_MULTI) is under way
+        auto read_share_now = [&] { return rt_share && !share_block && !batch_on() && !pipe_inflight(); };
         auto adm_lend_covers = [&](int64_t tokens) {
             const int64_t want = lend_want(tokens);
             for (const PfPart& p : pf_parts)
@@ -13998,7 +14012,7 @@ int main(int argc, char** argv) {
             const int b = j.r.slot;
             BSlot& sl = bs[(size_t) b];
             const int64_t n = j.n;
-            read_share();
+            const ShareScope share_scope(read_share_set, read_share_now());
             auto end_slot = [&] {   // nothing of it is kept
                 sl.reading = false;
                 sl.ids.clear();
@@ -14262,6 +14276,12 @@ int main(int argc, char** argv) {
             return v != nullptr && std::atoi(v) != 0;
         }();
         auto adm_multi_run = [&](const std::string& first, int& n_adm) -> bool {
+            read_share_set(false);
+            struct Block {
+                bool& b;
+                ~Block() { b = false; }
+            } share_block_scope{share_block};
+            share_block = true;
             const size_t n_st = stages.size() + 1;
             std::vector<std::unique_ptr<AdmJob>> live;
             struct Joins {   // (after `live`: first to go) every set-up thread joined, no slot left marked queued
@@ -16355,7 +16375,7 @@ int main(int argc, char** argv) {
                 } seg_plan_scope{seg_plan};
                 auto run = [&](int64_t q, int64_t r) -> bool {
                     if (planned) sp.force_chunk(plan.chunk, plan_single, plan.chunked);
-                    read_share();
+                    const ShareScope share_scope(read_share_set, read_share_now());
                     return sp.run(ids.data() + q, r - q, q, e);
                 };
                 // (a layer split reads its stages as a pipeline over one run's chunks: beside slots a chunk at a time, with
@@ -16588,7 +16608,7 @@ int main(int argc, char** argv) {
                         std::string read_err;
                         in_prompt_read = true;
                         sp.stop_at_chunk = [&] { return want_yield.load(std::memory_order_acquire) >= 0; };
-                        read_share();
+                        const ShareScope share_scope(read_share_set, read_share_now());   // (after the reader's join)
                         std::thread reader([&] {
                             conc_thread_cpus();
                             try {   // (an exception leaving a std::thread ends the process: a failed read instead)
