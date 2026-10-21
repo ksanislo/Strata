@@ -1282,7 +1282,7 @@ moving spare row are preserved, including checkpoint rewinds.
 The engine log reports parking, restoration, bytes, evictions, individual snapshot
 sizes and K/V bytes reused during capture. `STRATA_SNAPSHOT_FULL_CAPTURE=1` disables
 retention for diagnostic comparisons. Parked snapshots are not
-persisted across restarts; the session files below are.
+persisted across restarts unless `--session-dir` is set (session folder, below).
 
 **Session files (disk).** The conversation the engine holds can be saved to a file and restored later, also after a
 restart of the same engine version, so a long prompt is not read again. The server exposes the save and restore
@@ -1391,13 +1391,41 @@ geometry and layer range before any state array, and every count against the byt
 limits (context and cells, checkpoints, layers, each running-state array, each K/V part) before allocating it, the payload hash
 and then the usual snapshot validation - all before any device write, and a refusal leaves the current session as it
 was. A transfer failure after the device writes began ends the engine (`FATAL`) rather than decode from a partial
-state; the server reports `500` and starts it again. A restore does not park the outgoing session. Not supported with
-`--layer-split`, `--peer-device`, `--batch` (the config's `"parallel"`, #465; the server answers `501`) or
+state; the server reports `500` and starts it again. A restore does not park the outgoing session. With `--layer-split`
+the file is format v2: v1's payload for the first stage, then the count of later stages (u64) and each one's payload in the
+same encoding, the draft layer's K/V with the last stage. A v2 file is read only by a runtime with the same number of
+stages, each stage against its own bounds, and every stage image is validated on its GPU before any device write. A
+single-GPU file is still v1, byte for byte. Not supported with `--peer-device`, `--batch` (the config's `"parallel"`, #465; the server answers `501`) or
 `--prompt-cache 0` (the RAM conversation cache need not be on). On Linux the file
 moves with `O_DIRECT` in 16 MiB blocks when the filesystem takes it (buffered I/O otherwise, or with
 `STRATA_SESSION_BUFFERED=1`); on Windows with buffered I/O. The engine has been run on Linux/CUDA only. An earlier
 revision's CPU file-I/O test passed as a 32-bit Windows executable under Wine; the current code has not been built
 for Windows, and the Windows engine, HIP and AMD cards have not been run.
+
+**Session folder (`--session-dir DIR`, opt-in).** An engine argument (in the config's `args`) that keeps every
+conversation on disk, one session file each, in the format above (v2 with `--layer-split`). A parked conversation is
+written by a background thread `--session-dir-delay S` after it was parked (default 30; one taken back sooner is not
+written); at `QUIT` the active conversation is parked and everything queued is written. Without
+`--conversation-cache-mib`, or when parking refuses a conversation for RAM, the outgoing conversation is written
+straight from the GPU instead and read back through a file mapping, so a machine with little RAM keeps its
+conversations too. At start only each file's header and token IDs are read; a request whose prompt a file continues
+further than anything held reads that file first, then restores as from parking. `--session-dir-preload MIB` also
+reads the newest files in the background after the start, up to MIB (default 0 = only on demand). A newer file of
+the same conversation replaces the older. The least recently used files (written or resumed) are deleted first when
+the folder is over `--session-dir-gib G` (default 64) or `--session-dir-files N` (default 64); a file unused for
+`--session-dir-days D` (default 7) is deleted in any case, as is a file of another model, configuration or engine
+version. The server log shows each event (`[strata] sessions: ...`), every request's `done:` line ends with where
+its context came from (`context: N tokens from disk|from RAM (parked)|already on the GPU, M new`), and `GET /status`
+has `"sessions"` (files, bytes, limits and each conversation's tokens, bytes, last use and state). With `--batch`
+(`"parallel"`) a finished request's conversation stays in its slot as before; when another conversation takes that
+slot, or at `QUIT`, the slot's conversation is parked (or written straight from the GPU) the same way first, unless
+the new request continues it or another slot holds it. Not saved: a slot that a pipelined group's pad row overwrites
+(`--batch-groups` with several slots per group; the log says so) and the slots dropped after non-finite logits.
+`--peer-device` and `--prompt-cache 0` turn it off with a log line. Measured on 4 x T4
+(Qwen3.8-Flash-Next Q8, `--layer-split`, NVMe): a 187,275-token conversation written at shutdown in 4.1 s (2.96 GB); a
+169,011-token one read on demand in 1.8 s, after which its next turn read only the 11,213 new tokens. In the GPU test
+(two ~8.5K-token conversations alternating, the server restarted before each one's third turn) every turn matched a
+run without restarts token for token, and each third turn read 24-25 tokens.
 
 A session file saves conversation state, not all of the process's execution history. Exact future token replay
 across restarts is not guaranteed: expert residency and CPU/GPU rounding can change later output. In a 63K test the
