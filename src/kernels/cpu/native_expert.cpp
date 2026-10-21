@@ -7,6 +7,7 @@
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/iq_avx1.hpp"
 #include "strata/kernels/cpu/kq_avx2.hpp"
+#include "strata/kernels/cpu/kq_avx1.hpp"
 #include "strata/kernels/cpu/nvfp4_avx2.hpp"
 #include "strata/kernels/cpu/nvfp4_avx512.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -58,6 +59,23 @@ bool iq256_supported(int type) noexcept {
 }
 
 bool kq256_supported(int type) noexcept { return type == 12 || type == 7 || type == 8; }
+
+bool kq128_supported(int type, int n) noexcept {
+    return n > 0 && n <= 256 * 32 && (type == 12 ? n % 256 == 0 : (type == 7 || type == 8) && n % 32 == 0);
+}
+
+// The older-CPU tier's Q4_K / Q5_1 / Q8_0 rows (kq_avx1.cpp): ggml's __AVX__ dots with the weights decoded once
+// for all tokens, the same bits per token.  Only where AVX2 is absent.  STRATA_CPU_KERNELS=old keeps ggml's dot,
+// =fast takes the Q4_K/Q5_1 forms with half the madds (float rounding differs from ggml's).
+int kq128_mode() {   // 0 off (ggml), 1 exact, 2 fast
+    static const int mode = [] {
+        if (cpu_avx2_ok() || !cpu_avx1_ok()) return 0;
+        const char* v = std::getenv("STRATA_CPU_KERNELS");
+        if (v != nullptr && std::strcmp(v, "old") == 0) return 0;
+        return v != nullptr && std::strcmp(v, "fast") == 0 ? 2 : 1;
+    }();
+    return mode;
+}
 
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
     init_once();
@@ -245,6 +263,10 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         iq128_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
         return;
     }
+    if (f.tail_off == 0 && kq128_mode() != 0 && kq128_supported(f.gu_type, (int) f.n_embd)) {
+        kq128_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1, kq128_mode() == 2);
+        return;
+    }
     const int n = (int) f.n_embd;
     // NVFP4: the per-expert global scales from the blob's tail (1 and 1 otherwise). s_down goes on the down output:
     // folded into up it left the hidden near 1e-5, whose Q8_0 block scale is an FP16 subnormal (expert error 2-12%)
@@ -310,6 +332,10 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     static const bool avx1 = !cpu_avx2_ok() && cpu_avx1_ok() && std::getenv("STRATA_NO_IQ128") == nullptr;
     if (avx1 && iq128_down_supported(f.d_type)) {
         iq128_down_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
+    if (f.tail_off == 0 && kq128_mode() != 0 && kq128_supported(f.d_type, (int) f.n_ff)) {
+        kq128_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1, kq128_mode() == 2);
         return;
     }
     const int n = (int) f.n_ff;
