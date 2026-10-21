@@ -1978,7 +1978,7 @@ if(STRATA_NATIVE_EXPERTS)
     # MODEL-UPDATE: the dense Q8_0 GEMVs at the engine's shapes against the memory bandwidth (a benchmark, no test)
     add_executable(q8_gemv_bench src/kernels/q8_gemv_bench.cpp)
     target_include_directories(q8_gemv_bench PRIVATE ${_strata_gpu_include_directories})
-    target_link_libraries(q8_gemv_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    target_link_libraries(q8_gemv_bench PRIVATE strata_kernels strata_artifact ${_strata_gpu_runtime_target})
     if(STRATA_ENABLE_CUDA)
       # EXPDEC (docs/EXPERTDEC.md): the grouped experts' default kernels against STRATA_EXPDEC=1 at T = 1..4, bit for bit
       # and in microseconds, on synthetic blobs read cold from DRAM
