@@ -43,10 +43,12 @@ inline std::vector<int> split_by_weight(int total, const std::vector<int>& weigh
 /// `node_cores[n]`: node n's physical cores (one logical CPU each); `node_cores[-1]` lists every core and takes all
 /// stages when any stage's node is unknown or not listed.  `exclude`: CPUs no stage gets (the host thread's core).
 /// The stages of a node share its cores by weight, at least one each; `workers_total` > 0 caps the pool workers of
-/// all stages together (split by weight; the service threads are not counted).
+/// all stages together (split by weight; the service threads are not counted).  `sibling` (core -> its SMT sibling):
+/// the service thread takes the sibling of its share's first core instead, and that core joins the workers.
 inline std::vector<StageCores> plan_stage_cores(const std::vector<int>& stage_node, const std::vector<int>& weight,
                                                 const std::map<int, std::vector<int>>& node_cores,
-                                                const std::vector<int>& exclude, int workers_total) {
+                                                const std::vector<int>& exclude, int workers_total,
+                                                const std::map<int, int>* sibling = nullptr) {
     const size_t n = stage_node.size();
     std::vector<StageCores> out(n);
     bool known = true;
@@ -74,6 +76,11 @@ inline std::vector<StageCores> plan_stage_cores(const std::vector<int>& stage_no
         for (size_t j = 0; j < st.size(); ++j) {
             StageCores& s = out[st[j]];
             s.service = cores[at++];
+            if (sibling != nullptr)
+                if (auto it = sibling->find(s.service); it != sibling->end()) {
+                    s.workers.push_back(s.service);
+                    s.service = it->second;
+                }
             for (int k = 0; k < extra[j]; ++k) s.workers.push_back(cores[at++]);
         }
     }
