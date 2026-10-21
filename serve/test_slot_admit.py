@@ -96,8 +96,30 @@ while True:
         f = line.split()
         ids = f[-1].split(",")
         pb = bytes(int(x) & 255 for x in ids)
-        if f[0] == "GEN":                     # solo: a token a step until STOP
+        if f[0] == "GEN":                     # solo: the prompt a chunk a step (a BYIELD parks it), then a token a step
             note(f"GEN {len(ids)}")
+            given, held = None, []
+            for q in range(CH, len(ids) - 1, CH):
+                time.sleep(STEP / 4)
+                print(f"PP {q} {len(ids)} 1 1", flush=True)
+                while True:
+                    try:
+                        l2 = lines.get_nowait()
+                    except queue.Empty:
+                        break
+                    if l2.startswith("BYIELD ") and len(ids) - 1 - q > CH:
+                        given = (int(l2.split()[1]), q)
+                    else:
+                        held.append(l2)
+                if given:
+                    break
+            for l2 in held:
+                lines.put(l2)
+            if given:
+                note(f"YIELD {given[0]} {given[1]}")
+                print(f"YIELDED {given[0]} {given[1]}", flush=True)
+                print(f"DONE 0 {len(ids)} 5.0 0.0 cancel 0 0 0", flush=True)
+                continue
             out, halt, held = 0, False, []
             for t in reply(ids)[:int(f[1])]:
                 print(f"T {t}", flush=True)
@@ -223,6 +245,29 @@ class SlotAdmit(unittest.TestCase):
         with self.svc.status_lock:
             self.assertEqual(len(self.svc.history), 3)
             self.assertEqual(self.svc.live_reqs, {})
+
+    def test_a_lone_long_read_gives_way_and_goes_on_beside_the_slots(self):
+        """A lone long prompt read on the solo path gives way (BYIELD) to a much shorter request: the short one is
+        admitted the old way (nothing decodes) and answered, then the long one goes on as a read beside it (BQ 1)."""
+        self.start()
+        long_q, short_q = "long " * 600, "short"
+        res = {}
+
+        def go(t):
+            t0 = time.time()
+            res[t] = (self.chat(t, max_tokens=64), time.time() - t0)
+        a = threading.Thread(target=go, args=(long_q,))
+        a.start()
+        time.sleep(0.1)
+        go(short_q)
+        a.join(30)
+        self.assertEqual(res[long_q][0], "ok, done.")
+        self.assertEqual(res[short_q][0], "ok, done.")
+        log = self.lines()
+        self.assertTrue(any(x.startswith("YIELD ") for x in log), log)
+        long_bgen = [x.split() for x in log if x.startswith("BGEN ") and int(x.split()[2]) > 2000]
+        self.assertEqual([x[3] for x in long_bgen], ["direct=1"], log)
+        self.wait_free()
 
     def test_a_cancelled_queued_admission_frees_its_slot(self):
         self.start()
