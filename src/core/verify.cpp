@@ -2812,7 +2812,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         } else {
             *flag = 1;
         }
-    } else if (!test_stall && external_window()) {
+    } else if (!test_stall && x_runs_ && external_window()) {
         // STRATA_STAGE_SERVE: the stage's own thread serves the layers; this one waits, and meanwhile stages the next
         // stage's window (idle: its last window was synced) unless the overlapped split launches it already
         start_external(T, G, steps, do_ple, ple_rows);
