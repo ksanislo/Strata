@@ -259,9 +259,11 @@ public:
     /// (serve_external); `wake` is called at each such launch, `served` on the launching thread once every layer of a
     /// window is served (the server's dispatch is idle then).  The launching thread only waits and checks.  Unset:
     /// the windows serve themselves.  Not for windows with --remote-expert-opt, the PCIe balance or an adaptive gate.
-    void set_external_server(std::function<void()> wake, std::function<void()> served) {
+    /// `runs` false: run() windows serve themselves (on the calling thread), only the pipelined ones go to the server.
+    void set_external_server(std::function<void()> wake, std::function<void()> served, bool runs = true) {
         xwake_ = std::move(wake);
         xserved_ = std::move(served);
+        x_runs_ = runs;
     }
     bool external_busy() const { return x_running_.load(std::memory_order_acquire); }
     /// Serves the layers of the external window in flight that have rung, with no CUDA call: 1 when none is in flight
@@ -436,6 +438,7 @@ private:
     std::vector<uint32_t> x_ple_rows_;
     std::string x_err_;
     std::chrono::steady_clock::time_point x_since_{};   ///< (the server's) the last layer served, for ms_wait
+    bool x_runs_ = true;    ///< set_external_server's `runs`
     bool fl_ext_ = false;   ///< the pipelined window in flight is served externally
     bool external_window() const;
     void start_external(int T, int G, int64_t total, bool ple, const uint32_t* ple_rows);
