@@ -453,6 +453,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, Fi
         mapping_base = base;
         mapping_bytes = bytes;
     }
+    apply_numa_plan(base, bytes, backing, note);   // (STRATA_NUMA_PLACE: bound before the fill threads touch a page)
 }
 
 void PinnedArena::register_filled() { register_now(bounds_, fill_first_cap_); }
