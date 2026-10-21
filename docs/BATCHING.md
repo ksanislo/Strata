@@ -441,13 +441,33 @@ texts read as well as their solo runs.
 Sampled requests (temperature, top_p, top_k, min_p, seed) are drawn row by row with the solo window's
 counter-based draw (Philox(seed, position)).
 
+## MTP drafts in pipelined groups (experimental, opt-in)
+
+`STRATA_PIPED_MTP=1` keeps `--batch-mtp`'s drafts in pipelined slot groups (a layer split, `--batch-groups` above 1,
+the default there); it implies `--batch-mtp`. While at most `STRATA_PIPED_MTP_MAX` (default 2) conversations decode,
+a group's window carries each live slot's token and up to `STRATA_PIPED_MTP_DRAFTS` of its drafts (default `--spec`
+minus one, as a solo window; a group's window holds at most 8 rows, shared out one draft per slot in turn; idle slots
+get no row). Such a
+window is launched on every stage without its commit; when the last stage has picked, the host decides each slot's
+accepted prefix (its drafts up to the first the target did not pick), queues the group's commit on every stage's stream, starts the
+slots' drafters on the last stage's GPU (from the window's final residual rows, copied on that stage's stream), and the
+group's next window enters stage 0 once those drafts have landed; the other groups keep flowing meanwhile. A stage
+that runs another window before a group's commit first copies that group's commit inputs (its window rows of the GDN
+inputs, indexer keys and PLE history, a few MiB per group and stage, allocated at start) aside and puts them back for
+the commit. With more conversations the groups build one row per slot again (switched per window); a slot's drafter
+then skips those cells, so the first drafts after the switch back are accepted less often. Logs: `STRATA_PIPED_MTP:
+N pipelined groups of M slots keep their MTP drafts ...` at start, `strata batch (pipelined): MTP proposals accepted A
+of P (X%); W windows of R rows avg, T ms launch to picks, drafts D ms after; K tokens per window` when the slots go
+idle (what more drafts per window cost against what they bring). Each slot's tokens are the serial `--batch-mtp` windows' and its solo tokens
+(greedy, `STRATA_IQ_MT_MIN=1`): `STRATA_PIPED_MTP=1 tools/batch_test.py ... --batch 4 --n 2`.
+
 ## Limits (for now)
 
 - By default, batch windows carry no MTP drafts: a conversation in a slot decodes one token per window (the solo
   path keeps its drafts, which is why a request alone is not put in a slot, and goes back to it when left alone).
 - `--batch-mtp` uses one proposal per slot. With a layer split it needs each stage on its own GPU, does not combine
-  with `--batch-groups` above 1 (pipelined slot groups run no drafts, #1413) and has not been run with helper expert
-  caches.
+  with `--batch-groups` above 1 (pipelined slot groups run no drafts, #1413; see `STRATA_PIPED_MTP` below) and has not
+  been run with helper expert caches.
 - Repetition / frequency / presence penalties are not applied in batch windows.
 - A prompt shorter than one chunk is read in one piece (the slots wait for it); a read gives way only at a chunk
   boundary, and not for pictures.
