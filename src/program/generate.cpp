@@ -12627,8 +12627,11 @@ int main(int argc, char** argv) {
                 std::function<void()> stop;
                 ~Bells() { if (stop) stop(); }
             } bells;
-            for (int k = 0; k < n_pipe; ++k) stage_verifier(k).set_external_serve(true);
-            conc_serving = true;
+            // STRATA_STAGE_SERVE: the stages' own threads serve the doorbells already (no thread of ours)
+            if (!stage_serving) {
+                for (int k = 0; k < n_pipe; ++k) stage_verifier(k).set_external_serve(true);
+                conc_serving = true;
+            }
             bells.stop = [&] {
                 bells.on.store(false, std::memory_order_release);
                 {
@@ -12636,12 +12639,14 @@ int main(int argc, char** argv) {
                     bell_cv.notify_one();
                 }
                 if (bells.th.joinable()) bells.th.join();
-                for (int k = 0; k < n_pipe; ++k) stage_verifier(k).set_external_serve(false);
-                conc_serving = false;
+                if (!stage_serving) {
+                    for (int k = 0; k < n_pipe; ++k) stage_verifier(k).set_external_serve(false);
+                    conc_serving = false;
+                }
                 adm_active = false;
                 in_prompt_read = false;
             };
-            bells.th = std::thread([&] {
+            if (!stage_serving) bells.th = std::thread([&] {
                 adm_thread_cpus();
                 auto any_busy = [&] {
                     for (int k = 0; k < n_pipe; ++k)
