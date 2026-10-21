@@ -13389,10 +13389,16 @@ int main(int argc, char** argv) {
         };
         // a BGEN as it comes: beside the decoding slots or the old way (slot_admit_direct), answered with BQ; the line
         // is marked with the answer (\x01 beside, \x02 the old way) for when its turn comes
+        // a slot decoding a conversation with pictures reads its positions from the vision table (mrope)
+        auto img_decoding = [&] {
+            for (const BSlot& x : bs)
+                if (x.active && x.img) return true;
+            return false;
+        };
         auto adm_decide = [&](std::string& l) -> bool {
             AdmReq r;
             bool direct = false;
-            const bool ok = adm_parse(l, r) && !r.bias && mrope_identity && r.slot >= 0 && r.slot < (int) bs.size() &&
+            const bool ok = adm_parse(l, r) && !r.bias && (mrope_identity || !img_decoding()) && r.slot >= 0 && r.slot < (int) bs.size() &&
                             !bs[(size_t) r.slot].active && !adm_queued[(size_t) r.slot] && !adm_paused[(size_t) r.slot] && adm_reading != r.slot && adm_stop_of[(size_t) r.slot] == nullptr &&
                             r.max_new >= 1 && !r.ids.empty();
             if (ok) {
@@ -14287,6 +14293,40 @@ int main(int argc, char** argv) {
                     bell_waiting.store(false, std::memory_order_relaxed);
                 }
             });
+            // text reads after a picture request: the position table back to the identity (no picture slot decodes:
+            // adm_decide), as the request path does for a text request
+            if (!mrope_identity && !mrope_host.empty()) {
+                const int64_t cells = (int64_t) mrope_host.size() / 3;
+                for (int64_t c = 0; c < cells; ++c)
+                    mrope_host[(size_t) c * 3] = mrope_host[(size_t) c * 3 + 1] = mrope_host[(size_t) c * 3 + 2] = (int32_t) c;
+                bool ok = cudaDeviceSynchronize() == cudaSuccess &&
+                          cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
+                                     cudaMemcpyHostToDevice) == cudaSuccess;
+                for (auto& st : stages) {
+                    const strata::core::OnDevice on(st->dev);
+                    ok = ok && cudaDeviceSynchronize() == cudaSuccess &&
+                         cudaMemcpy(st->mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
+                                    cudaMemcpyHostToDevice) == cudaSuccess;
+                }
+                if (!ok) { std::printf("ERR the position table upload failed\n"); return false; }
+                mrope_identity = true;
+            }
+            // --batch-mtp: every slot drafter's prompt pass reserved now, with nothing of a read in flight (a reserve
+            // later would wait for the reads in the queue: STRATA_SLOT_ADMIT_MULTI's admissions went one by one)
+            if (batch_mtp) {
+                bool need = false;
+                for (size_t b = 0; b < bs.size(); ++b) need = need || !adm_mtp_ready[b];
+                if (need && !pipe_drain()) return false;
+                for (size_t b = 0; b < bs.size() && need; ++b) {
+                    if (adm_mtp_ready[b]) continue;
+                    std::string e;
+                    if (!slot_mtp[b]->reserve_prefill(sp.chunk(), e)) {
+                        std::printf("ERR batch MTP slot %zu: %s\n", b, e.c_str());
+                        return false;
+                    }
+                    adm_mtp_ready[b] = 1;
+                }
+            }
             int n_adm = 0;
             // the windows during these reads, per stage (the run's line): how many, and their doorbells' pool time
             std::vector<std::pair<int64_t, double>> w0((size_t) n_pipe);
@@ -16023,13 +16063,16 @@ int main(int argc, char** argv) {
                 }();
                 // (STRATA_SLOT_ADMIT: every read on the control lines too, so a lone long read gives way to a shorter
                 // request at its next chunk and goes on beside the slots after it)
-                if (piped && (pr_conc || slot_admit) && req_imgs.empty()) {   // (with no slot decoding it only watches for a BYIELD)
+                // (STRATA_SLOT_ADMIT: a picture request's read too - its rows' pinned slots are grown first, below)
+                if (piped && (pr_conc || slot_admit) && (req_imgs.empty() || slot_admit)) {   // (with no slot decoding it only watches for a BYIELD)
                     // the drafter's prompt pass captures its graphs and grows its records at first use, and the
                     // prompt path's pinned upload slots grow at their first larger upload: done here, with nothing in
                     // flight (on the reader's thread a capture, an allocation or a free takes the driver's lock and
                     // can wait for the device, #31)
                     if (use_mtp && !mtp.reserve_prefill(C, e)) return false;
-                    if (!sp.reserve_uploads(C))
+                    // (a picture's rows go up in runs of up to 4 MiB: slots that size, sized as a routing table of
+                    // 40 bytes a token)
+                    if (!sp.reserve_uploads(req_imgs.empty() ? C : std::max<int64_t>(C, (int64_t) (4 << 20) / 40 + 1)))
                         std::fprintf(stderr, "strata batch: the prompt path's pinned upload slots could not be "
                                              "reserved (they grow at first use)\n");
                     // where the read's thread and the doorbell thread run: on Linux a thread inherits its creator's
