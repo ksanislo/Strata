@@ -21,6 +21,8 @@
 #include <future>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace strata::core { class PeerExperts; }
 namespace strata::kernels::cpu { class ExpertPool; }
@@ -38,6 +40,8 @@ struct PrefillStats {
     int64_t experts_direct = 0;     ///< ...of which MMQ read in their cache slots, not gathered (STRATA_MMQ_DIRECT=1)
     int64_t experts_cpu = 0;        ///< ...computed on the CPU pool instead of streamed (STRATA_PREFILL_CPU_SHARE)
     double cpu_share = 0;           ///< ...the share of the streamed ones it took last (measured by default)
+    int64_t prefetch_issued = 0;    ///< STRATA_STAGE_PREFETCH: blobs copied before their layer's routing
+    int64_t experts_prefetched = 0; ///< ...of which the routing picked (read from their prefetch slot, not streamed)
     double ms_ple = 0;
 };
 
@@ -245,6 +249,8 @@ public:
     /// `by_default`: this path is one the share was measured on (CUDA, one GPU, no batch slots), so with the variable unset
     /// the share is on for chunks below 1024 tokens (STRATA_PREFILL_CPU_SHARE=0 turns it off).
     static void arm_cpu_share(bool applies, bool by_default = false);
+    /// STRATA_STAGE_PREFETCH: the experts' heat, hottest first (a profile's ranked pairs); unranked pairs come last.
+    static void set_prefetch_rank(const std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t n_layers, int64_t n_expert);
 
 private:
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
@@ -254,6 +260,12 @@ private:
     // the direct successor. The public run() drains the chain once at prompt end.
     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
     bool drain_pipeline(std::string& err);
+    // STRATA_STAGE_PREFETCH (stage_prefetch.hpp): plan this stage's prefetch for a one-chunk read of T tokens and
+    // issue its first slots; issue what the released slots allow after layer `done`; release layer l's slots; end the run
+    void pf_start(int64_t T);
+    void pf_issue(int64_t done);
+    void pf_release(int64_t l);
+    void pf_end();
 
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;

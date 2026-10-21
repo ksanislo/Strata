@@ -4975,6 +4975,8 @@ int main(int argc, char** argv) {
             stages[i]->le = i + 1 < stages.size() ? split_at[i + 1] : g.n_layers;
         }
     }
+    // STRATA_STAGE_PREFETCH: the prompt path prefetches each layer's misses hottest first
+    strata::prefill::Prefill::set_prefetch_rank(profile_all.empty() ? profile : profile_all, g.n_layers, g.n_expert);
 
     // ---- `--layer-split auto` with the trim asked: THE STAGES' WEIGHTS, NOW THAT THE SPLIT IS KNOWN.  Each later card
     // loads the dense weights of the layers it runs and nothing else (before this they loaded in the loop above, a

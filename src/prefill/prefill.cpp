@@ -40,6 +40,7 @@
 #include "strata/prefill/moe_fused.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/stage_prefetch.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/prefill/kernels.hpp"
 
@@ -328,6 +329,13 @@ inline int ring_slots(size_t T) {
 // The staging buffers a layout holds: the ring, and at least STAGE_GRP for the staged walk's grouped gather.  Counted
 // and taken through this one place, so the bytes the prompt path borrows cover every buffer it writes.
 inline int stage_slots(size_t T) { return std::max(ring_slots(T), STAGE_GRP); }
+// STRATA_STAGE_PREFETCH=1: a staged chunk's prefetch slots, after the ring (stage_prefetch.hpp); 0 = off, the layout unchanged
+inline int pf_slots(size_t T, bool src) {
+    static const bool on = strata::prefill::stage_prefetch::env_on(std::getenv("STRATA_STAGE_PREFETCH"));
+    if (!src || (int64_t) T >= stream_all_min()) return 0;
+    return strata::prefill::stage_prefetch::slots(on, std::getenv("STRATA_STAGE_PREFETCH_SLOTS"), ring_cap() - STAGE_GRP);
+}
+std::vector<int32_t> g_pf_rank;   // Prefill::set_prefetch_rank: n_layers x n_expert, lower = hotter
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
 // The BF16-weight projections (hyper-connection, SSM alpha/beta, indexer, router, shared gate, PLE key/value) take
 // BF16 activations here and FP32 ones in decode. STRATA_PREFILL_BF16X2=1 adds each activation's BF16 remainder as a
@@ -960,6 +968,15 @@ struct Prefill::Impl {
     // the event that releases each ring slot: its own `used`, or - when an MMQ group is gathered in one launch - the
     // `used` of the last slot gathered with it, recorded once for all of them (a later record only waits longer)
     int used_of[RING_MAX] = {};
+    // STRATA_STAGE_PREFETCH: slots stage_dev[pf_base, pf_base + pf_n); entry i of pf_list goes to pf_base + i % pf_n
+    int pf_base = 0, pf_n = 0;
+    bool pf_active = false;                  // a run's prefetch is planned (pf_start) until Prefill::run ends it
+    std::vector<strata::prefill::stage_prefetch::Entry> pf_list;
+    std::vector<size_t> pf_starts;           // per layer of the stage: its first entry
+    std::vector<int32_t> pf_idx;             // (l - lb) * n_expert + e -> its entry, -1
+    std::vector<char> pf_skip;               // entries passed over (their layer was read before a slot was free)
+    size_t pf_issued = 0, pf_released = 0;
+    int64_t pf_at[3] = {};                   // the stage's stats when the run started: issued, picked, streamed (trace)
     // PLE
     float* ple_emb = nullptr;
     std::vector<float> ple_pageable[2];      // the fallback when no more RAM can be pinned
@@ -1605,18 +1622,21 @@ bool Prefill::carve(size_t T, void* alloc) {
     }
     m.ring = ring_slots(T);
     const int nstage = stage_slots(T);   // the staged walk may use STAGE_GRP of them
+    m.pf_n = pf_slots(T, m.src != nullptr);
+    m.pf_base = nstage;
+    const int nall = nstage + m.pf_n;
     if (o.base == nullptr && m.ring > 0) {
         // OWNED buffers: the ring in ONE allocation.  384 separate 2.7 MiB cudaMallocs each round up to a 2 MiB page
         // (~1.3 MiB a slot, ~0.5 GiB in all) that no count ever saw.  A borrowed region keeps its per-slot layout (and
         // so its price, `bytes_needed`: the loans' slot counts do not move).
-        uint8_t* ring_base = o.take<uint8_t>((size_t) nstage * (size_t) MAXBLOB(), ok);
-        for (int i = 0; ok && i < nstage; ++i) {
+        uint8_t* ring_base = o.take<uint8_t>((size_t) nall * (size_t) MAXBLOB(), ok);
+        for (int i = 0; ok && i < nall; ++i) {
             m.stage_dev[i] = ring_base + (size_t) i * (size_t) MAXBLOB();
             m.stage_live[i] = false;
             m.used_of[i] = i;
         }
     } else {
-        for (int i = 0; i < nstage; ++i) {
+        for (int i = 0; i < nall; ++i) {
             m.stage_dev[i] = o.take<uint8_t>((size_t) MAXBLOB(), ok);
             m.stage_live[i] = false;                        // a new buffer: nothing of an earlier layout to wait for
             m.used_of[i] = i;
@@ -2333,10 +2353,11 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
         o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
     }
+    const int nall = stage_slots(T) + pf_slots(T, src);
     if (owned_pages) {
-        if (stage_slots(T) > 0) o.take<uint8_t>((size_t) stage_slots(T) * (size_t) MAXBLOB(), ok);   // one allocation
+        if (nall > 0) o.take<uint8_t>((size_t) nall * (size_t) MAXBLOB(), ok);   // one allocation
     } else {
-        for (int i = 0; i < stage_slots(T); ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
+        for (int i = 0; i < nall; ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
     }
     f(T * N);
     f((size_t) strata::kernels::NG_HC_DIM);
@@ -2611,6 +2632,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             std::swap(m.pp, m.help_pp);
         }
     } help_scope{m, helped};
+    // STRATA_STAGE_PREFETCH: a one-chunk staged read - every stage starts copying its first layers' hottest misses now
+    if (hand_in_ == nullptr && single_chunk && !pipe_chunked && !helped)
+        for (Prefill* p = this; p != nullptr; p = p->next_) p->pf_start(n);
     PfTimer pt;
     PeTimer pe;
     if (m.pp) pe.dev = m.pp->dev; else pe.on = false;
@@ -4373,10 +4397,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             m.stager->start(std::move(js));
                         }
                         StagerDone stager_done{stream_all ? nullptr : m.stager.get()};
+                        // STRATA_STAGE_PREFETCH: the slot expert e of this layer was prefetched into (-1: none)
+                        auto pf_slot = [&](int32_t e) -> int {
+                            if (!m.pf_active) return -1;
+                            const int32_t i = m.pf_idx[(size_t) ((l - LB) * m.g->n_expert + e)];
+                            if (i < 0 || (size_t) i >= m.pf_issued || m.pf_skip[(size_t) i]) return -1;
+                            return m.pf_base + (int) ((size_t) i % (size_t) m.pf_n);
+                        };
                         auto stage_one = [&](size_t j) -> bool {
                             const int32_t e = order[j];
                             const bool resident = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
-                            if (resident) return true;
+                            if (resident || pf_slot(e) >= 0) return true;
                             const int sl = stage_next;
                             stage_next = (stage_next + 1) % stage_n;
                             const auto th = Clock::now();
@@ -4622,7 +4653,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     ++staged;
                                 }
                                 const int32_t e = order[j];
-                                if (stage_of[j] < 0) {
+                                if (const int ps = pf_slot(e); ps >= 0) {   // landed before its layer's routing, as a rule
+                                    pt.mark(kPfWaitCopy, cs);
+                                    cudaStreamWaitEvent(m.cs, m.copied[ps], 0);
+                                    if (!compute(j, m.stage_dev[ps], -1, -1)) return false;
+                                    ++stats_.experts_prefetched;
+                                } else if (stage_of[j] < 0) {
                                     ++stats_.experts_resident;
                                     if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1,
                                                  m.host_res[(size_t) l * m.g->n_expert + e])) return false;
@@ -4634,6 +4670,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     if (!compute(j, m.stage_dev[stage_of[j]], stage_of[j], -1)) return false;
                                     --pending;   // compute recorded the slot's release event before any reuse
                                 }
+                            }
+                            // this layer's routed copies are all queued: its prefetch slots go to the next layers
+                            if (m.pf_active) {
+                                pf_release(l);
+                                pf_issue(l);
                             }
                         } else {
                             // the streamed walk: this layer's entries [k, kend) in id order; an entry the routing did not
@@ -5012,6 +5053,86 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     return true;
 }
 
+void Prefill::set_prefetch_rank(const std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t n_layers, int64_t n_expert) {
+    g_pf_rank.clear();
+    if (ranked.empty()) return;   // no profile: no heat to go by, nothing is prefetched
+    g_pf_rank.assign((size_t) (n_layers * n_expert), INT32_MAX);
+    int32_t r = 0;
+    for (const auto& [l, e] : ranked)
+        if (l >= 0 && l < n_layers && e >= 0 && e < n_expert && g_pf_rank[(size_t) (l * n_expert + e)] == INT32_MAX)
+            g_pf_rank[(size_t) (l * n_expert + e)] = r++;
+}
+
+void Prefill::pf_start(int64_t T) {
+    namespace sp = stage_prefetch;
+    Impl& m = *impl_;
+    m.pf_active = false;
+    const int64_t NE = m.g ? m.g->n_expert : 0;
+    if (m.pf_n <= 0 || m.T < T || T >= stream_all_min() || m.src == nullptr || m.pp || NE <= 0 ||
+        g_pf_rank.size() != (size_t) (m.g->n_layers * NE))
+        return;
+    const int64_t LB = stage_lb_, LE = stage_le_;
+    auto candidate = [&](int64_t l, int32_t e) {
+        if (m.host_res && m.cache && m.host_res[(size_t) (l * NE + e)] >= 0) return false;
+        return m.src->pinned(l, e) && !m.src->transient(l, e);   // DMA straight from the page-locked arena
+    };
+    auto rank = [&](int64_t l, int32_t e) { return g_pf_rank[(size_t) (l * NE + e)]; };
+    m.pf_list = sp::plan(LB, LE, (int32_t) NE, sp::per_layer(std::getenv("STRATA_STAGE_PREFETCH_LAYER"), m.pf_n),
+                         candidate, rank, m.pf_starts);
+    m.pf_idx.assign((size_t) ((LE - LB) * NE), -1);
+    for (size_t i = 0; i < m.pf_list.size(); ++i)
+        m.pf_idx[(size_t) ((m.pf_list[i].l - LB) * NE + m.pf_list[i].e)] = (int32_t) i;
+    m.pf_skip.assign(m.pf_list.size(), 0);
+    m.pf_issued = m.pf_released = 0;
+    m.pf_at[0] = stats_.prefetch_issued;
+    m.pf_at[1] = stats_.experts_prefetched;
+    m.pf_at[2] = stats_.experts_streamed;
+    m.pf_active = true;
+    const core::OnDevice on(m.device);
+    pf_issue(LB - 1);
+}
+
+void Prefill::pf_issue(int64_t done) {
+    Impl& m = *impl_;
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    while (m.pf_issued < m.pf_list.size() && stage_prefetch::can_issue(m.pf_issued, m.pf_released, m.pf_n)) {
+        const size_t i = m.pf_issued++;
+        const stage_prefetch::Entry en = m.pf_list[i];
+        const uint8_t* b = en.l > done ? m.src->blob_stable(en.l, en.e) : nullptr;
+        if (b == nullptr) { m.pf_skip[i] = 1; continue; }   // its layer was read already
+        const int sl = m.pf_base + (int) (i % (size_t) m.pf_n);
+        if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[sl], 0);
+        cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(en.l), cudaMemcpyHostToDevice, m.copy);
+        cudaEventRecord(m.copied[sl], m.copy);
+        m.stage_live[sl] = true;
+        ++stats_.prefetch_issued;
+    }
+}
+
+void Prefill::pf_release(int64_t l) {
+    Impl& m = *impl_;
+    const size_t a = m.pf_starts[(size_t) (l - stage_lb_)], b = m.pf_starts[(size_t) (l - stage_lb_) + 1];
+    // every copy of the layer (picked or not) is waited for on the compute stream before its slot is given back
+    for (size_t i = a; i < b && i < m.pf_issued; ++i) {
+        if (m.pf_skip[i]) continue;
+        const int sl = m.pf_base + (int) (i % (size_t) m.pf_n);
+        cudaStreamWaitEvent(m.cs, m.copied[sl], 0);
+        cudaEventRecord(m.used[sl], m.cs);
+        m.used_of[sl] = sl;
+    }
+    m.pf_released = std::max(m.pf_released, b);
+}
+
+void Prefill::pf_end() {
+    for (Prefill* p = this; p != nullptr; p = p->next_) {
+        Impl& m = *p->impl_;
+        if (!m.pf_active) continue;
+        const core::OnDevice on(m.device);
+        cudaStreamSynchronize(m.copy);   // nothing of it may land in a slot once the loan is refilled
+        m.pf_active = false;
+    }
+}
+
 bool Prefill::drain_pipeline(std::string& err) {
     bool ok = true;
 
@@ -5064,6 +5185,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
 
     std::string drain_err;
     const bool drain_ok = drain_pipeline(drain_err);
+    if (std::getenv("STRATA_TRACE")) {
+        for (const Prefill* p = this; p != nullptr; p = p->next_)
+            if (p->impl_->pf_active)
+            std::fprintf(stderr, "strata trace: stage prefetch: layers %lld..%lld: %lld prefetched, %lld of them picked, "
+                                 "%lld streamed after the routing\n", (long long) p->stage_lb_, (long long) p->stage_le_ - 1,
+                         (long long) (p->stats_.prefetch_issued - p->impl_->pf_at[0]),
+                         (long long) (p->stats_.experts_prefetched - p->impl_->pf_at[1]),
+                         (long long) (p->stats_.experts_streamed - p->impl_->pf_at[2]));
+    }
+    pf_end();
 
     if (!body_ok) return false;
     if (!drain_ok) {
