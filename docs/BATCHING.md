@@ -373,7 +373,22 @@ caps the workers of all stages together, split by layers; the service threads ar
   so the stages no longer take turns. The engine's own pool stays (it is built before the stages are known, and the
   single-GPU paths use it) but idles: its workers sleep.
 - Off (with a log line) beside what also keeps `STRATA_PIPED_CONCURRENT` off, the routing-aware prefetch, a peer
-  device, `--dump-routing`, `--no-pool` and `--split-device 0`. Not measured yet.
+  device, `--dump-routing`, `--no-pool` and `--split-device 0`.
+
+That describes `STRATA_STAGE_SERVE=split`. `=1` lets the CPU workers follow the work: on an AVX-only CPU the expert
+kernels are compute-bound (~1.2 GB/s a thread, local memory buys nothing), so cutting the pool into 3-5 workers per
+stage starved the one stage that works when one conversation decodes (2x Xeon E5-2660 v2, Q8: 19.0 tok/s against 29
+with the switches off). With `=1`:
+
+- A stage whose window is the only one in flight takes the engine's whole pool for its layers; while another stage
+  works (several conversations in the pipelined groups, `--pipeline-windows`) each stage takes its own, and the engine's
+  pool waits 25 ms after the last such moment, so its workers and a stage pool's never spin on one core. Decided per
+  layer; one stage at a time holds the engine's pool.
+- The serial windows (one conversation's decode, a slot's first token) serve on the host thread again, as without the
+  switch.
+- A stage's service thread runs on the SMT sibling of its share's first core, and every physical core of the share is
+  a worker.
+- Each request's log line is followed by how many layers ran on the engine's pool and on the stages' own.
 
 ## The VRAM expert tier keeps adapting in batch windows
 
