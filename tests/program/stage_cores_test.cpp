@@ -59,6 +59,14 @@ int main() {
         check(p[0].service == 0 && p[1].service == 1 && p[2].service == 0, "fewer cores than stages: shared");
         check(p[2].workers == std::vector<int>({0}), "a one-core share: the worker shares the service core");
     }
+    {   // service threads on SMT siblings: every physical core works
+        std::map<int, int> sib;
+        for (int c = 0; c < 20; ++c) sib[c] = c + 20;
+        const auto p = sp::plan_stage_cores(nodes, layers, box, {0, 20}, 0, &sib);
+        check(p[0].service == 21 && p[0].workers == std::vector<int>({1, 2, 3, 4}), "sibling: stage 0 service 21, workers 1-4");
+        check(p[1].service == 25 && p[1].workers.size() == 5 && p[3].service == 35 && p[3].workers.size() == 5,
+              "sibling: 19 physical cores all work");
+    }
     {
         const auto w = sp::split_by_weight(7, {11, 13}, {100, 100});
         check(w[0] == 3 && w[1] == 4, "split_by_weight: 7 by 11:13 is 3+4");
