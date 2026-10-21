@@ -807,6 +807,10 @@ def btrace(*a):
 
 EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default --eos-ids
 
+# a batch slot's own lines, routed to its queue: its tokens and end, and (STRATA_SLOT_ADMIT) its admission's read
+# progress (BRP), its start or not (BRA <slot> <1|0>) and a refusal (BRE)
+SLOT_LINES = ("BT ", "BDONE ", "BRP ", "BRA ", "BRE ")
+
 
 # The engine's own words for a verifier that cannot go on (its GPU waits were released, or an earlier window never
 # finished, #267): the process may stay alive and even print DONE, but it must not take another request.
@@ -1157,6 +1161,9 @@ class StrataEngine:
         groups_run = int(self.info.get("batch_groups") or groups)
         self.slot_gs = gs if groups > 1 and groups_run > 1 else 0
         self.slot_q = [queue.Queue() for _ in range(self.batch)]
+        # STRATA_SLOT_ADMIT (INFO slot_admit=1): an admission's prompt is read into its slot beside the decoding slots;
+        # the engine answers BGEN with `BQ <slot> 1` and the rest comes on the slot's own lines (see generate_batched)
+        self.slot_admit = bool(self.batch) and str(self.info.get("slot_admit") or "") == "1"
         self.slot_busy = [False] * self.batch
         # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
         # given back; slot_releasing: slots handed to the background BDONE wait.  A busy slot in neither has no owner
@@ -1216,7 +1223,7 @@ class StrataEngine:
                 if sample is not None and self.proc is proc:
                     self.terminal_stage_sample = {**sample, "observed_monotonic": time.monotonic()}
                 continue
-            if line.startswith(("BT ", "BDONE ")) and slot_q:   # --batch: a batch slot's own lines
+            if line.startswith(SLOT_LINES) and slot_q:   # --batch: a batch slot's own lines
                 try:
                     slot_q[int(line.split()[1])].put(line)
                     continue
@@ -1555,6 +1562,10 @@ class StrataEngine:
                 f = line.split()
                 self._ctl_result = ("badm", len(f) >= 3 and f[2] == "1")
                 return
+            elif line.startswith("BQ "):                 # STRATA_SLOT_ADMIT: 1 = read beside the slots, on its own lines
+                if line.split()[2:3] == ["1"]:
+                    self._ctl_result = ("queued", True)
+                    return
             elif line.startswith("YIELDED "):            # the read gave way (BYIELD): <slot> <tokens read>
                 f = line.split()
                 if len(f) >= 3 and f[1].lstrip("-").isdigit() and f[2].isdigit():
@@ -1651,6 +1662,9 @@ class StrataEngine:
                 if line.startswith("BDONE "):
                     if line.split()[3:4] == ["nonfinite"]:   # #879: the engine dropped the slot's state
                         tail = []
+                    break
+                if line.startswith("BRE ") or (line.startswith("BRA ") and line.split()[2:3] == ["0"]):
+                    tail = []                       # STRATA_SLOT_ADMIT: an admission that never started
                     break
             held[slot] = tail[:-1] if stream and tail else []
             with self.slot_cv:
@@ -1895,6 +1909,7 @@ class StrataEngine:
                         carry_leg(carry, self.last)         # #1869: the solo leg's figures; the slot's admission (a copy of
                                                             # the held prefix: prompt_read 1) and BDONE replace them
                         prompt = list(ids) + out            # promoted: it continues in a batch slot from here
+                direct = False      # STRATA_SLOT_ADMIT: this admission was read beside the slots
                 while True:
                     if slot is None:
                         # a free slot (they free themselves at BDONE, which needs no control lines): the one that holds
@@ -2018,6 +2033,25 @@ class StrataEngine:
                         self._park_slot(slot)
                         slot = None
                         continue
+                    if self._ctl_result and self._ctl_result[0] == "queued":
+                        # STRATA_SLOT_ADMIT: the engine reads this prompt into the slot beside the decoding slots and
+                        # answers on the slot's lines; the control lines are the next request's meanwhile
+                        phase = "queued"
+                        self.ctl.release()
+                        holding = False
+                        try:
+                            adm = yield from self._admission_wait(slot, cancel, live)
+                        except (ValueError, EngineDied):
+                            phase = "none"                  # refused (BRE) or gone: the engine holds nothing here
+                            raise
+                        cont = adm["start"]
+                        phase = "slot" if cont else "none"
+                        direct = True
+                        if cont:
+                            self.last = adm["figures"]
+                        elif adm.get("why") == "nonfinite":
+                            raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                        break
                     cont = bool(self._ctl_result and self._ctl_result[1])
                     phase = "slot" if cont else "none"
                     while pending:
@@ -2029,12 +2063,17 @@ class StrataEngine:
                     if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
                         continue                            # gave way: again once the shorter request is in
                     break
-                self.ctl.release()
-                holding = False
+                if holding:
+                    self.ctl.release()
+                    holding = False
                 if not cont:
                     return
-                live.update(state="decoding", first_token=time.time(), generated=len(out))
-                gen0 = len(out) - 1                         # the admission's own token: the slot feeds it first
+                live.update(state="decoding", first_token=None if direct else time.time(), generated=len(out))
+                # the admission's own token: the slot feeds it first (read beside the slots: its first BT is the first)
+                gen0 = len(out) if direct else len(out) - 1
+                if direct and cancel.is_set() and not stop_sent:   # (a BSTOP while it was queued may have come too late)
+                    self._send(f"BSTOP {slot}")
+                    stop_sent = True
                 going_solo = False
                 while True:
                     try:
@@ -2052,6 +2091,8 @@ class StrataEngine:
                         t = int(line.split()[2])
                         out.append(t)
                         live["generated"] = len(out)
+                        if live.get("first_token") is None:
+                            live["first_token"] = time.time()
                         if cancel.is_set():
                             if not stop_sent:
                                 self._send(f"BSTOP {slot}")
@@ -2137,16 +2178,63 @@ class StrataEngine:
                         self.slot_busy[slot] = False
                         self.slot_claims.discard(slot)
                         self.slot_cv.notify_all()
-                elif phase == "slot":
+                elif phase in ("slot", "queued"):
                     self.slot_held[slot] = []
-                    stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                    self._release_slot_when_done(slot, stream)    # freed at its BDONE
+                    stream = (list(prompt) + out[gen0:] if phase == "slot" and gen0 is not None and len(out) > gen0
+                              else None)
+                    self._release_slot_when_done(slot, stream)    # freed at its BDONE (or, queued: at its BRA 0)
                     self.slot_claims.discard(slot)                # (the BDONE wait owns it now)
                 else:
                     with self.slot_cv:
                         self.slot_busy[slot] = False
                         self.slot_claims.discard(slot)
                         self.slot_cv.notify_all()
+
+    def _admission_wait(self, slot: int, cancel, live: dict):
+        """STRATA_SLOT_ADMIT: an admission the engine queued (`BQ <slot> 1`), up to its start, yielding None heartbeats.
+        Returns {"start": True, "figures": ...} at `BRA <slot> 1`, {"start": False, "why": ...} at `BRA <slot> 0 <why>`;
+        `BRE <slot> <why>` (refused) raises ValueError.  A cancel sends BSTOP once (the engine drops a queued admission
+        or stops its read at the next chunk, and answers BRA 0)."""
+        q = self.slot_q[slot]
+        beat = time.monotonic()
+        stopped = False
+        while True:
+            if cancel.is_set() and not stopped:
+                self._send(f"BSTOP {slot}")
+                stopped = True
+            try:
+                line = q.get(timeout=0.5)
+            except queue.Empty:
+                if time.monotonic() - beat >= 10.0:
+                    beat = time.monotonic()
+                    yield None
+                continue
+            if line is None:
+                raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+            f = line.split()
+            if line.startswith("BRP "):                      # BRP <slot> <done> <total> <ms> <tok/s>
+                if len(f) >= 4 and f[2].isdigit():
+                    live["prompt_read"] = int(f[2])
+                if time.monotonic() - beat >= 10.0:
+                    beat = time.monotonic()
+                    yield None
+            elif line.startswith("BRA "):                    # BRA <slot> 1 prompt=N reused=R read_ms=M wait_ms=W
+                if f[2:3] != ["1"]:
+                    return {"start": False, "why": f[3] if len(f) > 3 else ""}
+                kv = dict(x.partition("=")[::2] for x in f[3:] if "=" in x)
+
+                def num(k, default=0.0):
+                    try:
+                        return float(kv.get(k, default))
+                    except ValueError:
+                        return default
+                n, reused = int(num("prompt")), int(num("reused"))
+                return {"start": True,
+                        "figures": {"generated": 0, "prompt_tokens": n, "prompt_ms": num("read_ms") + num("wait_ms"),
+                                    "decode_ms": 0.0, "finish": "length", "reused": reused,
+                                    "prompt_read": max(0, n - reused)}}
+            elif line.startswith("BRE "):
+                raise ValueError(" ".join(f[2:]) or "the engine refused the admission")
 
     slot_groups = 1         # --batch-groups (set when the engine starts)
     SLOT_PREFIX_MIN = 512   # a held prefix shorter than this is not worth unbalancing the pipeline's groups
@@ -2169,6 +2257,10 @@ class StrataEngine:
             def fills_hole(b):
                 g0 = b - b % gs
                 return any(self.slot_busy[x] for x in range(b + 1, g0 + gs))
+            if getattr(self, "slot_admit", False):
+                # STRATA_SLOT_ADMIT: a hole's group would wait for the slot's whole read (its window writes the slot):
+                # a slot above the busy ones of its group first
+                return min(free, key=lambda b: (fills_hole(b), self.slot_order.index(b)))
             return min(free, key=lambda b: (not fills_hole(b), self.slot_order.index(b)))
         def held_prefix(b):
             # what of `prompt` the slot's cache serves: the slot's whole held stream (the prompt and what it decoded)
