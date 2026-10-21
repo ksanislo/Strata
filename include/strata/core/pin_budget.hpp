@@ -24,6 +24,8 @@
 
 #include <cuda_runtime.h>
 
+#include "strata/core/numa_place.hpp"
+
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -76,13 +78,14 @@ inline void sim_uncharge(State& s, const void* p) {
 
 inline cudaError_t alloc_locked(State& s, void** p, size_t bytes, unsigned flags) {
     if (s.sim_budget != 0 && s.sim_used + bytes > s.sim_budget) return cudaErrorMemoryAllocation;
-    const cudaError_t e = cudaHostAlloc(p, bytes, flags);
+    // STRATA_NUMA_PLACE: on the current card's node (cudaHostAlloc as before when placement is off)
+    const cudaError_t e = numa_host_alloc(p, bytes, flags, numa_place_current_node());
     if (e == cudaSuccess) sim_charge(s, *p, bytes);
     return e;
 }
 inline void free_locked(State& s, void* p) {
     if (p == nullptr) return;
-    (void) cudaFreeHost(p);
+    numa_host_free(p);
     sim_uncharge(s, p);
 }
 
@@ -208,6 +211,9 @@ inline cudaError_t host_alloc_guarded(void** p, size_t bytes, unsigned flags) {
         return e2;
     }
 }
+
+/// Frees a host_alloc_guarded buffer: cudaFreeHost, or the NUMA-placed registration.
+inline void host_free_guarded(void* p) { numa_host_free(p); }
 
 /// The sentence every hard failure ends with, so the app can recognise it in the log.
 inline std::string pin_exhausted_hint() {

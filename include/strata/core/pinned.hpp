@@ -20,6 +20,8 @@
 #include <utility>
 #include <vector>
 
+#include "strata/platform/numa.hpp"
+
 namespace strata::core {
 
 enum class PageBacking { LargePages, NormalPages, PinnedByCuda };
@@ -29,6 +31,8 @@ enum class PageBacking { LargePages, NormalPages, PinnedByCuda };
 /// -2 for "auto" (Windows: the sliced pin stays below the GPU's shared-memory budget).
 int arena_pin_cap_gib();
 
+/// STRATA_NUMA_PLACE: spans (arena offsets) the next anonymous arena binds to their nodes before it registers (used once).
+void pinned_arena_numa_plan(std::vector<strata::platform::NumaSpan> spans);
 struct PinnedArena {
     void* base = nullptr;
     uint64_t capacity = 0;
