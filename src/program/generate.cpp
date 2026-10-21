@@ -13924,6 +13924,34 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata serve: PFMULTI skipped: slot %d is decoding\n", b);
                         return true;
                     }
+                // the first stage's PLE for the slots' sessions: the main one's table, weights and consts, each slot's own
+                // history and predecessors, and a scratch of the reads' own (as STRATA_SLOT_ADMIT wires it)
+                static float* pfm_ple_scratch = nullptr;
+                static float* pfm_ple_emb = nullptr;
+                if (ss.ple.ready() && pfm_ple_scratch == nullptr) {
+                    const strata::core::OnDevice on0(0);
+                    if (cudaMalloc((void**) &pfm_ple_scratch, strata::core::ple_run_scratch_bytes()) != cudaSuccess ||
+                        cudaMalloc((void**) &pfm_ple_emb, (size_t) strata::kernels::NG_N_EMBD * 4) != cudaSuccess) {
+                        cudaGetLastError();
+                        err = "PFMULTI: no VRAM for the PLE scratch";
+                        return false;
+                    }
+                }
+                struct PleScope {
+                    std::vector<strata::core::SessionState*> s;
+                    ~PleScope() { for (auto* x : s) x->ple = strata::core::PleRun{}; }
+                } ple_scope;
+                if (ss.ple.ready())
+                    for (int b = 0; b < N; ++b) {
+                        strata::core::SessionState& s0 = *bslot_ss[0][(size_t) b];
+                        s0.ple = ss.ple;
+                        s0.ple.hist = s0.ple_hist;
+                        s0.ple.prev = s0.ple_prev;
+                        s0.ple.token = &s0.ple_token;
+                        s0.ple.scratch = pfm_ple_scratch;
+                        s0.ple.emb_dev = pfm_ple_emb;
+                        ple_scope.s.push_back(&s0);
+                    }
                 const auto toks = std::make_shared<std::vector<int64_t>>(ids.begin(), ids.begin() + len);
                 const std::vector<int32_t> ids32(ids.begin(), ids.begin() + len);
                 auto dev_of = [&](size_t k) { return k == 0 ? 0 : stages[k - 1]->dev; };
