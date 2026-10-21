@@ -216,6 +216,9 @@ public:
         return hold_.compare_exchange_strong(expect, true, std::memory_order_acq_rel);
     }
     void release_hold() { hold_.store(false, std::memory_order_release); }
+    /// The parked workers sleep now instead of spinning out kSpinBeforeSleep (another pool takes their cores); the
+    /// next batch wakes them as usual.
+    void nap() { nap_.store(true, std::memory_order_relaxed); }
     /// What bounded the default worker count (pool_plan.hpp; "" when a count was configured), the physical cores
     /// and logical processors counted - for the start-up line.
     const char* plan_limit() const { return plan_limit_; }
@@ -423,6 +426,7 @@ private:
     PoolAffinity affinity_ = PoolAffinity::All;
     CpuTopology topo_;
     std::atomic<bool> hold_{false};   // try_hold
+    std::atomic<bool> nap_{false};    // nap; cleared by publish
     int stage_slot_ = -1;   // STRATA_STAGE_SERVE: its place in the watchdog's list of stage pools
 };
 
