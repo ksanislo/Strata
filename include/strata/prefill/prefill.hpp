@@ -202,6 +202,10 @@ public:
     /// for its grouping on the host; a policy may count them. Not called on the paths that keep the ids on the GPU.
     std::function<void(int64_t layer, const int32_t* ids, int64_t n)> on_routes;
     int64_t stopped_at() const { return stopped_at_; }
+    /// The session this stage's runs read into and advance (`init`'s until changed): another session carved alike on
+    /// the same device and range (a batch slot's).  Set between runs, never during one.
+    void set_session(core::SessionState& ss);
+    core::SessionState& session() const;
     /// Grows this stage's (and the later stages') pinned upload slots to what a text chunk of `T` tokens uploads, so
     /// a run of such chunks allocates no pinned memory (STRATA_PIPED_CONCURRENT: an allocation or free on the read's
     /// thread takes the driver's lock).  Before the run, with nothing of this path in flight.  False: a slot could
