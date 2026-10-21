@@ -234,6 +234,19 @@ public:
     /// 1 = this stage's window and commit are done (the last stage's picks are in batch_out), 0 = still running,
     /// -1 = an error (err).  Serves every layer that has rung so far.
     int batch_poll(PoolMultiFn pool, void* user, std::string& err);
+    /// STRATA_PIPED_MTP: the same over explicit `rows` (a slot's rows contiguous: its token, then its draft) at hand-off
+    /// rows [hbase, hbase + S).  `defer`: no commit is queued; commit_deferred(hbase, ...) queues it once the host knows
+    /// each slot's accepted prefix.  Another window launched here first saves the pending window's commit inputs.
+    bool batch_launch_rows(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, bool defer,
+                           std::string& err);
+    /// Queues the deferred commit of the window launched at `hbase` (keep[slot] rows of each of its slots) on this
+    /// stage's stream, without waiting.  No-op when none is pending there.
+    bool commit_deferred(int hbase, const int* keep, std::string& err);
+    /// Room to save the commit inputs of `n` deferred windows (one per pipelined group), allocated now.
+    bool reserve_deferred(int n, std::string& err);
+    bool deferred_pending() const { return !dwin_.empty(); }
+    /// The group at `hbase` can be launched here without waiting: its last deferred commit has run.
+    bool batch_launch_ready(int hbase);
     bool batch_busy() const { return b_running_.load(std::memory_order_acquire); }
     /// Serves the layers of this stage's window that have rung (the CPU pool and the flags), with no CUDA call: 1 once
     /// every layer is served (or the window raises no host doorbells), 0 while one is still to ring.  batch_poll
@@ -460,6 +473,29 @@ private:
     double fl_since_ms_ = 0, fl_flush_ms_ = 0, fl_launch_ms_ = 0;
     int32_t pl_prev_[2] = {-1, -1};
     std::vector<uint32_t> pl_ple_rows_;   ///< the window's PLE rows (T x PLE_N_HEADS), gathered when layer 0 is served
+    // STRATA_PIPED_MTP: windows launched with their commit deferred, by hbase; the arena rows of at most one of them
+    // are live (arena_holds_), the others are copied to dsave_ before another window overwrites them
+    struct DeferredWin {
+        std::vector<int> key;
+        int rows[8] = {};
+        int S = 0;
+        int32_t tok[8] = {};
+        int64_t pos[8] = {};
+        int save = -1;   ///< its dsave_ buffer once saved
+    };
+    std::map<int, DeferredWin> dwin_;
+    int arena_holds_ = -1;
+    std::vector<float*> dsave_;
+    std::vector<bool> dsave_used_;
+    std::map<int, cudaEvent_t> dcommit_ev_;   ///< by hbase: after its last deferred commit (live while in the map's set)
+    std::map<int, bool> dcommit_live_;
+    size_t deferred_floats() const;
+    bool deferred_copy(float* save, int S, bool to_save, std::string& err);
+    bool deferred_save_live(std::string& err);
+    bool pinned_layout(const std::vector<int>& key) const {
+        for (const auto& kv : dwin_) if (kv.second.key == key) return true;
+        return false;
+    }
     bool capture_commit_batch(const int* rows, int S, int hbase, std::string& err);
     bool stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, std::string& err);
     strata::kernels::SamplerParams sampling_ = [] {

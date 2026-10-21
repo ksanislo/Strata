@@ -604,6 +604,9 @@ Verifier::~Verifier() {
     for (auto& kv : commit_bm_)
         if (kv.second) cudaGraphExecDestroy(kv.second);
     if (arena_b_) cudaFree(arena_b_);
+    for (float* p : dsave_) cudaFree(p);
+    for (auto& kv : dcommit_ev_)
+        if (kv.second) cudaEventDestroy(kv.second);
     if (h_commitb_) strata::core::host_free_guarded(h_commitb_);
     if (qcnt_) cudaFree(qcnt_);
     if (d_spec_) cudaFree(d_spec_);
@@ -3480,7 +3483,7 @@ bool Verifier::evict_batch_graph(const std::vector<int>& keep, bool& evicted, st
     auto old = exec_bm_.end();
     uint64_t oldest = UINT64_MAX;
     for (auto it = exec_bm_.begin(); it != exec_bm_.end(); ++it) {
-        if (it->first == keep) continue;
+        if (it->first == keep || pinned_layout(it->first)) continue;   // (a deferred commit still needs its graph)
         const auto u = bm_used_.find(it->first);
         const uint64_t t = u == bm_used_.end() ? 0 : u->second;
         if (t < oldest) { oldest = t; old = it; }
@@ -3781,18 +3784,37 @@ bool Verifier::sample_rows(int S, std::string& err) {
 }
 
 bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
-    const OnDevice on_device(device_);
-    if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
     int rows[8] = {};
     for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
+    return batch_launch_rows(rows, S, base, tokens, pos, false, err);
+}
+
+bool Verifier::batch_launch_rows(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
+                                 bool defer, std::string& err) {
+    const OnDevice on_device(device_);
+    if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
+    if (S < 1 || S > 8) { err = "verify: batch rows out of range (init_slots)"; return false; }
+    if (dwin_.count(hbase) != 0) { err = "verify: a window of this group still waits for its commit"; return false; }
+    if (dcommit_live_[hbase]) {   // stage_batch rewrites the h_commitb_ rows this group's queued commit has still to read
+        if (cudaEventSynchronize(dcommit_ev_[hbase]) != cudaSuccess) { err = "verify: a deferred batch commit failed"; return false; }
+        dcommit_live_[hbase] = false;
+    }
     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
-    if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
-    cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, base)], cs_);
-    if (le == cudaSuccess && !batch_self_commits(rows, S))   // (else the window has kept its rows itself)
-        le = cudaGraphLaunch(commit_bm_[bkey(rows, S, base)], cs_);   // right behind it: every row is kept
+    if (!stage_batch(rows, S, hbase, tokens, pos, err)) return false;
+    if (!deferred_save_live(err)) return false;   // (this window overwrites the arena rows a pending commit reads)
+    if (defer && batch_self_commits(rows, S)) defer = false;
+    cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, hbase)], cs_);
+    if (le == cudaSuccess && !defer && !batch_self_commits(rows, S))   // (else the window has kept its rows itself)
+        le = cudaGraphLaunch(commit_bm_[bkey(rows, S, hbase)], cs_);   // right behind it: every row is kept
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
-    if (ple_stage())   // the host's side of the commit (the hash's last two tokens)
+    if (defer) {
+        DeferredWin& w = dwin_[hbase];
+        w.key = bkey(rows, S, hbase);
+        w.S = S;
+        for (int t = 0; t < S; ++t) { w.rows[t] = rows[t]; w.tok[t] = tokens[t]; w.pos[t] = pos[t]; }
+        arena_holds_ = hbase;
+    } else if (ple_stage())   // the host's side of the commit (the hash's last two tokens)
         for (int t = 0; t < S; ++t) {
             SessionState& sx = *slots_[(size_t) rows[t]];
             sx.ple_prev[0] = sx.ple_prev[1];
@@ -3802,6 +3824,139 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     b_steps_ = le_ - lb_;
     ring_now();
     b_running_.store(true, std::memory_order_release);   // last: an external server reads the rest after it
+    return true;
+}
+
+size_t Verifier::deferred_floats() const {
+    const ModelGeometry& g = *g_;
+    int64_t ng = 0, nq = 0;
+    for (int64_t l = lb_; l < le_; ++l) (is_qsa_layer(g, l) ? nq : ng) += 1;
+    const size_t HS = (size_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
+    return (size_t) max_t_ * ((size_t) ng * (2 * (size_t) g.ssm_conv_channels + 2 * (size_t) g.ssm_v_heads) +
+                              (size_t) nq * (size_t) g.idx_key_dim + (size_t) g.ssm_value_dim + HS);
+}
+
+// The arena rows [0, S) a batch commit graph reads (capture_commit_batch), packed into `save` or back from it.
+bool Verifier::deferred_copy(float* save, int S, bool to_save, std::string& err) {
+    const ModelGeometry& g = *g_;
+    int64_t g0 = 0, q0 = 0, ng = 0, nq = 0;
+    for (int64_t l = 0; l < le_; ++l) {
+        const bool q = is_qsa_layer(g, l);
+        if (l < lb_) (q ? q0 : g0) += 1;
+        else (q ? nq : ng) += 1;
+    }
+    const size_t MT = (size_t) max_t_, C = (size_t) g.ssm_conv_channels, HV = (size_t) g.ssm_v_heads;
+    const size_t ID = (size_t) g.idx_key_dim, ZV = (size_t) g.ssm_value_dim;
+    const size_t HS = (size_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
+    float* p = save;
+    auto rows = [&](float* arena, size_t width, int64_t n) {   // n layers of MT rows each
+        if (n <= 0) return true;
+        const size_t w = (size_t) S * width * sizeof(float), ap = MT * width * sizeof(float);
+        const cudaError_t e = to_save ? cudaMemcpy2DAsync(p, w, arena, ap, w, (size_t) n, cudaMemcpyDeviceToDevice, cs_)
+                                      : cudaMemcpy2DAsync(arena, ap, p, w, w, (size_t) n, cudaMemcpyDeviceToDevice, cs_);
+        p += (size_t) S * width * (size_t) n;
+        return e == cudaSuccess;
+    };
+    const bool ple = ss_->ple.ready() && ple_stage();
+    if (!rows(qkv_L_ + (size_t) g0 * MT * C, C, ng) || !rows(h_L_ + (size_t) g0 * MT * C, C, ng) ||
+        !rows(gate_L_ + (size_t) g0 * MT * HV, HV, ng) || !rows(beta_L_ + (size_t) g0 * MT * HV, HV, ng) ||
+        !rows(idx_raw_L_ + (size_t) q0 * MT * ID, ID, nq) || !rows(z_, ZV, 1) || (ple && !rows(hist_snap_, HS, 1))) {
+        err = std::string("verify: copying a deferred window's commit inputs: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    return true;
+}
+
+bool Verifier::deferred_save_live(std::string& err) {
+    const int hb = arena_holds_;
+    arena_holds_ = -1;
+    auto it = dwin_.find(hb);
+    if (it == dwin_.end()) return true;
+    int b = -1;
+    for (size_t i = 0; i < dsave_.size() && b < 0; ++i)
+        if (!dsave_used_[i]) b = (int) i;
+    if (b < 0) { err = "verify: no room to save a deferred window's commit inputs (reserve_deferred)"; return false; }
+    if (!deferred_copy(dsave_[(size_t) b], it->second.S, true, err)) return false;
+    dsave_used_[(size_t) b] = true;
+    it->second.save = b;
+    return true;
+}
+
+bool Verifier::batch_launch_ready(int hbase) {
+    const auto it = dcommit_live_.find(hbase);
+    if (it == dcommit_live_.end() || !it->second) return true;
+    const OnDevice on_device(device_);
+    if (cudaEventQuery(dcommit_ev_[hbase]) == cudaErrorNotReady) return false;
+    it->second = false;   // (an error shows at the launch's own calls)
+    return true;
+}
+
+bool Verifier::reserve_deferred(int n, std::string& err) {
+    const OnDevice on_device(device_);
+    const size_t bytes = deferred_floats() * sizeof(float);
+    while ((int) dsave_.size() < n) {
+        void* d = nullptr;
+        if (cudaMalloc(&d, bytes) != cudaSuccess) {
+            cudaGetLastError();
+            err = "verify: the deferred commit buffers do not fit";
+            return false;
+        }
+        dsave_.push_back((float*) d);
+        dsave_used_.push_back(false);
+    }
+    return true;
+}
+
+bool Verifier::commit_deferred(int hbase, const int* keep, std::string& err) {
+    auto it = dwin_.find(hbase);
+    if (it == dwin_.end()) return true;
+    const OnDevice on_device(device_);
+    const Clock::time_point t0 = Clock::now();
+    DeferredWin& w = it->second;
+    if (arena_holds_ != hbase) {
+        if (w.save < 0) { err = "verify: a deferred window's commit inputs were lost"; return false; }
+        if (!deferred_save_live(err) || !deferred_copy(dsave_[(size_t) w.save], w.S, false, err)) return false;
+    }
+    arena_holds_ = -1;
+    const int S = w.S;
+    const int64_t CB = 2 + max_t_;
+    for (int t = 0; t < S;) {   // as commit_slot_prefixes
+        const int first = t;
+        while (t < S && w.rows[t] == w.rows[first]) ++t;
+        const int n = keep[w.rows[first]];
+        if (n < 1 || n > t - first) { err = "verify: accepted prefix is outside its slot group"; return false; }
+        int32_t* c = h_commitb_ + (size_t) w.rows[first] * CB;
+        c[0] = n;
+        c[1] = n - 1;
+        for (int j = 0; j < max_t_; ++j) c[2 + j] = j < n ? (int32_t) w.pos[first + j] : -1;
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    const auto ce = commit_bm_.find(w.key);
+    if (ce == commit_bm_.end() || ce->second == nullptr) { err = "verify: a deferred window lost its commit graph"; return false; }
+    cudaEvent_t& ev = dcommit_ev_[hbase];
+    if (ev == nullptr && cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
+        ev = nullptr;
+        err = "verify: event creation failed";
+        return false;
+    }
+    cudaError_t le = cudaGraphLaunch(ce->second, cs_);
+    if (le == cudaSuccess) le = cudaEventRecord(ev, cs_);
+    if (le != cudaSuccess) { err = std::string("verify: deferred batch commit: ") + cudaGetErrorString(le); return false; }
+    (void) cudaStreamQuery(cs_);
+    dcommit_live_[hbase] = true;
+    if (ple_stage())
+        for (int t = 0; t < S;) {
+            const int first = t;
+            while (t < S && w.rows[t] == w.rows[first]) ++t;
+            SessionState& sx = *slots_[(size_t) w.rows[first]];
+            for (int u = first; u < first + keep[w.rows[first]]; ++u) {
+                sx.ple_prev[0] = sx.ple_prev[1];
+                sx.ple_prev[1] = w.tok[u];
+            }
+        }
+    if (w.save >= 0) dsave_used_[(size_t) w.save] = false;   // (a later save into it is queued behind the restore)
+    dwin_.erase(it);
+    ms_commit += ms_since(t0);
     return true;
 }
 
