@@ -75,17 +75,25 @@ inline const char* serial_what(Serial s) {
 }
 
 // ---- STRATA_PIPED_MTP: a group's window carries each live slot's token and, while at most `max_active`
-// conversations decode, its MTP draft right after it; the host decides each slot's accepted prefix once the last stage
-// has picked, and the group's next window waits for that commit and the slots' new drafts.
+// conversations decode, up to `max_drafts` of its MTP drafts right after it; the host decides each slot's accepted
+// prefix once the last stage has picked, and the group's next window waits for that commit and the slots' new drafts.
 
 /// Whether windows carry drafts: at most `max_active` conversations decode (0 or less: never).
 inline bool piped_mtp_on(int active_total, int max_active) { return max_active > 0 && active_total <= max_active; }
 
-/// A group's hand-off rows start here: room for two rows per slot, so no two groups share a hand-off row.
-inline int piped_mtp_hbase(int group, int slots_per_group) { return group * 2 * slots_per_group; }
+/// The most rows a group's window holds: each slot's token and `drafts` drafts, at most `max_t`.
+inline int piped_mtp_group_rows(int slots_per_group, int drafts, int max_t) {
+    const int r = slots_per_group * (1 + (drafts > 0 ? drafts : 0));
+    return r < max_t ? r : max_t;
+}
+
+/// A group's hand-off rows start here, so no two groups share a hand-off row.
+inline int piped_mtp_hbase(int group, int group_rows) { return group * group_rows; }
 
 /// The hand-off rows the pipelined groups need (at least `max_t`, the windows' own size).
-inline int piped_mtp_handoff_rows(int batch, int max_t) { return 2 * batch > max_t ? 2 * batch : max_t; }
+inline int piped_mtp_handoff_rows(int groups, int group_rows, int max_t) {
+    return groups * group_rows > max_t ? groups * group_rows : max_t;
+}
 
 struct Layout {
     int S = 0;                          ///< rows
@@ -93,18 +101,40 @@ struct Layout {
     int32_t tok[8] = {};
     int64_t pos[8] = {};
     int first[8] = {};                  ///< group slot t's first row (-1: not in the window)
-    int n[8] = {};                      ///< ... and its rows (1, or 2 with a draft)
+    int n[8] = {};                      ///< ... and its rows (1 + its drafts)
     int active = 0;
     bool drafts = false;                ///< some slot has a draft row (its commit waits for the verdict)
 };
 
-/// The window of the group whose slots are [base, base + gs): live slots only, each its token (x at p), and its draft
-/// at p + 1 when `on`, the slot has one, it fits in `max_rows` and the slot could keep both (p + 3 <= max_context).
-inline Layout piped_mtp_layout(int base, int gs, const bool* active, const bool* draft_ready, const int32_t* x,
-                               const int32_t* draft, const int64_t* p, bool on, int max_rows, int64_t max_context) {
+/// The window of the group whose slots are [base, base + gs): live slots only, each its token (x at p) and, when `on`,
+/// its first drafts at p + 1 ...: at most `max_drafts` and the slot's own `n_draft[t]` (draft t*8 + j), no more than
+/// it could keep (`left[t]` tokens to its max_new, the context's end), the rows past the tokens shared out one draft
+/// per slot in turn.
+inline Layout piped_mtp_layout(int base, int gs, const bool* active, const int* n_draft, const int32_t* x,
+                               const int32_t* draft, const int64_t* p, const int64_t* left, bool on, int max_drafts,
+                               int max_rows, int64_t max_context) {
     Layout L;
     if (max_rows > 8) max_rows = 8;
-    for (int t = 0; t < gs && t < 8; ++t) {
+    if (gs > 8) gs = 8;
+    int live = 0, want[8] = {}, give[8] = {};
+    for (int t = 0; t < gs; ++t) {
+        if (!active[t]) continue;
+        ++live;
+        int64_t w = on ? (n_draft[t] < max_drafts ? n_draft[t] : max_drafts) : 0;
+        if (w > left[t] - 1) w = left[t] - 1;                       // keeping k rows emits k tokens
+        if (w > max_context - p[t] - 2) w = max_context - p[t] - 2; // ... and needs p + k + 1 <= max_context
+        want[t] = w > 0 ? (int) w : 0;
+    }
+    for (int budget = max_rows - live, more = 1; budget > 0 && more;) {
+        more = 0;
+        for (int t = 0; t < gs && budget > 0; ++t)
+            if (give[t] < want[t]) {
+                ++give[t];
+                --budget;
+                more = 1;
+            }
+    }
+    for (int t = 0; t < gs; ++t) {
         L.first[t] = -1;
         L.n[t] = 0;
         if (!active[t] || L.S >= max_rows) continue;
@@ -113,10 +143,10 @@ inline Layout piped_mtp_layout(int base, int gs, const bool* active, const bool*
         L.tok[L.S] = x[t];
         L.pos[L.S] = p[t];
         ++L.S;
-        if (on && draft_ready[t] && L.S < max_rows && p[t] + 3 <= max_context) {
+        for (int j = 0; j < give[t] && L.S < max_rows; ++j) {
             L.rows[L.S] = base + t;
-            L.tok[L.S] = draft[t];
-            L.pos[L.S] = p[t] + 1;
+            L.tok[L.S] = draft[t * 8 + j];
+            L.pos[L.S] = p[t] + 1 + j;
             ++L.S;
             L.drafts = true;
         }
@@ -126,12 +156,16 @@ inline Layout piped_mtp_layout(int base, int gs, const bool* active, const bool*
     return L;
 }
 
-/// A slot's accepted rows: 2 when it had a draft row, the target picked that draft after its token, and both tokens
-/// can be emitted; else 1 (as --batch-mtp's serial windows decide).
-inline int piped_mtp_keep(int n_rows, int32_t pick0, int32_t draft, bool pick0_eos, bool stop, int64_t produced,
-                          int64_t max_new, int64_t p, int64_t max_context) {
-    return n_rows >= 2 && pick0 == draft && !pick0_eos && !stop && produced + 2 <= max_new && p + 3 <= max_context ? 2
-                                                                                                                  : 1;
+/// A slot's accepted rows (1..n_rows): its token, then each draft the target picked after the row before it, while the
+/// pick is not an end token and the tokens can be emitted (as --batch-mtp's serial windows decide for one draft).
+/// `pick[j]` is row j's pick, `tok[j]` row j's token, `eos[j]` whether pick j ends the conversation.
+inline int piped_mtp_keep(int n_rows, const int32_t* pick, const int32_t* tok, const bool* eos, bool stop,
+                          int64_t produced, int64_t max_new, int64_t p, int64_t max_context) {
+    if (stop) return 1;
+    int k = 1;
+    while (k < n_rows && pick[k - 1] == tok[k] && !eos[k - 1] && produced + k + 1 <= max_new && p + k + 2 <= max_context)
+        ++k;
+    return k;
 }
 
 }  // namespace strata::program::batch_groups

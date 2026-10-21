@@ -108,7 +108,7 @@ public:
     /// draft() split in two (STRATA_PIPED_MTP): the round is launched and draft_poll returns 1 once its drafts are in
     /// `drafts` (0: still running, -1: an error).  Greedy drafts only (no min_p); no PLE prefetch.
     bool draft_launch(int T, const int32_t* tokens, int64_t p, int a, std::string& err);
-    int draft_poll(int32_t* drafts, std::string& err);
+    int draft_poll(int32_t* drafts, std::string& err, int* n_drafts = nullptr);
     bool draft_live() const { return async_live_; }
     /// Capture the round graphs for T = 1..max_T and the step graphs now, with nothing in flight.
     bool prepare_rounds(int max_T, std::string& err);
