@@ -13449,6 +13449,7 @@ int main(int argc, char** argv) {
         std::vector<Clock::time_point> adm_queued_at(bs.size());
         int adm_reading = -1;               // the slot whose prompt is being read
         std::vector<std::atomic<bool>*> adm_stop_of(bs.size(), nullptr);   // STRATA_SLOT_ADMIT_MULTI: a slot's queued read
+        size_t adm_held_n = 0;              // STRATA_SLOT_ADMIT_MULTI: reads that gave way, to go on in the next run
         std::atomic<bool> adm_stop{false};  // BSTOP for it
         bool adm_active = false;            // a run of admissions (reads and the loan between them) is under way
         struct AdmReq {
@@ -13546,7 +13547,7 @@ int main(int argc, char** argv) {
                         if (c.imgs.empty()) other = std::max(other, pre(c.ids));
                     other = std::max<int64_t>(other, (int64_t) conversations.best(r.ids, {}, cvec_cached).tokens);
                 }
-                direct = strata::program::slot_admit_direct(batch_on() || pipe_inflight() || adm_active, false, own,
+                direct = strata::program::slot_admit_direct(batch_on() || pipe_inflight() || adm_active || adm_held_n > 0, false, own,
                                                              other, adm_gain);
                 if (trace)
                     std::fprintf(stderr, "strata trace: BGEN %d: %s (the slot holds %lld of %lld tokens, another cache "
@@ -13664,7 +13665,7 @@ int main(int argc, char** argv) {
             std::mutex mu;
             std::string err;
             std::thread setup;
-            bool setup_ok = true, queued = false;
+            bool setup_ok = true, queued = false, withdrawn = false;
             std::vector<ConvCheckpoint> parts;
             std::vector<char> part_ok;
             Clock::time_point t_read{};
@@ -14041,6 +14042,15 @@ int main(int argc, char** argv) {
             const char* v = std::getenv("STRATA_SLOT_ADMIT_MULTI");
             return v != nullptr && std::atoi(v) != 0;
         }();
+        // admissions a run gave way with (their unstarted pieces withdrawn): their slots keep what was read and stay
+        // `reading`; the next run goes on with them.  A run gives way when a line that is not read beside the slots
+        // waits (an old-way admission, a solo request, a command), or after STRATA_SLOT_ADMIT_RUN_S seconds (20; 0 = no
+        // cap) so the control lines come round
+        std::vector<std::unique_ptr<AdmJob>> adm_held;
+        static const double adm_run_cap_s = [] {
+            const char* v = std::getenv("STRATA_SLOT_ADMIT_RUN_S");
+            return v != nullptr ? std::max(0.0, std::atof(v)) : 20.0;
+        }();
         auto adm_multi_run = [&](const std::string& first, int& n_adm) -> bool {
             read_share_set(false);
             struct Block {
@@ -14054,9 +14064,10 @@ int main(int argc, char** argv) {
                 std::vector<std::unique_ptr<AdmJob>>& l;
                 std::vector<std::atomic<bool>*>& stops;
                 ~Joins() {
-                    for (auto& j : l)
+                    for (auto& j : l) {
                         if (j->setup.joinable()) j->setup.join();
-                    for (auto& x : stops) x = nullptr;
+                        stops[(size_t) j->r.slot] = nullptr;
+                    }
                 }
             } joins{live, adm_stop_of};
             auto in_flight = [&] {
@@ -14173,10 +14184,12 @@ int main(int argc, char** argv) {
             auto queue_pieces = [&](AdmJob& j) {
                 const int b = j.r.slot;
                 j.queued = true;
-                j.t_read = Clock::now();
-                j.rows0 = pipe_rows;
-                j.parts.assign(n_st, ConvCheckpoint{});
-                j.part_ok.assign(n_st, 0);
+                if (j.parts.empty()) {   // (a read going on after a pause keeps its start and its checkpoint parts)
+                    j.t_read = Clock::now();
+                    j.rows0 = pipe_rows;
+                    j.parts.assign(n_st, ConvCheckpoint{});
+                    j.part_ok.assign(n_st, 0);
+                }
                 const bool ck = j.turn_at > j.at;
                 std::vector<std::pair<int64_t, int64_t>> cuts;
                 for (int64_t a = j.at; a < j.n - 1;) {
@@ -14314,41 +14327,88 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 return true;
             };
-            if (!take(first)) return false;
+            if (!first.empty() && !take(first)) return false;
+            for (auto& j : adm_held) {   // the reads an earlier run gave way with: on from where they stopped
+                j->queued = false;
+                live.push_back(std::move(j));
+            }
+            const size_t resumed = adm_held.size();
+            adm_held.clear();
+            adm_held_n = 0;
+            struct HeldCount {
+                std::vector<std::unique_ptr<AdmJob>>& h;
+                size_t& n;
+                ~HeldCount() { n = h.size(); }
+            } held_count{adm_held, adm_held_n};
+            if (resumed > 0)
+                std::fprintf(stderr, "strata batch: %zu read%s beside the slots go%s on after giving way\n", resumed,
+                             resumed == 1 ? "" : "s", resumed == 1 ? "es" : "");
+            const auto t_start = Clock::now();
+            bool yielding = false;
             size_t seen = 0;
             for (;;) {
                 if (!pump_ok) return false;
                 std::vector<std::string> fresh;
-                bool more = false;
+                bool more = false, other = false;
                 {
                     std::unique_lock<std::mutex> lk(in_mu);
                     if (!(batch_on() || pipe_inflight()))
                         in_cv.wait_for(lk, std::chrono::milliseconds(1), [&] { return in_lines.size() != seen; });
                     adm_lines();
-                    while (!in_lines.empty() && !in_lines.front().empty() && in_lines.front()[0] == '\x01') {
+                    while (!yielding && !in_lines.empty() && !in_lines.front().empty() && in_lines.front()[0] == '\x01') {
                         fresh.push_back(in_lines.front().substr(1));
                         in_lines.pop_front();
                     }
+                    other = !in_lines.empty() && (in_lines.front().empty() || in_lines.front()[0] != '\x01');
                     seen = in_lines.size();
                 }
                 for (const std::string& l : fresh)
                     if (!take(l)) return false;
+                // give way: the pieces stage 0 has not started go back to their admissions, which stop where they are
+                const double run_s = std::chrono::duration<double>(Clock::now() - t_start).count();
+                if (!yielding && !live.empty() && (other || (adm_run_cap_s > 0.0 && run_s >= adm_run_cap_s))) {
+                    yielding = true;
+                    const auto back = sp.withdraw([](const strata::prefill::PromptJob&) { return true; });
+                    for (const auto& pj : back)
+                        for (auto& j : live)
+                            if (!pj->sessions.empty() && pj->sessions[0] == bslot_ss[0][(size_t) j->r.slot].get()) {
+                                j->at = j->withdrawn ? std::min(j->at, pj->pos0) : pj->pos0;   // (its pieces left: a suffix)
+                                j->withdrawn = true;
+                                j->inflight.fetch_sub(1);
+                                break;
+                            }
+                    std::fprintf(stderr, "strata batch: the reads beside the slots give way (%s, after %.0f s): %zu "
+                                         "piece%s back in line\n", other ? "another line waits" : "STRATA_SLOT_ADMIT_RUN_S",
+                                 run_s, back.size(), back.size() == 1 ? "" : "s");
+                }
                 for (auto& j : live)
                     if (!j->queued && j->set_up.load(std::memory_order_acquire)) {
                         if (j->setup.joinable()) j->setup.join();
-                        if (j->setup_ok && j->at < j->n - 1) queue_pieces(*j);
-                        else j->queued = true;   // (nothing to read, or its set-up failed: finished below)
+                        if (j->setup_ok && j->at < j->n - 1) {
+                            if (yielding) continue;   // (it waits for the next run)
+                            queue_pieces(*j);
+                        } else {
+                            j->queued = true;   // (nothing to read, or its set-up failed: finished below)
+                        }
                     }
                 for (auto it = live.begin(); it != live.end();) {
                     AdmJob& j = **it;
-                    if (j.queued && j.inflight.load() == 0) {
+                    if (j.queued && j.inflight.load() == 0 && !j.withdrawn) {
                         if (j.setup.joinable()) j.setup.join();
                         if (!finish(j)) return false;
+                        it = live.erase(it);
+                    } else if (yielding && j.inflight.load() == 0 && j.set_up.load(std::memory_order_acquire) &&
+                               (j.withdrawn || !j.queued)) {
+                        if (j.setup.joinable()) j.setup.join();   // stopped where its last piece ended: held
+                        j.queued = false;
+                        j.withdrawn = false;
+                        adm_held.push_back(std::move(*it));
                         it = live.erase(it);
                     } else {
                         ++it;
                     }
                 }
+                if (yielding && live.empty()) break;
                 if (live.empty()) {
                     std::lock_guard<std::mutex> lk(in_mu);
                     adm_lines();
@@ -14565,6 +14625,18 @@ int main(int argc, char** argv) {
         for (;;) {
             line_drain_ms = 0.0;
             bool adm_direct = false;   // STRATA_SLOT_ADMIT: this BGEN is read beside the slots (adm_run)
+            if (adm_held_n > 0) {   // reads that gave way go on, unless a line that is not read beside the slots waits
+                bool other = false;
+                {
+                    std::lock_guard<std::mutex> lk(in_mu);
+                    adm_lines();
+                    other = !in_lines.empty() && (in_lines.front().empty() || in_lines.front()[0] != '\x01');
+                }
+                if (!other) {
+                    if (!adm_run(std::string())) return 1;
+                    continue;
+                }
+            }
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
                     if (!(piped ? pump(true) : batch_step())) return 1;
