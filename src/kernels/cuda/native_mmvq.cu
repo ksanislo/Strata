@@ -39,6 +39,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -2829,6 +2830,193 @@ void native_q5_0_f32(const void* weights, const float* x, void* scratch_q8_1,
     small_f32<Q50Block, 4>(weights, x, scratch_q8_1, y, n_in, n_out, ncols, stream);
 }
 
+namespace {
+#if !defined(__HIPCC__)
+// STRATA_SM75_Q8G=1 (Turing, opt-in): Q8_0 at 2-8 columns on the GGUF layout, activations staged in shared memory once
+// per workgroup, a warp per R rows; lane l's chunk m is thread 32 (m % 4) + l's pass m / 4 of the exact kernel: bitwise.
+constexpr int Q8G_WARPS = 8;
+constexpr std::size_t Q8G_MAX_SMEM = 48 * 1024;
+int g_q8g_force = -1;      // native_q8_0_turing_tune: -1 the env switch, 0 off, 1 on (any CUDA card)
+int g_q8g_rows = 0;        // rows a warp (0: STRATA_SM75_Q8G_ROWS, default 2)
+int g_q8g_min_out = -1;    // smallest n_out taken (-1: STRATA_SM75_Q8G_MIN_OUT, default 2048)
+
+std::size_t q8g_smem(int ncols, int n_in) { return std::size_t(ncols) * (std::size_t(n_in) + std::size_t(n_in / 32) * sizeof(float)); }
+
+int q8g_env_int(const char* name, int dflt) {
+    const char* v = std::getenv(name);
+    return v != nullptr && v[0] != '\0' ? std::atoi(v) : dflt;
+}
+
+bool q8g_on() {
+    if (g_q8g_force >= 0) return g_q8g_force > 0;
+    static const bool env = [] {
+        const bool yes = q8g_env_int("STRATA_SM75_Q8G", 0) != 0;
+        if (yes) std::fprintf(stderr, "strata: STRATA_SM75_Q8G=1: Q8_0 GEMVs at 2-8 columns on the Turing row kernel\n");
+        return yes;
+    }();
+    if (!env) return false;
+    static int ok[16] = {};   // per device: 1 a Turing card (or STRATA_EMULATE_CC=75), -1 not
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) { cudaGetLastError(); return false; }
+    if (ok[dev] == 0) {
+        int major = 0, minor = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        cudaGetLastError();
+        ok[dev] = strata::is_sm75(major, minor) ? 1 : -1;
+    }
+    return ok[dev] > 0;
+}
+
+int q8g_rows(int ncols) {
+    static const int env = q8g_env_int("STRATA_SM75_Q8G_ROWS", 2);
+    int r = g_q8g_rows > 0 ? g_q8g_rows : env;
+    r = r >= 4 ? 4 : r >= 2 ? 2 : 1;
+    return ncols > 4 && r > 2 ? 2 : r;   // 5-8 columns: the accumulators of 4 rows would spill
+}
+
+bool q8g_takes(int n_in, int n_out, int ncols) {
+    if (ncols < 2 || ncols > MAX_NCOLS || !g_multi_exact || n_in <= 0 || n_in % 32 != 0 || n_out <= 0 || !q8g_on())
+        return false;
+    static const int env_min = q8g_env_int("STRATA_SM75_Q8G_MIN_OUT", 2048);
+    return n_out >= (g_q8g_min_out >= 0 ? g_q8g_min_out : env_min) && q8g_smem(ncols, n_in) <= Q8G_MAX_SMEM;
+}
+
+template<int NCOLS, int R>
+__launch_bounds__(Q8G_WARPS * WARP)
+__global__ void q8g_kernel(const Q80Block* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y,
+                           int n_in, int n_out) {
+    extern __shared__ int4 q8g_smem_buf[];
+    int* sq = reinterpret_cast<int*>(q8g_smem_buf);                           // [NCOLS][n_in / 4]
+    float* sd = reinterpret_cast<float*>(sq + std::size_t(NCOLS) * (n_in / 4));   // [NCOLS][n_in / 32]
+    const int nb = n_in / 32;
+    for (int i = int(threadIdx.x); i < NCOLS * nb * 8; i += Q8G_WARPS * WARP) {   // column-major blocks, 8 ints each
+        const Q81Block& b = x[i >> 3];
+        sq[i] = reinterpret_cast<const int*>(b.qs)[i & 7];
+        if ((i & 7) == 0) sd[i >> 3] = __low2float(b.ds);
+    }
+    __syncthreads();
+    const int lane = int(threadIdx.x) & (WARP - 1);
+    const int kqs = 2 * (lane % 4);
+    const int nm = (nb + 7) / 8;   // chunks of 8 blocks, 4 to a pass of the exact layout
+    for (int grp = int(blockIdx.x) * Q8G_WARPS + (int(threadIdx.x) >> 5); grp * R < n_out;
+         grp += int(gridDim.x) * Q8G_WARPS) {
+        const int row0 = grp * R;
+        float acc[4][R][NCOLS];
+#pragma unroll
+        for (int v = 0; v < 4; ++v)
+#pragma unroll
+            for (int i = 0; i < R; ++i)
+#pragma unroll
+                for (int j = 0; j < NCOLS; ++j) acc[v][i][j] = 0.0f;
+        for (int m0 = 0; m0 < nm; m0 += 4) {
+#pragma unroll
+            for (int v = 0; v < 4; ++v) {
+                const int kbx = 8 * (m0 + v) + lane / 4;
+                if (kbx < nb) {
+                    int2 u[NCOLS];
+                    float d1[NCOLS];
+#pragma unroll
+                    for (int j = 0; j < NCOLS; ++j) {
+                        u[j] = *reinterpret_cast<const int2*>(sq + std::size_t(j) * (n_in / 4) + 8 * kbx + kqs);
+                        d1[j] = sd[j * nb + kbx];
+                    }
+#pragma unroll
+                    for (int i = 0; i < R; ++i) {
+                        const int row = min(row0 + i, n_out - 1);   // a partial last group recomputes its last row
+                        const Q80Block* b = w + std::size_t(row) * nb + kbx;
+                        const int v0 = load_int_b2(b->qs, kqs);
+                        const int v1 = load_int_b2(b->qs, kqs + 1);
+                        const float d0 = b->d;
+#pragma unroll
+                        for (int j = 0; j < NCOLS; ++j) {
+                            int sumi = 0;
+                            sumi = STRATA_DP4A(v0, u[j].x, sumi);
+                            sumi = STRATA_DP4A(v1, u[j].y, sumi);
+                            acc[v][i][j] += d0 * d1[j] * float(sumi);
+                        }
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < R; ++i)
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j) {
+                float s = acc[0][i][j];
+                s += acc[1][i][j];
+                s += acc[2][i][j];
+                s += acc[3][i][j];
+                s = warp_sum(s);
+                if (lane == 0 && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = s;
+            }
+    }
+}
+
+template<int NCOLS, int R>
+void q8g_launch_r(const Q80Block* w, const Q81Block* x, float* y, int n_in, int n_out, cudaStream_t s) {
+    // workgroups resident per SM for this kernel (registers, threads) by device, then capped by shared memory
+    static std::atomic<int> occ[16];
+    static std::atomic<int> sms[16];
+    static std::atomic<int> smem_sm[16];
+    int dev = 0;
+    cudaGetDevice(&dev);
+    dev = dev >= 0 && dev < 16 ? dev : 0;
+    if (occ[dev].load() == 0) {
+        int n = 0, m = 0, k = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, q8g_kernel<NCOLS, R>, Q8G_WARPS * WARP, 0);
+        cudaDeviceGetAttribute(&m, cudaDevAttrMultiProcessorCount, dev);
+        cudaDeviceGetAttribute(&k, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev);
+        cudaGetLastError();
+        sms[dev] = m > 0 ? m : 40;
+        smem_sm[dev] = k > 0 ? k : 65536;
+        occ[dev] = n > 0 ? n : 1;
+    }
+    const std::size_t smem = q8g_smem(NCOLS, n_in);
+    const int by_smem = int(std::size_t(smem_sm[dev].load()) / (smem + 1024));   // 1 KB a workgroup reserved
+    const int per_sm = std::max(1, std::min(occ[dev].load(), by_smem));
+    const int groups = (n_out + R - 1) / R;
+    const int grid = std::min((groups + Q8G_WARPS - 1) / Q8G_WARPS, sms[dev].load() * per_sm);
+    q8g_kernel<NCOLS, R><<<unsigned(grid), Q8G_WARPS * WARP, smem, s>>>(w, x, y, n_in, n_out);
+}
+
+template<int NCOLS>
+void q8g_launch_n(const Q80Block* w, const Q81Block* x, float* y, int n_in, int n_out, cudaStream_t s) {
+    switch (q8g_rows(NCOLS)) {
+        case 1: q8g_launch_r<NCOLS, 1>(w, x, y, n_in, n_out, s); break;
+        case 4: if constexpr (NCOLS <= 4) q8g_launch_r<NCOLS, 4>(w, x, y, n_in, n_out, s); break;
+        default: q8g_launch_r<NCOLS, 2>(w, x, y, n_in, n_out, s); break;
+    }
+}
+
+// true when the call ran here
+bool q8g_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
+    if (!q8g_takes(n_in, n_out, ncols)) return false;
+    validate_pointer(weights);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    const auto* w = static_cast<const Q80Block*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const auto s = static_cast<cudaStream_t>(stream);
+    switch (ncols) {
+        case 2: q8g_launch_n<2>(w, x, y, n_in, n_out, s); break;
+        case 3: q8g_launch_n<3>(w, x, y, n_in, n_out, s); break;
+        case 4: q8g_launch_n<4>(w, x, y, n_in, n_out, s); break;
+        case 5: q8g_launch_n<5>(w, x, y, n_in, n_out, s); break;
+        case 6: q8g_launch_n<6>(w, x, y, n_in, n_out, s); break;
+        case 7: q8g_launch_n<7>(w, x, y, n_in, n_out, s); break;
+        default: q8g_launch_n<8>(w, x, y, n_in, n_out, s); break;
+    }
+    launch_check();
+    return true;
+}
+#else
+bool q8g_takes(int, int, int) { return false; }
+bool q8g_mmvq(const void*, const void*, float*, int, int, int, void*) { return false; }
+#endif
+}  // namespace
+
 template<int NCOLS>
 void q8_0_pair_launch(const Q80Block* w1, const Q80Block* w2, const Q81Block* x, float* y1, float* y2, int n_in, int n_out,
                       cudaStream_t s) {
@@ -2849,6 +3037,7 @@ bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void*
         return false;
     const auto& reg = q8_packed_registry();
     if (reg.count(w1) || reg.count(w2)) return false;
+    if (q8g_takes(n_in, n_out, ncols)) return false;   // STRATA_SM75_Q8G: the two calls take the Turing kernel
     const auto* a = static_cast<const Q80Block*>(w1);
     const auto* b = static_cast<const Q80Block*>(w2);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
@@ -2869,8 +3058,20 @@ bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void*
 void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
     if (q8_packed_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;   // STRATA_Q8_PACKED=1 tensors
+    if (q8g_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;         // STRATA_SM75_Q8G=1
     small_mmvq<Q80Block, 8>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
 }
+
+void native_q8_0_turing_tune(int force, int rows, int min_out) {
+#if !defined(__HIPCC__)
+    g_q8g_force = force;
+    g_q8g_rows = rows;
+    g_q8g_min_out = min_out;
+#else
+    (void) force; (void) rows; (void) min_out;
+#endif
+}
+bool native_q8_0_turing_takes(int n_in, int n_out, int ncols) { return q8g_takes(n_in, n_out, ncols); }
 
 void native_q8_0_f32(const void* weights, const float* x, void* scratch_q8_1,
                       float* y, int n_in, int n_out, int ncols, void* stream) {
