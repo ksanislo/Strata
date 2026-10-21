@@ -8131,6 +8131,24 @@ int main(int argc, char** argv) {
             if (split_share)
                 strata::prefill::Prefill::set_share_default_max(short_reads::share_max(std::getenv("STRATA_PREFILL_CPU_SHARE_MAX")));
         }
+        // ... and beside --batch slots, per read: armed here, a read takes the pools only while no slot decodes (read_share)
+        bool rt_share = false;
+        if (short_reads_on && multi_gpu && o.batch > 0 && !o.no_pool) {
+            int64_t held = xcache.slots();
+            for (auto& st : stages) held += st->cache.slots();
+            const bool expl = std::getenv("STRATA_PREFILL_CPU_SHARE") != nullptr;
+            rt_share = expl || (short_reads::split_share_default(
+                                    true, true, true, false,
+                                    strata::prefill::share_rules::default_share_has_work(held, g.n_layers * g.n_expert), true) &&
+                                share_default_ok());
+            if (rt_share) {
+                if (!expl)
+                    strata::prefill::Prefill::set_share_default_max(short_reads::share_max(std::getenv("STRATA_PREFILL_CPU_SHARE_MAX")));
+                strata::prefill::Prefill::arm_cpu_share(true, true);
+                std::fprintf(stderr, "strata serve: STRATA_SHORT_READS beside --batch: a prompt read takes the CPU pool%s while "
+                                     "no slot decodes\n", std::getenv("STRATA_STAGE_SERVE") ? "s (each stage its own)" : "");
+            }
+        }
         strata::prefill::Prefill::arm_cpu_share(share_pool,
                                                 (share_pool && stages.empty() && !multi_gpu && share_has_work) || split_share);
         void* borrow = nullptr;
@@ -11226,6 +11244,10 @@ int main(int argc, char** argv) {
             int first[strata::kernels::kVerifyMaxT] = {}, active[strata::kernels::kVerifyMaxT] = {};
             static size_t next_slot = 0;
             // Each MTP slot uses two rows; rotate slots when more than four are active.
+            if (!lazy_fly.empty() && !in_prompt_read && !lazy_land(false, err)) {   // (quiet between these windows)
+                std::printf("ERR %s\n", err.c_str());
+                return false;
+            }
             int A = 0;
             for (size_t offset = 0; offset < bs.size() && S + (batch_mtp ? 2 : 1) <= strata::kernels::kVerifyMaxT; ++offset) {
                 const int b = (int) ((next_slot + offset) % bs.size());
@@ -11552,6 +11574,11 @@ int main(int argc, char** argv) {
                 ++bt_windows;
                 G.inflight = false;
                 report_batch_window(G.S, G.active, !pipe_inflight() && !batch_on(), G.started);
+            }
+            // STRATA_SHORT_READS: copies back landed while nothing is in flight (the table goes to every card)
+            if (!lazy_fly.empty() && !conc_serving && !in_prompt_read && !pipe_inflight()) {
+                std::string le;
+                if (!lazy_land(false, le)) { std::printf("ERR %s\n", le.c_str()); return false; }
             }
             // start waiting groups on free stages, the longest waiting first; a new step on stage 0 round-robin
             for (int k = n_pipe - 1; k >= 0; --k) {
@@ -13030,7 +13057,9 @@ int main(int argc, char** argv) {
             const char* lazy_why = nullptr;
             if (short_reads_on) {
                 short_reads::LazySetup ls;
-                ls.batch = o.batch > 0;
+                // --batch: a loan is lent again only after its copies landed (lend), and a request lands them before it ends
+                // (so before the slots' windows go on); slot windows meanwhile see those experts missing (the pool computes them)
+                ls.batch = false;
                 ls.pipe = pipe;
                 ls.kv_grow = kvg.on || o.vram_elastic;
                 ls.peer = peer.valid();
@@ -13192,6 +13221,15 @@ int main(int argc, char** argv) {
                 const char* v = std::getenv("STRATA_BATCH_DECODE_SHARE");
                 return v != nullptr ? std::max(0.0, std::atof(v)) : 0.5;
             }();
+            // STRATA_SHORT_READS beside --batch: the CPU share is a read's only while no slot decodes and no window is in
+            // flight (the pools serve the slots' windows otherwise; none can start before such a read ends or pauses).
+            // Called on the main thread before a read.
+            auto read_share = [&]() {
+                if (!rt_share) return;
+                const bool on = !batch_on() && !pipe_inflight();
+                sp.set_cpu_pool(on ? &pool : nullptr);
+                for (size_t i = 0; i < stages.size(); ++i) stages[i]->sp.set_cpu_pool(on ? &pool : nullptr);
+            };
             bool batch_fatal = false;
             int64_t il_parts = 0;   // the slots' windows run between this prompt's chunks
             double il_ms = 0;
@@ -13249,6 +13287,7 @@ int main(int argc, char** argv) {
                 } seg_plan_scope{seg_plan};
                 auto run = [&](int64_t q, int64_t r) -> bool {
                     if (planned) sp.force_chunk(plan.chunk, plan_single, plan.chunked);
+                    read_share();
                     return sp.run(ids.data() + q, r - q, q, e);
                 };
                 // (a layer split reads its stages as a pipeline over one run's chunks: beside slots a chunk at a time, with
@@ -13473,6 +13512,7 @@ int main(int argc, char** argv) {
                         std::string read_err;
                         in_prompt_read = true;
                         sp.stop_at_chunk = [&] { return want_yield.load(std::memory_order_acquire) >= 0; };
+                        read_share();
                         std::thread reader([&] {
                             conc_thread_cpus();
                             try {   // (an exception leaving a std::thread ends the process: a failed read instead)
