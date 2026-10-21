@@ -11909,13 +11909,15 @@ int main(int argc, char** argv) {
         // card k is quiet (no window in flight there, no prompt chunk being read): idle slots keep only what their
         // conversations hold (one that keeps none: cell 0, state reset), the budget is topped up to what the decoding
         // slots need next, and what is left over goes back to the expert cache
-        auto elastic_idle = [&](size_t k, bool may_give) {
+        // `skip`: the slot an admission is filling (idle and not yet a cache: it would be cut to cell 0 under its copy)
+        auto elastic_idle = [&](size_t k, bool may_give, int skip) {
             if (!eslots_on) return;
             const strata::core::OnDevice on_k(eslot_dev(k));
             for (size_t b = 0; b < bs.size(); ++b) {
                 const BSlot& sl = bs[b];
                 strata::core::SessionState& u = *bslot_ss[k][b];
                 if (sl.active || sl.reading || u.slot_cells < 0) continue;   // (STRATA_SLOT_ADMIT: a read writes it)
+                if ((int) b == skip || (int) b == admit_slot) continue;
                 const bool keeps = sl.cached || sl.partial;
                 const int64_t keep = keeps ? (int64_t) sl.ids.size() + 4 : 1;
                 if (u.slot_cells <= keep) continue;
@@ -11950,7 +11952,7 @@ int main(int argc, char** argv) {
                     BSlot& sj = bs[(size_t) j];
                     bool big = false;
                     for (const auto& v : bslot_ss) big = big || v[(size_t) j]->slot_cells > 1;
-                    if (j == b || sj.active || sj.reading || sj.partial != (pass == 1) || !big) continue;
+                    if (j == b || j == admit_slot || sj.active || sj.reading || sj.partial != (pass == 1) || !big) continue;
                     if (slot_drop_save) slot_drop_save(j, "it gives its memory to another slot");
                     for (size_t k = 0; k < bslot_ss.size(); ++k) {
                         strata::core::SessionState& u = *bslot_ss[k][(size_t) j];
@@ -11985,7 +11987,7 @@ int main(int argc, char** argv) {
             for (int j = 0; j < (int) bs.size(); ++j)
                 if (j != b && bs[(size_t) j].active)
                     (void) slot_fit(j, bs[(size_t) j].p + 2 + eslot_step, false, all_quiet);
-            for (size_t k = 0; k < bslot_ss.size(); ++k) elastic_idle(k, true);
+            for (size_t k = 0; k < bslot_ss.size(); ++k) elastic_idle(k, true, b);
             std::fprintf(stderr, "strata batch: elastic slot %d holds %lld cells: %s\n", b, (long long) upto,
                          slot_mem_note(b).c_str());
             return true;
@@ -12120,7 +12122,7 @@ int main(int argc, char** argv) {
             std::vector<uint8_t> e_hold(bs.size(), 0);
             if (eslots_on) {
                 const std::function<bool(size_t)> none = [](size_t) { return false; };
-                for (size_t k = 0; k < bslot_ss.size(); ++k) elastic_idle(k, !in_prompt_read);
+                for (size_t k = 0; k < bslot_ss.size(); ++k) elastic_idle(k, !in_prompt_read, -1);
                 for (int b = 0; b < (int) bs.size(); ++b)
                     if (bs[(size_t) b].active)
                         e_hold[(size_t) b] = slot_grow_or_end(b, bs[(size_t) b].p + (batch_mtp ? 3 : 2),
@@ -12746,7 +12748,7 @@ int main(int argc, char** argv) {
                 for (int k = 0; k < n_pipe; ++k)
                     if (eidle_due[(size_t) k] && stage_group[(size_t) k] < 0) {
                         eidle_due[(size_t) k] = 0;
-                        elastic_idle((size_t) k, !in_prompt_read);
+                        elastic_idle((size_t) k, !in_prompt_read, -1);
                     }
             if (piped_mtp && !pm_collect()) return false;
             // start waiting groups on free stages, the longest waiting first; a new step on stage 0 round-robin
