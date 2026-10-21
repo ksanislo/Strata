@@ -56,6 +56,9 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst);
 /// From how many tokens native_gu_rows gives this gate/up type to a multi-token kernel (#152; ggml-cpu's per-token dot
 /// below that).  1: a token's rows are the same alone and in any group.
 int native_gu_mt_min(int gu_type);
+/// The AVX-only CPUs' Q4_K/Q5_1/Q8_0 rows (kq_avx1.hpp): 0 = ggml's dot (an AVX2 CPU, or STRATA_CPU_KERNELS=old),
+/// 1 = kq128 bit-exact (the default there), 2 = kq128 fast (STRATA_CPU_KERNELS=fast).
+int kq128_mode();
 /// ff[t][r] = silu(gate_r . a[t]) * (up_r . a[t]) for rows r in [r0, r1), `nt` tokens.
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1);
