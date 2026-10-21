@@ -13506,6 +13506,17 @@ int main(int argc, char** argv) {
                     if (p[(size_t) i] != (int32_t) j.r.ids[(size_t) i]) return false;
                 return true;
             };
+            // --session-dir: the slot's kept conversation is saved before this prompt overwrites it (as copy_to_slot's
+            // admissions: not when the prompt continues it or one of its turn checkpoints); the save needs a drain
+            if (sdir) {
+                const std::vector<int32_t> next(j.r.ids.begin(), j.r.ids.end());
+                bool from_this = false;
+                for (const ConvCheckpoint& c : sl.checks) from_this = from_this || (c.imgs.empty() && pre(c.ids));
+                if (sl.cached && !sl.active && !strata::program::slot_ids_continue(next, sl.ids) && !from_this) {
+                    if (!pipe_drain()) return AdmEnd::fatal;
+                    persist_slot(b, from_this, next, false, "an admission beside the slots takes it");
+                }
+            }
             if (o.prompt_cache > 0 && !nan_flush && !sl.tainted && !sl.img && sl.cvec == cvec_cached) {
                 if (sl.cached && pre(sl.ids)) j.resume = (int64_t) sl.ids.size();
                 for (const ConvCheckpoint& c : sl.checks)
