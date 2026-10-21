@@ -13544,10 +13544,7 @@ int main(int argc, char** argv) {
                     if (live_ok && live_imgs.empty()) other = std::max(other, pre(live));
                     for (const ConvCheckpoint& c : checks)
                         if (c.imgs.empty()) other = std::max(other, pre(c.ids));
-                    // a parked conversation goes into the slot as well (adm_prepare) when it is whole
-                    const auto pm = conversations.best(r.ids, {}, cvec_cached);
-                    int64_t& to = pm.live && (!use_mtp || batch_mtp) ? own : other;
-                    to = std::max<int64_t>(to, (int64_t) pm.tokens);
+                    other = std::max<int64_t>(other, (int64_t) conversations.best(r.ids, {}, cvec_cached).tokens);
                 }
                 direct = strata::program::slot_admit_direct(batch_on() || pipe_inflight() || adm_active, false, own,
                                                              other, adm_gain);
@@ -13672,7 +13669,6 @@ int main(int argc, char** argv) {
             std::vector<char> part_ok;
             Clock::time_point t_read{};
             int64_t rows0 = 0;
-            std::optional<strata::core::SavedConversation> incoming;   // a parked conversation restored into the slot
         };
         enum class AdmEnd { done, paused, fatal, ready };
         int adm_main_dev = 0;
@@ -13694,42 +13690,6 @@ int main(int argc, char** argv) {
                 }
             }
             return false;
-        };
-        // A parked conversation (the conversation cache) as a slot's start: its images go into the slot's sessions as
-        // the request path restores them into the main ones - each stage its own, the draft K/V with the drafter's
-        // stage (the slot's drafter: --batch-mtp; without one an image that carries a draft does not validate)
-        auto adm_parked_draft = [&](int b, size_t k) -> const strata::core::QsaState* {   // k: 0 = the first stage
-            if (!use_mtp || !batch_mtp) return nullptr;
-            const size_t n_st = stages.size();
-            const bool here = n_st == 0 || mtp_first ? k == 0 : k == n_st;
-            return here ? &slot_mtp[(size_t) b]->kv_state() : nullptr;
-        };
-        auto adm_parked_fits = [&](const strata::core::SavedConversation& c, int b) -> bool {
-            if (c.stage_images.size() != stages.size() || c.cvec != cvec_cached) return false;
-            std::string e;
-            if (!strata::core::conversation_snapshot_validate(c, *bslot_ss[0][(size_t) b], g, adm_parked_draft(b, 0), e))
-                return false;
-            for (size_t k = 0; k < stages.size(); ++k) {
-                const strata::core::OnDevice on(stages[k]->dev);
-                if (!strata::core::conversation_snapshot_validate(c.stage_images[k], *bslot_ss[k + 1][(size_t) b], g,
-                                                                  adm_parked_draft(b, k + 1), e))
-                    return false;
-            }
-            return true;
-        };
-        // (on the set-up / read thread) false: a transfer failed and the slot's state is partial
-        auto adm_restore_parked = [&](const strata::core::SavedConversation& c, int b, std::string& e) -> bool {
-            for (size_t k = 0; k <= stages.size(); ++k) {
-                const strata::core::OnDevice on(k == 0 ? adm_main_dev : stages[k - 1]->dev);
-                const strata::core::SavedConversation& img = k == 0 ? c : c.stage_images[k - 1];
-                if (strata::core::conversation_snapshot_restore(img, *bslot_ss[k][(size_t) b], g, adm_parked_draft(b, k), e) !=
-                        strata::core::ConversationRestore::restored ||
-                    cudaDeviceSynchronize() != cudaSuccess) {
-                    if (e.empty()) e = "restoring a parked conversation into the slot failed";
-                    return false;
-                }
-            }
-            return true;
         };
         std::function<bool()> adm_quiet;   // STRATA_SLOT_ADMIT_MULTI: until no queued read is in flight
         // a job's first step (main thread): refused (BRE, done), or the slot set up to be read into
@@ -13791,20 +13751,6 @@ int main(int argc, char** argv) {
                         j.resume = (int64_t) c.ids.size();
                         j.ck = &c;
                     }
-            }
-            // a parked conversation holding more of this prompt than the slot: it moves into the slot (restored before
-            // the read), instead of the old way's restore into the main sessions and copy into the slot
-            if (o.prompt_cache > 0 && !nan_flush && conversations.enabled() && (!use_mtp || batch_mtp)) {
-                const auto m = conversations.best(j.r.ids, {}, cvec_cached);
-                const strata::core::SavedConversation* c = m.tokens > j.resume ? conversations.find(m.serial) : nullptr;
-                if (c != nullptr && m.live && m.tokens <= n - 1 && (int64_t) c->live.ids.size() == m.tokens &&
-                    adm_parked_fits(*c, b)) {
-                    j.incoming.emplace(conversations.take(m.index));
-                    j.resume = m.tokens;
-                    j.ck = nullptr;
-                    std::fprintf(stderr, "strata batch: slot %d starts from a parked conversation (%lld tokens)\n", b,
-                                 (long long) m.tokens);
-                }
             }
             j.at = j.resume;
             j.turn_at = o.prompt_cache > 0 && j.r.ckpt
@@ -13940,12 +13886,7 @@ int main(int argc, char** argv) {
             // last token - or up to the chunk where a shorter admission takes over
             auto read = [&](std::string& err) -> bool {
                 if (!j.started) {
-                    if (dr != nullptr) {   // (a parked image restores its K/V too)
-                        const strata::core::OnDevice on(dr->device());
-                        if (!dr->idle(err)) return false;
-                    }
-                    if (j.incoming && !adm_restore_parked(*j.incoming, b, err)) return false;
-                    for (size_t k = 0; k < n_st && !j.incoming; ++k) {
+                    for (size_t k = 0; k < n_st; ++k) {
                         const strata::core::OnDevice on(k == 0 ? adm_main_dev : stages[k - 1]->dev);
                         strata::core::SessionState& x = *bslot_ss[k][(size_t) b];
                         if (j.ck != nullptr) {
@@ -13965,7 +13906,6 @@ int main(int argc, char** argv) {
                         dr->set_prompt_len(n);
                     }
                     j.ck = nullptr;
-                    j.incoming.reset();
                     j.started = true;
                 }
                 for (size_t k = 0; k < n_st; ++k) {
@@ -14196,31 +14136,22 @@ int main(int argc, char** argv) {
                     bool ok = true;
                     try {
                         strata::core::MtpDrafter* dr = batch_mtp ? slot_mtp[b].get() : nullptr;
-                        if (dr != nullptr) {   // (a parked image restores its K/V too)
-                            const strata::core::OnDevice on(dr->device());
-                            ok = dr->idle(e2);
-                        }
-                        if (ok && jr.incoming) {
-                            ok = adm_restore_parked(*jr.incoming, (int) b, e2);
-                            jr.incoming.reset();
-                        }
-                        for (size_t k = 0; k < n_st && ok && !jr.incoming && jr.ck != nullptr; ++k) {
-                            const strata::core::OnDevice on(k == 0 ? adm_main_dev : stages[k - 1]->dev);
-                            if (!checkpoint_restore(k == 0 ? *jr.ck : jr.ck->stage_parts[k - 1], *bslot_ss[k][b], g)) {
-                                ok = false;
-                                e2 = "restoring the slot's turn checkpoint failed";
-                            }
-                        }
-                        for (size_t k = 0; k < n_st && ok && jr.ck == nullptr && jr.resume == 0; ++k) {
+                        for (size_t k = 0; k < n_st && ok; ++k) {
                             const strata::core::OnDevice on(k == 0 ? adm_main_dev : stages[k - 1]->dev);
                             strata::core::SessionState& x = *bslot_ss[k][b];
-                            strata::core::session_zero(x, g, nullptr, (void*) stage_stream(k));
-                            ok = cudaStreamSynchronize(stage_stream(k)) == cudaSuccess;
-                            if (!ok) e2 = "zeroing the slot failed";
+                            if (jr.ck != nullptr) {
+                                ok = checkpoint_restore(k == 0 ? *jr.ck : jr.ck->stage_parts[k - 1], x, g);
+                                if (!ok) e2 = "restoring the slot's turn checkpoint failed";
+                            } else if (jr.resume == 0) {
+                                strata::core::session_zero(x, g, nullptr, (void*) stage_stream(k));
+                                ok = cudaStreamSynchronize(stage_stream(k)) == cudaSuccess;
+                                if (!ok) e2 = "zeroing the slot failed";
+                            }
                         }
                         if (ok && dr != nullptr) {   // the drafter's K/V below `resume` is what it held (stale is allowed)
                             const strata::core::OnDevice on(dr->device());
-                            if (jr.resume > 0) dr->kv_restore(jr.resume);
+                            ok = dr->idle(e2);
+                            if (ok && jr.resume > 0) dr->kv_restore(jr.resume);
                             dr->set_prompt_len(jr.n);
                         }
                         strata::core::SessionState& x0 = *bslot_ss[0][b];
