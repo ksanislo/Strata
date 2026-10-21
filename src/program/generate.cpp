@@ -16326,6 +16326,9 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata serve: PFMULTI skipped: slot %d is decoding\n", b);
                         return true;
                     }
+                // STRATA_ELASTIC_SLOTS: each slot backed for the prompt first (their conversations are dropped anyway)
+                for (int b = 0; b < N && eslots_on; ++b)
+                    if (!slot_admit_fit(b, len, err)) return false;
                 // the first stage's PLE for the slots' sessions: the main one's table, weights and consts, each slot's own
                 // history and predecessors, and a scratch of the reads' own (as STRATA_SLOT_ADMIT wires it)
                 static float* pfm_ple_scratch = nullptr;
