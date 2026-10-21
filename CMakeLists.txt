@@ -310,6 +310,11 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(prefill_plan_test PRIVATE include)
   add_test(NAME prefill_plan_test COMMAND prefill_plan_test)
 
+  # STRATA_SHORT_READS: the split's CPU share and the lazy refill's rules: header-only, no GPU
+  add_executable(short_reads_test tests/program/short_reads_test.cpp)
+  target_include_directories(short_reads_test PRIVATE include)
+  add_test(NAME short_reads_test COMMAND short_reads_test)
+
   # the default CPU prefill share is not armed when every expert is resident (#1595): header-only rule, no GPU
   add_executable(share_rules_test tests/prefill/share_rules_test.cpp)
   target_include_directories(share_rules_test PRIVATE include)
