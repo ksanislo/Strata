@@ -189,7 +189,7 @@ struct Grouped {
     float* dout = nullptr;
     size_t out_floats = 0;
 
-    Grouped(int gu, int dt, int64_t H, int64_t FF, const std::vector<int>& counts, int tokens, std::mt19937& rng) {
+    Grouped(int gu, int dt, int64_t H, int64_t FF, const std::vector<int>& counts, int tokens, std::mt19937& rng, int skew = 0) {
         L = k::native_expert_layout(gu, dt, H, FF);
         n_groups = (int) counts.size();
         cap_groups = n_groups + 2;              // the extra grid rows must exit
@@ -211,9 +211,9 @@ struct Grouped {
             b.insert(b.end(), d.begin(), d.end());
             if (b.size() != L.bytes) { std::fprintf(stderr, "blob size %zu != %zu\n", b.size(), L.bytes); std::exit(2); }
             uint8_t* db = dalloc<uint8_t>(b.size());
-            ck(cudaMemcpy(db, b.data(), b.size(), cudaMemcpyHostToDevice), "blob");
+            ck(cudaMemcpy(db + skew, b.data(), b.size(), cudaMemcpyHostToDevice), "blob");   // skew: a blob not 16-byte aligned
             blobs.push_back(db);
-            ptr.push_back((unsigned long long) db);
+            ptr.push_back((unsigned long long) (db + skew));
         }
         dptr = dalloc<unsigned long long>(cap_groups);
         dstart = dalloc<int32_t>(cap_groups + 1);
@@ -277,6 +277,30 @@ void check_grouped(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::m
     }
 }
 
+// STRATA_KQL (native_expert_set_mode 9): the staged-row kernels against the old ones, every STRATA_KQL_GU_P /
+// STRATA_KQL_D_P / STRATA_KQL_WARPS the environment picks; also with blobs 4 bytes off 16-byte alignment
+void check_kql(int gu, int dt, cudaStream_t s, std::mt19937& rng) {
+    for (int skew : {0, 4}) {
+        Grouped G(gu, dt, 2560, 640, {1, 3, 4, 5, 0, 8, 2, 11, 1}, 8, rng, skew);
+        const auto a = G.result(true, s);
+        k::native_expert_set_mode(9, 0);
+        const auto b = G.result(false, s);
+        k::native_expert_set_mode(-1, 0);
+        size_t diff = 0;
+        bool finite = true;
+        for (size_t i = 0; i < a.size(); ++i) {
+            diff += std::memcmp(&a[i], &b[i], 4) != 0;
+            if (i < (size_t) G.n_ent * 2560) finite = finite && std::isfinite(b[i]);
+        }
+        const bool ok = diff == 0 && finite;
+        std::printf("%-8s/%-7s  2560 x  640  STRATA_KQL staged rows%s, %d groups, %d entries: %s\n", name_of(gu), name_of(dt),
+                    skew ? " (unaligned blobs)" : "", G.n_groups, G.n_ent, ok ? "bitwise equal to the old kernels" : "FAIL");
+        if (!ok) {
+            std::printf("  %zu of %zu floats differ%s\n", diff, a.size(), finite ? "" : ", non-finite outputs");
+            ++g_fail;
+        }
+    }
+}
 // ------------------------------------------------------------------------------------------------ --bench
 float time_ms(cudaStream_t s, int it, const auto& fn) {
     cudaEvent_t e0, e1;
@@ -431,6 +455,9 @@ int main(int argc, char** argv) {
         for (int dt : {7, 8}) check_grouped(gu, dt, 2560, 640, s, rng);
     for (int gu : {12, 13}) check_grouped(gu, 13, 2048, 512, s, rng);   // Qwen3.6-35B-A3B's geometry
     check_grouped(8, 8, 2560, 640, s, rng);   // Flash-Next's Q8_0 pack (320 dots a gate/up row: the full-warp rows)
+    for (int gu : {12, 13})
+        for (int dt : {7, 8}) check_kql(gu, dt, s, rng);
+    check_kql(8, 8, s, rng);
     check_q8_1_finite(s, rng);
     if (do_bench) bench(s, rng);
     std::printf("iq_multi_parity: %d failures\n", g_fail);
