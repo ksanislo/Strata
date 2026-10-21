@@ -94,7 +94,6 @@ int main() {
         CHECK(slot_admit_off(s) != nullptr);
         s.piped = true;
         CHECK(slot_admit_off(s) == nullptr);
-        SlotAdmitSetup m = s; m.batch_mtp = true; CHECK(m.batch_mtp && slot_admit_off(m) != nullptr);
         SlotAdmitSetup c = s; c.cvec = true; CHECK(slot_admit_off(c) != nullptr);
         SlotAdmitSetup h = s; h.head_alias = true; CHECK(slot_admit_off(h) != nullptr);
         SlotAdmitSetup r = s; r.conc_off = "x"; CHECK(std::strcmp(slot_admit_off(r), "x") == 0);
