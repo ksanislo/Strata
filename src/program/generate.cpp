@@ -5453,10 +5453,21 @@ int main(int argc, char** argv) {
     }
 
     const bool piped_mtp = piped_mtp_env && batch_mtp && o.batch > 0 && o.batch_groups > 1 && !stages.empty();
+    // drafts per slot and window (STRATA_PIPED_MTP_DRAFTS, default --spec - 1 as the solo windows), and the rows a
+    // group's window can then hold
+    const int pm_drafts = [&] {
+        const char* v = std::getenv("STRATA_PIPED_MTP_DRAFTS");
+        const int d = v != nullptr && v[0] != '\0' ? std::atoi(v) : o.spec - 1;
+        return std::max(1, std::min(d, std::max(o.spec - 1, 1)));
+    }();
+    const int pm_group_rows = piped_mtp ? strata::program::batch_groups::piped_mtp_group_rows(
+                                              o.batch / o.batch_groups, pm_drafts, strata::kernels::kVerifyMaxT) : 0;
     if (piped_mtp)
-        std::fprintf(stderr, "strata generate: STRATA_PIPED_MTP: %d pipelined groups of %d slots keep their MTP drafts "
-                             "while at most %d conversation%s decode (STRATA_PIPED_MTP_MAX)\n", o.batch_groups,
-                     o.batch / o.batch_groups, piped_mtp_max, piped_mtp_max == 1 ? "" : "s");
+        std::fprintf(stderr, "strata generate: STRATA_PIPED_MTP: %d pipelined groups of %d slots keep up to %d MTP "
+                             "draft%s per slot (windows of up to %d rows) while at most %d conversation%s decode "
+                             "(STRATA_PIPED_MTP_DRAFTS, STRATA_PIPED_MTP_MAX)\n", o.batch_groups,
+                     o.batch / o.batch_groups, pm_drafts, pm_drafts == 1 ? "" : "s", pm_group_rows, piped_mtp_max,
+                     piped_mtp_max == 1 ? "" : "s");
     else if (piped_mtp_env && batch_mtp && o.batch > 0)
         std::fprintf(stderr, "strata generate: STRATA_PIPED_MTP: one slot group, so --batch-mtp's serial windows\n");
     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts.
@@ -5547,7 +5558,7 @@ int main(int argc, char** argv) {
                                  vram_free_note().c_str());
                     return 1;
                 }
-                d->set_max_drafts(1);   // the first candidate verifies one proposal per slot
+                d->set_max_drafts(piped_mtp ? pm_drafts : 1);   // the serial windows verify one proposal per slot
                 d->set_ple_session(bslot_ss[0][(size_t) b].get());
                 slot_mtp.push_back(std::move(d));
             }
@@ -9032,7 +9043,8 @@ int main(int argc, char** argv) {
         if (n_stages > 1) {
             // pipelined slot groups write their rows at hbase = group * rows-per-group, so with more than
             // kVerifyMaxT slots in groups the hand-off holds one row per slot (otherwise kVerifyMaxT, as before)
-            const int hrows = piped_mtp ? strata::program::batch_groups::piped_mtp_handoff_rows(o.batch, strata::kernels::kVerifyMaxT)
+            const int hrows = piped_mtp ? strata::program::batch_groups::piped_mtp_handoff_rows(o.batch_groups, pm_group_rows,
+                                                                                                strata::kernels::kVerifyMaxT)
                             : !batch_mtp && o.batch_groups > 1 ? std::max<int>(strata::kernels::kVerifyMaxT, o.batch)
                                                                : strata::kernels::kVerifyMaxT;
             const size_t hb = (size_t) hrows * (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
@@ -9234,7 +9246,7 @@ int main(int argc, char** argv) {
             }
             // the slot drafters' graphs now: in the pipeline a capture would wait for windows in flight on their GPU
             for (size_t b = 0; piped_mtp && b < slot_mtp.size(); ++b)
-                if (!slot_mtp[b]->prepare_rounds(2, err)) {
+                if (!slot_mtp[b]->prepare_rounds(o.spec, err)) {
                     std::fprintf(stderr, "strata serve: STRATA_PIPED_MTP slot %zu: %s\n", b, err.c_str());
                     return 1;
                 }
@@ -11350,6 +11362,7 @@ int main(int argc, char** argv) {
             int32_t x = 0;                 ///< the token the next window feeds (not yet in the slot's state)
             std::array<int32_t, strata::kernels::kVerifyMaxT> draft{}; ///< the slot's next MTP proposal
             bool draft_ready = false;
+            int n_draft = 1;               ///< STRATA_PIPED_MTP: how many of `draft` are proposals
             int64_t p = 0;                 ///< its position
             int64_t produced = 0, max_new = 0;
             Clock::time_point t0;
@@ -11796,6 +11809,7 @@ int main(int argc, char** argv) {
             strata::program::batch_groups::Layout lay;
             int hbase = 0;
             bool drafting = false;           ///< its slots' drafts are running: its next window waits for them
+            Clock::time_point pm_t0, pm_t1;  ///< its window's stage-0 launch, its verdict
             bool dpend[strata::kernels::kVerifyMaxT] = {};
         };
         std::vector<PGroup> pg((size_t) (piped ? o.batch_groups : 0));
@@ -11803,6 +11817,8 @@ int main(int argc, char** argv) {
         int64_t pipe_tick = 0, rr = 0;
         auto pipe_inflight = [&] { for (const PGroup& x : pg) if (x.inflight || x.drafting) return true; return false; };
         int64_t pm_prop = 0, pm_acc = 0;   // STRATA_PIPED_MTP: drafts verified, accepted
+        int64_t pm_wins = 0, pm_rowsum = 0, pm_drafts_n = 0;
+        double pm_win_ms = 0.0, pm_draft_ms = 0.0;   // launch -> verdict per window; verdict -> drafts landed
         cudaEvent_t pm_rows_ev = nullptr;  // the last stage's residual rows copied for the drafters
         if (piped_mtp) {
             const strata::core::OnDevice on_last(stage_verifier(n_pipe - 1).device());
@@ -11818,19 +11834,22 @@ int main(int argc, char** argv) {
             PGroup& G = pg[(size_t) gi];
             const auto& L = G.lay;
             const int32_t* outb = vk.batch_out();
+            G.pm_t1 = Clock::now();
+            ++pm_wins;
+            pm_rowsum += L.S;
+            pm_win_ms += std::chrono::duration<double, std::milli>(G.pm_t1 - G.pm_t0).count();
             std::vector<int> keep(bs.size(), 1);
             for (int t = 0; t < GS; ++t) {
                 if (L.first[t] < 0) continue;
                 const int b = gi * GS + t, i = L.first[t];
                 const BSlot& sl = bs[(size_t) b];
-                const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outb[i]) != o.eos_ids.end();
-                keep[b] = strata::program::batch_groups::piped_mtp_keep(L.n[t], outb[i], L.n[t] > 1 ? L.tok[i + 1] : -1,
-                                                                      eos, sl.stop, sl.produced, sl.max_new, sl.p,
-                                                                      o.max_context);
-                if (L.n[t] > 1) {
-                    ++pm_prop;
-                    pm_acc += keep[b] - 1;
-                }
+                bool eos[strata::kernels::kVerifyMaxT] = {};
+                for (int j = 0; j < L.n[t]; ++j)
+                    eos[j] = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outb[i + j]) != o.eos_ids.end();
+                keep[b] = strata::program::batch_groups::piped_mtp_keep(L.n[t], outb + i, L.tok + i, eos, sl.stop,
+                                                                      sl.produced, sl.max_new, sl.p, o.max_context);
+                pm_prop += L.n[t] - 1;
+                pm_acc += keep[b] - 1;
             }
             if (L.drafts)
                 for (int k = 0; k < n_pipe; ++k)
@@ -11923,13 +11942,17 @@ int main(int argc, char** argv) {
                 for (int t = 0; t < GS; ++t) {
                     if (!G.dpend[t]) continue;
                     const int b = gi * GS + t;
-                    const int r = slot_mtp[(size_t) b]->draft_poll(bs[(size_t) b].draft.data(), err);
+                    const int r = slot_mtp[(size_t) b]->draft_poll(bs[(size_t) b].draft.data(), err, &bs[(size_t) b].n_draft);
                     if (r < 0) { std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str()); return false; }
                     if (r == 0) { all = false; continue; }
                     G.dpend[t] = false;
                     bs[(size_t) b].draft_ready = true;
                 }
-                if (all) G.drafting = false;
+                if (all) {
+                    G.drafting = false;
+                    ++pm_drafts_n;
+                    pm_draft_ms += std::chrono::duration<double, std::milli>(Clock::now() - G.pm_t1).count();
+                }
             }
             return true;
         };
@@ -12047,7 +12070,7 @@ int main(int argc, char** argv) {
                         const int gi = (int) ((rr + j) % (int64_t) pg.size());
                         if (!pg[(size_t) gi].inflight && !pg[(size_t) gi].drafting && group_active(gi) &&
                             (!piped_mtp || stage_verifier(0).batch_launch_ready(
-                                               strata::program::batch_groups::piped_mtp_hbase(gi, GS))))
+                                               strata::program::batch_groups::piped_mtp_hbase(gi, pm_group_rows))))
                             pick = gi;
                     }
                     if (pick < 0) continue;
@@ -12060,22 +12083,26 @@ int main(int argc, char** argv) {
                         ++G.active;
                     }
                     if (piped_mtp) {   // live slots only, each with its draft while few conversations decode
-                        bool act[strata::kernels::kVerifyMaxT] = {}, rdy[strata::kernels::kVerifyMaxT] = {};
-                        int32_t xs[strata::kernels::kVerifyMaxT] = {}, dr[strata::kernels::kVerifyMaxT] = {};
-                        int64_t ps[strata::kernels::kVerifyMaxT] = {};
-                        for (int t = 0; t < GS && t < strata::kernels::kVerifyMaxT; ++t) {
+                        constexpr int MT = strata::kernels::kVerifyMaxT;
+                        bool act[MT] = {};
+                        int nd[MT] = {};
+                        int32_t xs[MT] = {}, dr[MT * 8] = {};
+                        int64_t ps[MT] = {}, left[MT] = {};
+                        for (int t = 0; t < GS && t < MT; ++t) {
                             const BSlot& sl = bs[(size_t) (pick * GS + t)];
                             act[t] = sl.active;
-                            rdy[t] = sl.draft_ready;
+                            nd[t] = sl.draft_ready ? sl.n_draft : 0;
                             xs[t] = sl.x;
-                            dr[t] = sl.draft[0];
+                            for (int j = 0; j < 8 && j < MT; ++j) dr[t * 8 + j] = sl.draft[(size_t) j];
                             ps[t] = sl.p;
+                            left[t] = sl.max_new - sl.produced;
                         }
                         G.lay = strata::program::batch_groups::piped_mtp_layout(
-                            pick * GS, GS, act, rdy, xs, dr, ps,
-                            strata::program::batch_groups::piped_mtp_on(active_total(), piped_mtp_max),
-                            strata::kernels::kVerifyMaxT, o.max_context);
-                        G.hbase = strata::program::batch_groups::piped_mtp_hbase(pick, GS);
+                            pick * GS, GS, act, nd, xs, dr, ps, left,
+                            strata::program::batch_groups::piped_mtp_on(active_total(), piped_mtp_max), pm_drafts,
+                            pm_group_rows, o.max_context);
+                        G.hbase = strata::program::batch_groups::piped_mtp_hbase(pick, pm_group_rows);
+                        G.pm_t0 = Clock::now();
                         G.S = G.lay.S;
                         G.active = G.lay.active;
                     } else
@@ -12132,10 +12159,16 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata batch (pipelined, %d groups of %d): %lld group-steps, %lld rows in %.0f ms = "
                                      "%.1f rows/s (admissions included)\n", o.batch_groups, GS, (long long) bt_windows,
                              (long long) bt_rows, wall, 1000.0 * bt_rows / std::max(wall, 1e-9));
-                if (piped_mtp && pm_prop > 0)
-                    std::fprintf(stderr, "strata batch (pipelined): MTP proposals accepted %lld of %lld (%.1f%%)\n",
-                                 (long long) pm_acc, (long long) pm_prop, 100.0 * (double) pm_acc / (double) pm_prop);
-                pm_acc = pm_prop = 0;
+                if (piped_mtp && pm_wins > 0)   // the cost of a window by its rows: what STRATA_PIPED_MTP_DRAFTS trades
+                    std::fprintf(stderr, "strata batch (pipelined): MTP proposals accepted %lld of %lld (%.1f%%); %lld "
+                                         "windows of %.2f rows avg, %.1f ms launch to picks, drafts %.1f ms after; "
+                                         "%.2f tokens per window\n", (long long) pm_acc, (long long) pm_prop,
+                                 100.0 * (double) pm_acc / (double) std::max<int64_t>(pm_prop, 1), (long long) pm_wins,
+                                 (double) pm_rowsum / (double) pm_wins, pm_win_ms / (double) pm_wins,
+                                 pm_draft_ms / (double) std::max<int64_t>(pm_drafts_n, 1),
+                                 (double) (pm_rowsum - pm_prop + pm_acc) / (double) pm_wins);
+                pm_acc = pm_prop = pm_wins = pm_rowsum = pm_drafts_n = 0;
+                pm_win_ms = pm_draft_ms = 0.0;
                 for (int k = 0; k < n_pipe; ++k) {
                     const std::string pr = stage_verifier(k).profile_report();
                     if (!pr.empty()) std::fprintf(stderr, "strata batch GPU stages, stage %d (ms/window):%s\n", k + 1, pr.c_str());
@@ -15624,7 +15657,8 @@ int main(int argc, char** argv) {
                     sl.ids = live;
                     if (batch_mtp) {
                         if (!slot_mtp[(size_t) admit_slot]->draft_first(1, ver.final_R_all(), sl.x,
-                                                                        sl.p - 1, sl.draft.data(), err)) {
+                                                                        sl.p - 1, sl.draft.data(), err, nullptr,
+                                                                        0.0f, &sl.n_draft)) {
                             std::fprintf(stderr, "strata batch: MTP admission for slot %d failed: %s\n",
                                          admit_slot, err.c_str());
                             return 1;
