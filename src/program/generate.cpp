@@ -121,6 +121,7 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 
 #include <array>
 #include <chrono>
+#include <csignal>
 #include <algorithm>
 #include <memory>
 #include <iostream>
@@ -13724,6 +13725,11 @@ int main(int argc, char** argv) {
                          std::chrono::duration<double, std::milli>(Clock::now() - t_run).count(), adm_fence_ms);
             return true;
         };
+        // --serve is driven by its server over stdin (QUIT, or EOF when the server is gone): a SIGTERM / SIGINT sent to
+        // the whole process group (systemd stopping a service, Ctrl+C in a terminal) must not end the engine before
+        // the server's orderly QUIT.  SIGKILL still ends it.
+        std::signal(SIGTERM, SIG_IGN);
+        std::signal(SIGINT, SIG_IGN);
         for (;;) {
             line_drain_ms = 0.0;
             bool adm_direct = false;   // STRATA_SLOT_ADMIT: this BGEN is read beside the slots (adm_run)
