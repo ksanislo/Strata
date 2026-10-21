@@ -990,6 +990,7 @@ ExpertPool::~ExpertPool() {
 }
 
 void ExpertPool::publish() {
+    nap_.store(false, std::memory_order_relaxed);   // (a worker that still saw it set finds the new epoch and wakes)
     // Both sides are seq_cst, and that is the whole lost-wakeup argument: a worker going to sleep does
     // `sleepers_++` and then reads `epoch_`, the host does `epoch_++` and then reads `sleepers_`.  In one total
     // order at least one of them sees the other's write - the worker sees the new epoch and does not sleep, or
@@ -1044,7 +1045,8 @@ void ExpertPool::worker(int id) {
                 _mm_pause();
                 if ((++spins & 1023u) != 0) continue;
             }
-            if (std::chrono::steady_clock::now() - parked_at < spin_before_sleep_) continue;
+            if (!nap_.load(std::memory_order_relaxed) && std::chrono::steady_clock::now() - parked_at < spin_before_sleep_)
+                continue;
             std::unique_lock<std::mutex> lk(sleep_mu_);
             wstate_[(size_t) id].store(kSleeping, std::memory_order_relaxed);
             sleepers_.fetch_add(1, std::memory_order_seq_cst);
