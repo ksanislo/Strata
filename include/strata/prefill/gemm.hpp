@@ -17,6 +17,11 @@ namespace strata::prefill {
 /// finite.  gemm_f16_range_read returns them (and resets when asked); false where the route does not exist (CUDA).
 void gemm_set_f16_range(bool on);
 bool gemm_f16_range_read(float max_abs[2], unsigned long long over[2], bool reset);
+/// The same switch on CUDA's FP16 tensor-core route (STRATA_BF16_TC): slot 0 the BF16 weights, slot 1 the activations
+/// converted to FP16 - the largest |value|, how many were clamped at 65504, how many fell in FP16's subnormal band,
+/// and how many were converted.  False on HIP.
+bool gemm_tc_range_read(float max_abs[2], unsigned long long clamped[2], unsigned long long subnormal[2],
+                        unsigned long long total[2], bool reset);
 
 
 class Gemm {
@@ -41,6 +46,9 @@ public:
               float beta = 0.0f, int64_t ldx = 0, bool x_f16 = false);
     /// true when bf16() runs its products through FP16 tensor cores here (Turing, STRATA_BF16_TC): where X may be FP16
     bool bf16_converts_x() const;
+    /// STRATA_BF16_TC_SKIP: while held, bf16() keeps cuBLAS's BF16 GEMM where the Turing FP16 path would run (Pascal's
+    /// FP32 path is unaffected: it has no BF16 GEMM to keep)
+    void hold_bf16_tc(bool on) { tc_hold_ = on; }
 
     /// S (STRATA_HCD_EXACT): the HC down projection (N 320, K 10240) by the WMMA kernel that reproduces hipBLASLt's
     /// solution 1176 / 1177 bit for bit; false (nothing launched) unless hipBLASLt would take one of those for this
@@ -80,6 +88,7 @@ private:
     void* hipblaslt_state_ = nullptr;
     void* rocblas_state_ = nullptr;   // HIP: the rocBLAS solution table of f16_inplace (STRATA_ROCBLAS_TUNING)
     bool f16_io_ = false;
+    bool tc_hold_ = false;
     /// cuBLAS 12 answers the default FP16 algorithm of a few (N, K) shapes with CUBLAS_STATUS_INTERNAL_ERROR once
     /// another CUDA device in the process has initialized its context (issue #1650, Turing + Pascal).  A fixed
     /// algorithm (ALGO2) survives that state, but is markedly slower for the wide shapes, so only the shapes that
