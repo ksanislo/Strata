@@ -1620,7 +1620,7 @@ bool MtpDrafter::draft_launch(int T, const int32_t* tokens, int64_t p, int a, st
     return true;
 }
 
-int MtpDrafter::draft_poll(int32_t* drafts, std::string& err) {
+int MtpDrafter::draft_poll(int32_t* drafts, std::string& err, int* n_drafts) {
     if (!async_live_) return 1;
     const OnDevice on_device(device_);
     const cudaError_t q = cudaStreamQuery(cs_);
@@ -1629,6 +1629,7 @@ int MtpDrafter::draft_poll(int32_t* drafts, std::string& err) {
     if (q != cudaSuccess) { err = std::string("mtp draft: ") + cudaGetErrorString(q); return -1; }
     for (int j = 0; j < async_steps_; ++j) drafts[j] = ((volatile int32_t*) h_out_)[j];
     for (int j = async_steps_; j < max_t_ - 1; ++j) drafts[j] = 0;
+    if (n_drafts) *n_drafts = async_steps_;
     ms_draft += ms_since(async_t0_);
     ++rounds;
     return 1;
