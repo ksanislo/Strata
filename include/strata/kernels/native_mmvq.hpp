@@ -113,6 +113,12 @@ void native_q8_0_packed_unregister(const void* gguf_weights);
 /// native_q8_0_sm60_pack packs a device matrix here (the head) and owns the copy until native_q8_0_sm60_release.
 bool native_q8_0_sm60_pack(const void* weights, int n_in, int n_out, const char* what);
 void native_q8_0_sm60_release(const void* weights);
+/// STRATA_SM75_Q8G=1 (opt-in, Turing): Q8_0 calls of 2-8 columns with n_out >= STRATA_SM75_Q8G_MIN_OUT (2048) run a
+/// warp-per-row kernel on the GGUF layout, activations staged in shared memory; bitwise the default kernel's outputs.
+/// Tests and benchmarks: force -1 = the env switch, 0 off, 1 on (any CUDA card); rows a warp 0 = STRATA_SM75_Q8G_ROWS
+/// (2); min_out -1 = STRATA_SM75_Q8G_MIN_OUT.
+void native_q8_0_turing_tune(int force, int rows, int min_out);
+bool native_q8_0_turing_takes(int n_in, int n_out, int ncols);
 
 /// STRATA_Q6_PACKED=1 (opt-in): a packed copy of a Q6_K matrix (the output heads) - the same bytes as ql / qh /
 /// scales / d planes - that native_q6_k_mmvq calls on `weights` read instead (bitwise equal outputs). The copy is
