@@ -435,6 +435,24 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
 
     // Register with CUDA BEFORE any page is touched: cudaHostRegister pins what is resident now, and a region
     // that has already been faulted in page by page is far more expensive to register and may fail outright.
+    register_now(bounds, max_pinned_bytes);
+}
+
+PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, FillFirst, uint64_t max_pinned_bytes)
+    : capacity(bytes), bounds_(bounds), fill_first_cap_(max_pinned_bytes) {
+    if (bytes == 0) return;
+    base = reserve(bytes, backing, note, std::string{}, 0, mapping_base, mapping_bytes);
+    if (base != nullptr && mapping_base == nullptr) {
+        mapping_base = base;
+        mapping_bytes = bytes;
+    }
+    apply_numa_plan(base, bytes, backing, note);   // (STRATA_NUMA_PLACE: bound before the fill threads touch a page)
+}
+
+void PinnedArena::register_filled() { register_now(bounds_, fill_first_cap_); }
+
+void PinnedArena::register_now(const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes) {
+    const uint64_t bytes = capacity;
     if (base) {
         // #243: STRATA_ARENA_PIN_GIB=N caps the registration from the start where the caller set no cap
         const int env_gib = arena_pin_cap_gib();
