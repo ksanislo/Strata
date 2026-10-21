@@ -430,6 +430,7 @@ int main(int argc, char** argv) {
     for (int gu : {12, 13})
         for (int dt : {7, 8}) check_grouped(gu, dt, 2560, 640, s, rng);
     for (int gu : {12, 13}) check_grouped(gu, 13, 2048, 512, s, rng);   // Qwen3.6-35B-A3B's geometry
+    check_grouped(8, 8, 2560, 640, s, rng);   // Flash-Next's Q8_0 pack (320 dots a gate/up row: the full-warp rows)
     check_q8_1_finite(s, rng);
     if (do_bench) bench(s, rng);
     std::printf("iq_multi_parity: %d failures\n", g_fail);
