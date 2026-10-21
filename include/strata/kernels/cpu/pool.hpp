@@ -171,6 +171,9 @@ public:
     /// asserted - the counter it moves is `pool phases ... drain`, which is host-side and needs no profiler.
     explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true,
                         PoolAffinity affinity = PoolAffinity::All, int tasks = 0);
+    /// STRATA_STAGE_SERVE: one worker per CPU of `cores`, pinned there (a layer-split stage's share of its NUMA node).
+    /// Construct it on the thread that will call `run`, already on that node: the scratch is touched here first.
+    ExpertPool(const std::vector<int>& cores, bool host_works, int tasks);
     /// Batched row phases: 0 keeps three tasks per participating thread; explicit counts are capped by rows.
     static constexpr int kMaxTasks = 4096;
     /// The watchdog's view of the pool (issue #31): the batch, the counters, every thread's state.
@@ -180,6 +183,12 @@ public:
     ExpertPool& operator=(const ExpertPool&) = delete;
 
     int workers() const { return n_; }
+    /// The prompt path's CPU share takes the pool for a chunk only when no other stage's prompt path holds it.
+    bool try_hold() {
+        bool expect = false;
+        return hold_.compare_exchange_strong(expect, true, std::memory_order_acq_rel);
+    }
+    void release_hold() { hold_.store(false, std::memory_order_release); }
     /// What bounded the default worker count (pool_plan.hpp; "" when a count was configured), the physical cores
     /// and logical processors counted - for the start-up line.
     const char* plan_limit() const { return plan_limit_; }
@@ -246,6 +255,7 @@ public:
     static constexpr std::chrono::seconds kStall{60};
 
 private:
+    void start(bool pin, const std::vector<int>& cores, bool stage);
     int phase_tasks(int64_t rows) const;
     int tasks_ = 0;
     void worker(int id);
@@ -328,6 +338,8 @@ private:
     std::vector<SplitBufMulti> split_multi_;
     PoolAffinity affinity_ = PoolAffinity::All;
     CpuTopology topo_;
+    std::atomic<bool> hold_{false};   // try_hold
+    int stage_slot_ = -1;   // STRATA_STAGE_SERVE: its place in the watchdog's list of stage pools
 };
 
 }  // namespace strata::kernels::cpu

@@ -71,6 +71,7 @@
 #endif
 #include "strata/core/native_dense.hpp"
 #include "strata/program/batch_read.hpp"
+#include "strata/program/stage_cores.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/program/split_rules.hpp"
@@ -1162,12 +1163,76 @@ struct SplitDrive {
     const uint8_t* cache_base[kMax] = {};
     const uint64_t* cache_slot_off[kMax] = {};
     int pcie_num[kMax] = {};
+    Drive* own[kMax] = {};                        ///< STRATA_STAGE_SERVE: each stage's own Drive (null: the base, re-pointed)
 };
+
+/// STRATA_STAGE_SERVE: a stage Drive's counters and failure move into the base Drive (the one every report reads).
+/// Called on the thread that owns the base, while the stage's Drive is idle.
+void drive_fold(Drive& from, Drive& to) {
+    strata::core::ExpertDispatch& a = from.d;
+    strata::core::ExpertDispatch& b = to.d;
+    auto add = [](auto& x, auto& y) { y += x; x = 0; };
+    add(a.experts, b.experts);
+    add(a.missing, b.missing);
+    add(a.cache_hits, b.cache_hits);
+    add(a.cache_admitted, b.cache_admitted);
+    add(a.cache_refused, b.cache_refused);
+    add(a.pcie_experts, b.pcie_experts);
+    add(a.offload_entries, b.offload_entries);
+    add(a.tail_skipped, b.tail_skipped);
+    add(a.tail_experts, b.tail_experts);
+    add(a.ms_plan, b.ms_plan);
+    add(a.ms_actq, b.ms_actq);
+    add(a.ms_jobs, b.ms_jobs);
+    add(a.ms_run, b.ms_run);
+    add(a.cold_zc, b.cold_zc);
+    add(a.cold_layers, b.cold_layers);
+    add(a.cold_pending, b.cold_pending);
+    add(a.cold_ready, b.cold_ready);
+    add(a.cold_batches, b.cold_batches);
+    add(a.ms_cold_r, b.ms_cold_r);
+    add(a.ms_cold_cr, b.ms_cold_cr);
+    add(a.ms_cold_cc, b.ms_cold_cc);
+    add(a.ms_cold_wait, b.ms_cold_wait);
+    add(a.ms_cold_hide, b.ms_cold_hide);
+    add(a.stale_x, b.stale_x);
+    add(a.multi_misses, b.multi_misses);
+    add(a.multi_entries, b.multi_entries);
+    add(from.cpu_ms, to.cpu_ms);
+    add(from.calls, to.calls);
+    if (a.failed && !b.failed) {
+        b.failed = true;
+        b.fail = a.fail;
+        b.fail_layer = a.fail_layer;
+        b.fail_expert = a.fail_expert;
+    }
+    a.failed = false;
+    a.fail = nullptr;
+}
+
+/// STRATA_STAGE_SERVE: what a stage's Drive takes from the base before a window (the base's may change between them).
+void drive_sync(Drive& st, const Drive& base) {
+    st.d.src = base.d.src;
+    st.d.n_expert = base.d.n_expert;
+    st.d.host_res = base.d.host_res;
+    st.d.dres_check = base.d.dres_check;
+    st.d.cache_blob = base.d.cache_blob;
+    st.d.split_rows = base.d.split_rows;
+}
+
 void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
                       int64_t layer) {
     SplitDrive* s = (SplitDrive*) user;
     int st = 0;
     while (st + 1 < s->n && layer >= s->end[st]) ++st;
+    if (Drive* own = s->own[st]) {   // STRATA_STAGE_SERVE: the stage's pool, on this thread; the base keeps the counts
+        drive_sync(*own, *s->base);
+        own->d.plan = s->plan[st];
+        own->d.failed = s->base->d.failed;   // (a failure latches for the rest of the window, as with one Drive)
+        drive_pool_multi(own, x_f, ids, n_tok, k, out, layer);
+        drive_fold(*own, *s->base);
+        return;
+    }
     Drive& d = *s->base;
     d.d.plan = s->plan[st];
     d.d.cache_base = s->cache_base[st];
@@ -1175,6 +1240,96 @@ void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t 
     d.d.pcie_num = s->pcie_num[st];
     drive_pool_multi(s->base, x_f, ids, n_tok, k, out, layer);
 }
+
+/// STRATA_STAGE_SERVE=1: a layer-split stage's expert pool, a Drive per verifier of the stage (the plan sink, cache and
+/// PCIe share set once), and a thread pinned on the stage GPU's NUMA node that builds the pool there and serves the
+/// stage's windows: the pipelined batch windows (`serving`) and the run() and pipelined windows handed to it
+/// (Verifier::set_external_server).  Between windows it spins for kSpin, then sleeps until `wake` (a launch).
+struct StageServe {
+    static constexpr std::chrono::milliseconds kSpin{20};
+    std::unique_ptr<strata::kernels::cpu::ExpertPool> pool;
+    std::vector<strata::core::Verifier*> vers;    ///< [0]: the stage's verifier (batch windows); [1]: --pipeline-windows' odd
+    std::vector<std::unique_ptr<Drive>> drives;   ///< one per verifier
+    strata::program::StageCores cores;
+    bool host_works = true;
+    int tasks = 0;
+    std::atomic<bool> stop{false}, serving{false}, waiting{false};
+    bool ready = false;
+    std::string pool_err;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::thread th;
+
+    void start() {
+        th = std::thread([this] { loop(); });
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [&] { return ready; });
+    }
+    void wake() {
+        std::atomic_thread_fence(std::memory_order_seq_cst);   // pairs with loop()'s: one side sees the other
+        if (waiting.load(std::memory_order_relaxed)) {
+            std::lock_guard<std::mutex> lk(mu);
+            cv.notify_all();
+        }
+    }
+    bool busy() const {
+        for (const strata::core::Verifier* v : vers)
+            if ((serving.load(std::memory_order_acquire) && v->batch_busy()) || v->external_busy()) return true;
+        return false;
+    }
+    void loop() {
+        strata::aux_cpus::note_owned_thread();   // --aux-cpus never moves it
+        if (cores.service >= 0) (void) strata::kernels::cpu::pin_current_thread(cores.service);
+        try {   // built here, so its scratch is first touched on this node
+            pool = std::make_unique<strata::kernels::cpu::ExpertPool>(cores.workers, host_works, tasks);
+            for (auto& d : drives) d->d.pool = pool.get();
+        } catch (const std::exception& x) {
+            pool_err = x.what();
+        }
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            ready = true;
+        }
+        cv.notify_all();
+        Clock::time_point busy_at = Clock::now();
+        while (!stop.load(std::memory_order_acquire)) {
+            bool any = false;
+            for (size_t i = 0; i < vers.size(); ++i) {
+                strata::core::Verifier& v = *vers[i];
+                if (serving.load(std::memory_order_acquire) && v.batch_busy()) {
+                    v.batch_serve(&drive_pool_multi, drives[i].get());
+                    any = true;
+                }
+                if (v.external_busy()) {
+                    v.serve_external(&drive_pool_multi, drives[i].get());
+                    any = true;
+                }
+            }
+            if (any) {
+                busy_at = Clock::now();
+                continue;
+            }
+            if (Clock::now() - busy_at < kSpin) {
+                std::this_thread::yield();
+                continue;
+            }
+            std::unique_lock<std::mutex> lk(mu);
+            waiting.store(true, std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            cv.wait_for(lk, std::chrono::milliseconds(50), [&] { return stop.load(std::memory_order_acquire) || busy(); });
+            waiting.store(false, std::memory_order_relaxed);
+        }
+        pool.reset();
+    }
+    ~StageServe() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            stop.store(true, std::memory_order_release);
+        }
+        cv.notify_all();
+        if (th.joinable()) th.join();
+    }
+};
 
 /// Layer split across GPUs: a later stage on its own device, with its own copy of the dense weights, a session, an
 /// expert cache for its layers, a verify window and a prompt path; the last one also holds the head (the drafter
@@ -8458,6 +8613,9 @@ int main(int argc, char** argv) {
         // the prompt path's own buffers (no loan) are not priced into them: with the whole arena pinned (#253) a
         // `--prefill auto` split could stop at start with "device buffers for a chunk of 2048 tokens do not fit".  A
         // chunk that does not fit is tried again one size smaller, down to 512 tokens (a smaller chunk only reads slower).
+        // STRATA_STAGE_SERVE: each stage's prompt path takes its stage's pool (set below, where the pools start)
+        std::vector<strata::kernels::cpu::ExpertPool*> prompt_pool;
+        auto prompt_pool_of = [&](size_t st) { return st < prompt_pool.size() ? prompt_pool[st] : &pool; };
         auto init_prompt_paths = [&]() -> int {   // 0: ready; 1: failed (err set); 2: failed with "do not fit"
             for (size_t i = 0; i < stages.size(); ++i) {
                 GpuStage& st = *stages[i];
@@ -8470,7 +8628,7 @@ int main(int argc, char** argv) {
                     sb = st.cache.device_slot(pf_parts[i + 1].first);
                     sbb = part_bytes(pf_parts[i + 1], pf_parts[i + 1].first);
                 }
-                if (share_pool) st.sp.set_cpu_pool(&pool);   // one stage at a time takes it for a chunk (prefill.cpp)
+                if (share_pool) st.sp.set_cpu_pool(prompt_pool_of(i + 1));   // one stage at a time takes a shared one (prefill.cpp)
                 if (!st.sp.init(st.wt, g, st.ss, srcp, &st.cache, host_res.data(), o.prefill_chunk, (void*) st.stream,
                                 err, sb, sbb)) {
                     err = "layer split, CUDA" + std::to_string(st.dev) + " prompt path: " + err;
@@ -8478,7 +8636,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
-            if (share_pool) sp.set_cpu_pool(&pool);
+            if (share_pool) sp.set_cpu_pool(prompt_pool_of(0));
             if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes,
                          o.prefill_head_alias))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
@@ -11386,6 +11544,109 @@ int main(int argc, char** argv) {
         const int n_pipe = (int) stages.size() + 1;
         const bool piped = o.batch > 0 && o.batch_groups > 1 && n_pipe > 1;
         strata::core::StageInFlightSampler stage_in_flight(n_pipe, piped && batch_telemetry_enabled);
+        // STRATA_STAGE_SERVE=1 (opt-in): each stage of a layer split gets its own expert pool on its GPU's NUMA node and
+        // its own Drive (no re-pointing per layer); the verify windows of every path use them, and with the pipelined
+        // groups one thread per stage, pinned there, serves the stage's doorbells (the pump only launches and polls).
+        // The prompt path keeps the engine's pool.
+        std::vector<std::unique_ptr<StageServe>> stsv;
+        bool stage_serving = false;
+        if (const char* v = std::getenv("STRATA_STAGE_SERVE"); v != nullptr && std::atoi(v) != 0 && n_stages > 1) {
+            strata::program::ConcurrentReadSetup cs;   // the doorbells of several stages at once: the same limits
+            cs.fs_slots = drive.d.fs != nullptr;
+            cs.pcie_dma = o.pcie_mode == "dma";
+            cs.helper_caches = prefill_src != srcp || drive.d.remote_count > 0 || remote_opt != nullptr;
+            cs.staged_source = srcp == &src && src.stages_blobs();
+            cs.other_source = srcp != &src && srcp != &arena_src;
+            const char* off = strata::program::concurrent_read_off(cs);
+#if !defined(__linux__)
+            off = "this OS (the NUMA placement reads Linux's sysfs)";
+#endif
+            if (off == nullptr && split_same) off = "--split-device 0";
+            if (off == nullptr && drive.d.lookahead != nullptr) off = "the routing-aware prefetch (STRATA_LOOKAHEAD=0)";
+            if (off == nullptr && drive.d.peer != nullptr) off = "a peer device";
+            if (off == nullptr && drive.routing != nullptr) off = "--dump-routing";
+            if (off == nullptr && o.no_pool) off = "--no-pool";
+            if (off != nullptr)
+                std::fprintf(stderr, "strata serve: STRATA_STAGE_SERVE is off beside %s\n", off);
+#if defined(__linux__)
+            if (off == nullptr) {
+                std::vector<int> nodes, layers;
+                for (int k = 0; k < n_stages; ++k) {
+                    char bus[64] = {};
+                    nodes.push_back(cudaDeviceGetPCIBusId(bus, (int) sizeof bus, stage_ver(k).device()) == cudaSuccess
+                                        ? strata::program::pci_numa_node(bus) : -1);
+                    layers.push_back((int) (split_drive.end[k] - (k ? split_drive.end[k - 1] : 0)));
+                }
+                const int host = strata::kernels::cpu::planned_host_core(o.pool_affinity);
+                const auto plan = strata::program::plan_stage_cores(
+                    nodes, layers, strata::program::numa_physical_cores(strata::aux_cpus::allowed_cpus()),
+                    host >= 0 ? strata::program::core_cpus(host) : std::vector<int>{}, o.pool_workers);
+                bool ok = true;
+                for (int k = 0; k < n_stages && ok; ++k) {
+                    auto sv = std::make_unique<StageServe>();
+                    sv->cores = plan[(size_t) k];
+                    sv->host_works = !o.no_host_worker;
+                    sv->tasks = o.pool_tasks;
+                    for (int par = 0; par < (pipe ? 2 : 1); ++par) {   // --pipeline-windows: the odd windows' verifier too
+                        strata::core::Verifier& vk = stage_ver_p(k, par);
+                        auto d = std::make_unique<Drive>();
+                        d->d.n_expert = g.n_expert;
+                        d->d.usage_into = &drive.d.usage;
+                        d->d.plan = vk.plan_sink();
+                        d->d.cache_base = split_drive.cache_base[k];
+                        d->d.cache_slot_off = split_drive.cache_slot_off[k];
+                        d->d.pcie_num = split_drive.pcie_num[k];
+                        drive_sync(*d, drive);
+                        sv->vers.push_back(&vk);
+                        sv->drives.push_back(std::move(d));
+                    }
+                    sv->start();
+                    if (!sv->pool_err.empty()) {
+                        std::fprintf(stderr, "strata serve: STRATA_STAGE_SERVE: stage %d's pool: %s; off\n", k + 1,
+                                     sv->pool_err.c_str());
+                        ok = false;
+                    }
+                    stsv.push_back(std::move(sv));
+                }
+                if (!ok) stsv.clear();
+                for (int k = 0; k < (int) stsv.size(); ++k) {
+                    StageServe& sv = *stsv[(size_t) k];
+                    split_drive.own[k] = sv.drives[0].get();
+                    split_drive_b.own[k] = sv.drives.back().get();
+                    for (size_t i = 0; i < sv.vers.size(); ++i) {   // run() and the pipelined windows: served by sv
+                        Drive* dr = sv.drives[i].get();
+                        StageServe* svp = &sv;
+                        sv.vers[i]->set_external_server([svp] { svp->wake(); }, [dr, &drive] {
+                            drive_fold(*dr, drive);
+                            drive_sync(*dr, drive);
+                        });
+                    }
+                    prompt_pool.push_back(sv.pool.get());
+                    std::fprintf(stderr, "strata serve: STRATA_STAGE_SERVE: stage %d (CUDA%d, layers %lld-%lld) %s, %d "
+                                         "pool workers%s\n", k + 1, stage_ver(k).device(),
+                                 (long long) (k ? split_drive.end[k - 1] : 0), (long long) (split_drive.end[k] - 1),
+                                 strata::program::stage_cores_text(sv.cores).c_str(), sv.pool->workers(),
+                                 sv.host_works ? " + the service thread" : "");
+                }
+                if (!stsv.empty() && share_pool) {   // the prompt paths: their stage's pool from now on
+                    sp.set_cpu_pool(prompt_pool_of(0));
+                    for (size_t i = 0; i < stages.size(); ++i) stages[i]->sp.set_cpu_pool(prompt_pool_of(i + 1));
+                }
+                if (!stsv.empty() && piped) {
+                    for (int k = 0; k < n_pipe; ++k) {
+                        stage_ver(k).set_external_serve(true);
+                        stsv[(size_t) k]->serving.store(true, std::memory_order_release);
+                    }
+                    stage_serving = true;
+                }
+                if (!stsv.empty())
+                    std::fprintf(stderr, "strata serve: STRATA_STAGE_SERVE: every verify window's doorbells are served by "
+                                         "its stage's thread%s; the prompt path %s; the engine's pool (%d workers) "
+                                         "idles\n", stage_serving ? " (the pipelined groups too)" : "",
+                                 share_pool ? "uses the stage pools" : "takes no pool (--batch)", pool.workers());
+            }
+#endif
+        }
         if (piped && batch_mtp)   // #1413: said, not silent
             std::fprintf(stderr,
                          "strata generate: WARNING: --batch-groups %d runs the pipelined path, which builds one row per slot: "
@@ -11444,6 +11705,7 @@ int main(int argc, char** argv) {
                 const int r = vk.batch_poll(win_pool_fn, win_pool_user, err);
                 if (r < 0) { std::printf("ERR %s\n", err.c_str()); return false; }
                 if (r == 0) continue;
+                if (stage_serving) drive_fold(*stsv[(size_t) k]->drives[0], drive);   // its window is served: the Drive is idle
                 if (batch_telemetry_enabled) stage_in_flight.complete(k, Clock::now());
                 stage_group[(size_t) k] = -1;
                 PGroup& G = pg[(size_t) gi];
@@ -11533,7 +11795,7 @@ int main(int argc, char** argv) {
                     if (batch_telemetry_enabled) G.started = Clock::now();
                     // (with the doorbells on their own thread, a failure it set for a window that left this stage is
                     // not cleared unseen)
-                    if (conc_serving && drive.d.failed) {
+                    if ((conc_serving || stage_serving) && drive.d.failed) {
                         std::printf("ERR %s\n", drive.d.fail ? drive.d.fail : "the expert pool failed");
                         return false;
                     }
@@ -11543,11 +11805,15 @@ int main(int argc, char** argv) {
                 PGroup& G = pg[(size_t) pick];
                 strata::core::progress().busy.store(true);
                 if (batch_telemetry_enabled) stage_in_flight.launch(k, Clock::now());
+                if (stage_serving) {
+                    drive_sync(*stsv[(size_t) k]->drives[0], drive);
+                }
                 if (!stage_verifier(k).batch_launch(pick * GS, G.S, G.tok, G.pos, err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return false;
                 }
                 stage_group[(size_t) k] = pick;
+                if (stage_serving) stsv[(size_t) k]->wake();
                 if (conc_serving) {   // the doorbell thread may be waiting between windows: the launch above is seen
                     std::atomic_thread_fence(std::memory_order_seq_cst);
                     if (bell_waiting.load(std::memory_order_relaxed)) {
@@ -13277,54 +13543,56 @@ int main(int argc, char** argv) {
                             if (off) off();
                         }
                     } bells;
-                    for (int k = 0; k < n_pipe; ++k) stage_verifier(k).set_external_serve(true);
-                    conc_serving = true;
-                    bells.off = [&] {
-                        for (int k = 0; k < n_pipe; ++k) stage_verifier(k).set_external_serve(false);
-                        conc_serving = false;
-                    };
-                    bells.wake = [&] {
-                        std::lock_guard<std::mutex> lk(bell_mu);
-                        bell_cv.notify_one();
-                    };
-                    bells.th = std::thread([&] {
-                        conc_thread_cpus();
-                        auto any_busy = [&] {
-                            for (int k = 0; k < n_pipe; ++k)
-                                if (stage_verifier(k).batch_busy()) return true;
-                            return false;
+                    if (!stage_serving) {   // (STRATA_STAGE_SERVE: the stages' own threads serve them already)
+                        for (int k = 0; k < n_pipe; ++k) stage_verifier(k).set_external_serve(true);
+                        conc_serving = true;
+                        bells.off = [&] {
+                            for (int k = 0; k < n_pipe; ++k) stage_verifier(k).set_external_serve(false);
+                            conc_serving = false;
                         };
-                        while (bells.on.load(std::memory_order_acquire)) {
-                            bool busy = false;
-                            for (int k = 0; k < n_pipe; ++k) {
-                                auto& vk = stage_verifier(k);
-                                if (vk.batch_busy()) {
-                                    busy = true;
-                                    vk.batch_serve(win_pool_fn, win_pool_user);
+                        bells.wake = [&] {
+                            std::lock_guard<std::mutex> lk(bell_mu);
+                            bell_cv.notify_one();
+                        };
+                        bells.th = std::thread([&] {
+                            conc_thread_cpus();
+                            auto any_busy = [&] {
+                                for (int k = 0; k < n_pipe; ++k)
+                                    if (stage_verifier(k).batch_busy()) return true;
+                                return false;
+                            };
+                            while (bells.on.load(std::memory_order_acquire)) {
+                                bool busy = false;
+                                for (int k = 0; k < n_pipe; ++k) {
+                                    auto& vk = stage_verifier(k);
+                                    if (vk.batch_busy()) {
+                                        busy = true;
+                                        vk.batch_serve(win_pool_fn, win_pool_user);
+                                    }
                                 }
+                                if (busy) continue;
+                                // STRATA_TEST_BELL_SLEEP_US=N (a test, an A/B of the wait below): sleep N us instead, as
+                                // the first form of this thread did (a whole timer tick on Windows)
+                                static const int test_sleep_us = [] {
+                                    const char* t = std::getenv("STRATA_TEST_BELL_SLEEP_US");
+                                    return t != nullptr ? std::max(0, std::atoi(t)) : 0;
+                                }();
+                                if (test_sleep_us > 0) {
+                                    std::this_thread::sleep_for(std::chrono::microseconds(test_sleep_us));
+                                    continue;
+                                }
+                                // no window in flight: wait for pump's next launch (it notifies when this is set; the
+                                // fences pair the flag with batch_launch's running flag, so one of the two sides sees the
+                                // other), or for the end of the read
+                                std::unique_lock<std::mutex> lk(bell_mu);
+                                bell_waiting.store(true, std::memory_order_relaxed);
+                                std::atomic_thread_fence(std::memory_order_seq_cst);
+                                bell_cv.wait_for(lk, std::chrono::milliseconds(2),
+                                                 [&] { return !bells.on.load(std::memory_order_acquire) || any_busy(); });
+                                bell_waiting.store(false, std::memory_order_relaxed);
                             }
-                            if (busy) continue;
-                            // STRATA_TEST_BELL_SLEEP_US=N (a test, an A/B of the wait below): sleep N us instead, as
-                            // the first form of this thread did (a whole timer tick on Windows)
-                            static const int test_sleep_us = [] {
-                                const char* t = std::getenv("STRATA_TEST_BELL_SLEEP_US");
-                                return t != nullptr ? std::max(0, std::atoi(t)) : 0;
-                            }();
-                            if (test_sleep_us > 0) {
-                                std::this_thread::sleep_for(std::chrono::microseconds(test_sleep_us));
-                                continue;
-                            }
-                            // no window in flight: wait for pump's next launch (it notifies when this is set; the
-                            // fences pair the flag with batch_launch's running flag, so one of the two sides sees the
-                            // other), or for the end of the read
-                            std::unique_lock<std::mutex> lk(bell_mu);
-                            bell_waiting.store(true, std::memory_order_relaxed);
-                            std::atomic_thread_fence(std::memory_order_seq_cst);
-                            bell_cv.wait_for(lk, std::chrono::milliseconds(2),
-                                             [&] { return !bells.on.load(std::memory_order_acquire) || any_busy(); });
-                            bell_waiting.store(false, std::memory_order_relaxed);
-                        }
-                    });
+                        });
+                    }
                     for (int64_t q0 = a0; q0 < b0;) {
                         const auto tc = Clock::now();
                         const int64_t rows0 = pipe_rows;
