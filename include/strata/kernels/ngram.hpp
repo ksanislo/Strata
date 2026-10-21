@@ -187,6 +187,9 @@ public:
     /// as ONE reader request - page dedupe and sort across the whole batch, the reader's full queue depth.  Not
     /// while a single-token `issue` is pending.  The mapped mode gathers row by row.
     bool gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err);
+    /// A gather of more than `tokens` tokens goes in requests of that many, the table free between them (a token's
+    /// gather waiting behind a prompt's: STRATA_SLOT_ADMIT).  0 (default): one request.
+    static void set_gather_piece(size_t tokens);
 
     /// Fault injection (Direct mode): every row read completes no earlier than `us` after issue.
     void set_injected_delay_us(double us);
@@ -221,6 +224,7 @@ public:
     PleIo mode() const;
 
 private:
+    bool gather_one(const uint32_t* rows, size_t n_tokens, float* out, std::string& err);
     struct Impl;
     Impl* impl_ = nullptr;
 };
