@@ -584,7 +584,7 @@ void SessionLoopScratch::free() {
         pinned_core = {};
     }
     if (probe != nullptr) { cudaEventDestroy(probe); probe = nullptr; }
-    if (y_miss != nullptr) { cudaFreeHost(y_miss); y_miss = nullptr; }
+    if (y_miss != nullptr) { strata::core::host_free_guarded(y_miss); y_miss = nullptr; }
     parts_bytes = 0;
 }
 
