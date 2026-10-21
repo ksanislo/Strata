@@ -120,6 +120,9 @@
 #endif
 
 #include <cuda_runtime.h>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 #if defined(STRATA_GPU_METAL)
 namespace strata::metal_engine { void set_model_shard(const char* shard1); }   // metal/src/engine/window.cpp
 #endif
@@ -1314,6 +1317,14 @@ void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t 
 /// PCIe share set once), and a thread pinned on the stage GPU's NUMA node that builds the pool there and serves the
 /// stage's windows: the pipelined batch windows (`serving`) and the run() and pipelined windows handed to it
 /// (Verifier::set_external_server).  Between windows it spins for kSpin, then sleeps until `wake` (a launch).
+inline void spin_pause() {
+#if defined(__x86_64__) || defined(_M_X64)
+    _mm_pause();
+#else
+    std::this_thread::yield();
+#endif
+}
+
 struct StagePools;
 struct StageServe {
     static constexpr std::chrono::milliseconds kSpin{20};
@@ -1370,19 +1381,21 @@ struct StageServe {
         cv.notify_all();
         Clock::time_point busy_at = Clock::now();
         while (!stop.load(std::memory_order_acquire)) {
-            bool any = false;
+            bool any = false, waits = true;
             for (size_t i = 0; i < vers.size(); ++i) {
                 strata::core::Verifier& v = *vers[i];
                 if (serving.load(std::memory_order_acquire) && v.batch_busy()) {
-                    v.batch_serve(&drive_pool_stage, drives[i].get());
+                    waits = v.batch_serve(&drive_pool_stage, drives[i].get()) == 0 && waits;
                     any = true;
                 }
                 if (v.external_busy()) {
-                    v.serve_external(&drive_pool_stage, drives[i].get());
+                    waits = v.serve_external(&drive_pool_stage, drives[i].get()) == 0 && waits;
                     any = true;
                 }
             }
             if (any) {
+                // waiting for a ring: pause, so a worker on the other hardware thread of this core keeps its cycles
+                if (waits) spin_pause();
                 busy_at = Clock::now();
                 continue;
             }
@@ -1418,6 +1431,7 @@ struct StagePools {
     /// when a stage last saw another one working (steady ns): the engine's pool waits until the stage pools' workers
     /// have stopped spinning (ExpertPool::kSpinBeforeSleep), so the two never spin on one core
     std::atomic<int64_t> together_ns{0};
+    std::atomic<int64_t> shared_ns{0};   ///< when the engine's pool last ran a stage's layer
 };
 
 /// The pool for a stage Drive's layer (see StagePools), decided per layer.
@@ -1433,14 +1447,20 @@ void drive_pool_stage(void* user, const float* x_f, const int32_t* ids, int64_t 
     for (const StageServe* o : g->stages)
         if (o != t->stage && o->working()) { alone = false; break; }
     const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
-    if (!alone) g->together_ns.store(now, std::memory_order_relaxed);
     const int64_t quiet = std::chrono::duration_cast<std::chrono::nanoseconds>(
                               strata::kernels::cpu::ExpertPool::kSpinBeforeSleep).count() * 5 / 4;
+    if (!alone) {
+        g->together_ns.store(now, std::memory_order_relaxed);
+        // the engine's pool ran a layer moments ago: its parked workers would spin on the stage pools' cores
+        if (now - g->shared_ns.load(std::memory_order_relaxed) < quiet) g->shared->nap();
+    }
     if (alone && now - g->together_ns.load(std::memory_order_relaxed) > quiet && g->shared->try_hold()) {   // (one caller at a time: another stage may have just found itself alone)
         strata::kernels::cpu::ExpertPool* own = t->d.pool;
         t->d.pool = g->shared;
         drive_pool_multi(user, x_f, ids, n_tok, k, out, layer);
         t->d.pool = own;
+        g->shared_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count(),
+                           std::memory_order_relaxed);
         g->shared->release_hold();
         g->shared_layers.fetch_add(1, std::memory_order_relaxed);
         return;
