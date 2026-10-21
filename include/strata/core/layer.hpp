@@ -42,6 +42,7 @@
 
 #include <cstdio>
 #include <functional>
+#include <vector>
 
 #include "strata/core/vmm.hpp"
 #include <cstdlib>
@@ -239,6 +240,9 @@ struct QsaState {
     /// The elastic K/V (qsa_set_kv_elastic): this state's pools are in a VMM range mapped only as far as the
     /// context needs - its index in layer.cpp's registry; -1: carved from the arena as before.
     int32_t kv_elastic = -1;
+    /// An elastic --batch slot state (STRATA_ELASTIC_SLOTS): its arrays larger than a chunk are in a VMM range of its
+    /// own, backed by qsa_slots_grow - its index in layer.cpp's registry; -1: carved as before.
+    int32_t slot_elastic = -1;
     strata::kernels::KvHostPools host;
     strata::kernels::KvStreamMap map;
     int64_t idx_pooled_rows = 0;     ///< rows of `idx_pooled` (a ring, which has no indexer, keeps 2)
@@ -276,7 +280,10 @@ struct QsaState {
 /// Plan v0.3 P7: the RoPE cos/sin table (max_cells x n_rot/2 x 2 floats, 64 MiB at 262K) is identical in every
 /// QSA layer. `with_rope = false` sizes a state that borrows it; `share_rope` points `st` at another state's table
 /// instead of building a copy (the session builds it once, in the first QSA layer).
-uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0);
+/// `elastic_slot`: a --batch slot's state whose arrays larger than one VMM chunk (the K/V pool slots, the indexer's
+/// pooled rows) get addresses of their own and no memory until qsa_slots_grow backs them (CUDA, a VMM device).
+uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0,
+                         bool elastic_slot = false);
 /// KV streaming: keep `cells` cells of each QSA layer in VRAM and the rest in pinned host memory (0: all in VRAM,
 /// the default). Set before sizing and initializing the session; a context that fits in `cells` is not streamed.
 /// Also puts the MTP drafter's K/V in a ring of its window (`ring_cells` of qsa_state_bytes/init; -1 forces a fully
@@ -324,7 +331,26 @@ inline int qsa_kv_format(const QsaState& st) {
     return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
 }
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0);
+                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0, bool elastic_slot = false);
+/// THE ELASTIC SLOT STATES' MEMORY.  Each device has a budget of physical chunks made once (qsa_slot_budget_add) that its
+/// slot states map as their conversations grow and give back when trimmed.
+uint64_t qsa_slot_budget_add(int dev, uint64_t bytes);   ///< returns the bytes made
+void qsa_slot_budget(int dev, uint64_t& total, uint64_t& free);
+/// STRATA_ELASTIC_SLOTS_GIVE: the expert cache hands a chunk of its own to the budget, and takes up to `n` free ones back
+/// (appended to `out`; returns how many).
+void qsa_slot_budget_give(int dev, VmmChunk h);
+int64_t qsa_slot_budget_take(int dev, int64_t n, std::vector<VmmChunk>& out);
+/// Chunks the budget holds now; `free` of them unused, `made` made at load.
+int64_t qsa_slot_budget_chunks(int dev, int64_t* free, int64_t* made);
+/// Chunks the states still lack to hold `cells` cells.
+int64_t qsa_slots_need(const std::vector<const QsaState*>& states, int64_t cells);
+/// Backs `cells` cells in every state (all on one device): all or nothing, false when the budget is short.  New chunks
+/// are zeroed on a stream of their own; a window in flight on other memory is not waited for.
+bool qsa_slots_grow(const std::vector<const QsaState*>& states, int64_t cells);
+/// Unmaps what `cells` cells do not need, back to the budget; returns the chunks.  No window may be reading the state.
+int64_t qsa_slot_trim(const QsaState& st, int64_t cells);
+uint64_t qsa_slot_backed_bytes(const QsaState& st);
+uint64_t qsa_slot_reserved_bytes(const QsaState& st);
 /// KV streaming: the pools a reader sees (the VRAM slots) and, when streamed, make the selection's blocks resident.
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st);
 void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* ids, const int32_t* steps, int64_t n_q,
