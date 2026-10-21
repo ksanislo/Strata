@@ -827,8 +827,9 @@ template<int TY> inline constexpr bool kSplit = false;
 // The K-quant / Q8_0 / Q5_1 formats (UD-Q4_K_XL) have Split traits (SplitK below), but their decode-once multi kernels
 // run only with STRATA_KQ_SPLIT=1 until the A/B on the measured cards decides (bitwise the old kernels either way).
 template<int TY> inline constexpr bool kq_type = (TY == 12 || TY == 13 || TY == 8);   // not Q5_1: its Split apply is not bitwise the old dot (FMA contraction), see notes-151-amd
-inline bool g_kq_split = [] { const char* v = std::getenv("STRATA_KQ_SPLIT"); return v != nullptr && v[0] == '1'; }();
-template<int TY> inline bool split_off() { return kq_type<TY> && !g_kq_split; }
+// read at first use, not at load: the sm_75 table (nv_defaults, STRATA_SM75_STACK) sets it in main
+inline bool kq_split_on() { static const bool on = [] { const char* v = std::getenv("STRATA_KQ_SPLIT"); return v != nullptr && v[0] == '1'; }(); return on; }
+template<int TY> inline bool split_off() { return kq_type<TY> && !kq_split_on(); }
 template<int TY> inline constexpr bool kTqType = (TY == 144 || TY == 145 || TY == 146);
 // the trellis types stage their int8 codebook (4 KB) too, but only where it pays: tq_stage_on() below (compute capability 6.0)
 template<int TY> inline constexpr bool kStageIqGrid = (TY == 16 || TY == 17 || TY == 18 || TY == 21 || TY == 22 || TY == 29 || kTqType<TY>);
@@ -3269,6 +3270,15 @@ bool gu_split(int t) {
         default: return false;
     }
 }
+// dots per gate/up row ((n_embd / qk) * ipb); launch_gu takes the 16-lane rows only at 80 (Q8_0 at 2560: 320)
+int gu_dots(int t, int64_t n_embd) {
+    switch (t) {
+#define STRATA_DOTS(T) case T: return (int) (n_embd / Fmt<T>::qk) * Fmt<T>::ipb;
+        STRATA_GU_FMTS(STRATA_DOTS)
+#undef STRATA_DOTS
+        default: return 0;
+    }
+}
 
 bool env_on(const char* name) {
     const char* v = std::getenv(name);
@@ -5139,8 +5149,9 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }
     const bool v1 = g_grouped_v1;
     const int64_t gy = (v1 || grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
+    // the grid must match launch_gu's row width: 16 rows a block only where it takes the sub-16 kernel (80 dots a row)
     const int gu_rows = (!g_old_kernels && !g_no_sub16_gu && L.n_embd == 2560 && gu_split(L.gu_type) &&
-                         gu_qk(L.gu_type) != 128 && L.gu_type != 12 && L.gu_type != 13) ? 16 : GU_ROWS;   // qk 128 (APR trellis): no sub-16 rows, see launch_gu
+                         gu_dots(L.gu_type, L.n_embd) == 80) ? 16 : GU_ROWS;
     const dim3 ggu((unsigned) ((2 * L.n_ff + gu_rows - 1) / gu_rows), (unsigned) gy);
 #if STRATA_EXP_LAYOUTS
 #if defined(STRATA_HIP_GFX906)
