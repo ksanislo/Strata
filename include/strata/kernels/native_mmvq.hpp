@@ -119,6 +119,8 @@ void native_q8_0_sm60_release(const void* weights);
 /// (2); min_out -1 = STRATA_SM75_Q8G_MIN_OUT.
 void native_q8_0_turing_tune(int force, int rows, int min_out);
 bool native_q8_0_turing_takes(int n_in, int n_out, int ncols);
+/// STRATA_SM75_Q8G_CHECK=1|2 (debug): per device, the calls checked against the default kernel and the outputs that differ.
+void native_q8_0_turing_report();
 
 /// STRATA_Q6_PACKED=1 (opt-in): a packed copy of a Q6_K matrix (the output heads) - the same bytes as ql / qh /
 /// scales / d planes - that native_q6_k_mmvq calls on `weights` read instead (bitwise equal outputs). The copy is
