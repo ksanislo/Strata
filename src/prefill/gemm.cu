@@ -60,6 +60,14 @@
 
 namespace strata::prefill {
 namespace {
+#if !defined(__HIPCC__)
+// STRATA_F16_RANGE (gemm_tc_range_read): what the FP16 path's conversions meet - slot 0 the weights, slot 1 the
+// activations: the largest |value|, how many were clamped at 65504, how many land in FP16's subnormal band (< 2^-14,
+// fewer than 10 mantissa bits kept), and how many were converted
+__device__ int g_tc_range_on = 0;
+__device__ unsigned g_tc_range_max[2] = {0, 0};
+__device__ unsigned long long g_tc_range_cnt[2][3] = {};
+#endif
 #if defined(__HIPCC__)
 // STRATA_F16_RANGE (gemm_set_f16_range): the largest |value| and the count beyond 65504 / non-finite, for the BF16
 // weights converted to FP16 (slot 0, bf16_to_f16_rows) and the FP16 GEMM outputs widened (slot 1, widen_rows_f16 -
@@ -103,7 +111,33 @@ __global__ void bf16_to_f16_rows(const uint16_t* __restrict__ s, __half* __restr
 #endif
 }  // namespace
 
+bool gemm_tc_range_read(float max_abs[2], unsigned long long clamped[2], unsigned long long subnormal[2],
+                        unsigned long long total[2], bool reset) {
+#if !defined(__HIPCC__)
+    unsigned bits[2] = {0, 0};
+    unsigned long long c[2][3] = {};
+    if (cudaMemcpyFromSymbol(bits, g_tc_range_max, sizeof bits) != cudaSuccess ||
+        cudaMemcpyFromSymbol(c, g_tc_range_cnt, sizeof c) != cudaSuccess) { cudaGetLastError(); return false; }
+    for (int k = 0; k < 2; ++k) {
+        float f;
+        std::memcpy(&f, &bits[k], 4);
+        max_abs[k] = f; clamped[k] = c[k][0]; subnormal[k] = c[k][1]; total[k] = c[k][2];
+    }
+    if (reset) {
+        const unsigned z[2] = {0, 0}; const unsigned long long zz[2][3] = {};
+        cudaMemcpyToSymbol(g_tc_range_max, z, sizeof z); cudaMemcpyToSymbol(g_tc_range_cnt, zz, sizeof zz);
+    }
+    return true;
+#else
+    (void) max_abs; (void) clamped; (void) subnormal; (void) total; (void) reset;
+    return false;
+#endif
+}
 void gemm_set_f16_range(bool on) {
+#if !defined(__HIPCC__)
+    const int tc = on ? 1 : 0;
+    if (cudaMemcpyToSymbol(g_tc_range_on, &tc, sizeof tc) != cudaSuccess) cudaGetLastError();
+#endif
 #if defined(__HIPCC__)
     const int v = on ? 1 : 0;
     if (cudaMemcpyToSymbol(g_f16_range_on_g, &v, sizeof v) != cudaSuccess) {
@@ -669,18 +703,25 @@ bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
 // Pascal (6.x) has no tensor cores and cuBLAS has no BF16 GEMM for it (#395, measured NOT_SUPPORTED on a P40): both
 // operands are widened to fp32 by an exact shift and the product is cublasSgemm with the same fp32 accumulator.
 namespace {
-__global__ void bf16_to_f16_kernel(const uint16_t* __restrict__ in, __half* __restrict__ out, int64_t n) {
+__global__ void bf16_to_f16_kernel(const uint16_t* __restrict__ in, __half* __restrict__ out, int64_t n, int slot) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         float f = __uint_as_float((uint32_t) in[i] << 16);
+        if (g_tc_range_on) {
+            const float a = fabsf(f);
+            if (__float_as_uint(a) > g_tc_range_max[slot]) atomicMax(&g_tc_range_max[slot], __float_as_uint(a));
+            if (a > 65504.0f && !isinf(a)) atomicAdd(&g_tc_range_cnt[slot][0], 1ull);
+            if (a > 0.0f && a < 6.103515625e-05f) atomicAdd(&g_tc_range_cnt[slot][1], 1ull);
+            if (threadIdx.x == 0) atomicAdd(&g_tc_range_cnt[slot][2], (unsigned long long) min((int64_t) blockDim.x, n - i));
+        }
         if (f > 65504.0f && !isinf(f)) f = 65504.0f;
         else if (f < -65504.0f && !isinf(f)) f = -65504.0f;
         out[i] = __float2half_rn(f);
     }
 }
-void bf16_to_f16(const uint16_t* in, uint16_t* out, int64_t n, cudaStream_t st) {
+void bf16_to_f16(const uint16_t* in, uint16_t* out, int64_t n, cudaStream_t st, int slot = 0) {
     if (n <= 0) return;
-    bf16_to_f16_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, st>>>(in, reinterpret_cast<__half*>(out), n);
+    bf16_to_f16_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, st>>>(in, reinterpret_cast<__half*>(out), n, slot);
 }
 #if defined(STRATA_EXPERIMENTAL_SM60)   // Pascal runs only the experimental build
 __global__ void bf16_to_f32_kernel(const uint16_t* __restrict__ in, float* __restrict__ out, int64_t n) {
@@ -965,7 +1006,8 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
 #else
     constexpr bool kPascalPath = false;
 #endif
-    if (const int path = K > 0 ? bf16_path() : 0; (path == 1 && N > 1 && beta == 0.0f) || (path == 2 && kPascalPath)) {
+    if (const int path = K > 0 ? (tc_hold_ && bf16_path() == 1 ? 0 : bf16_path()) : 0;
+        (path == 1 && N > 1 && beta == 0.0f) || (path == 2 && kPascalPath)) {
         // FP16 (path 1) or FP32 (path 2, Pascal) copies of the weight and of X, converted in tiles.  Issue #1757: when
         // the buffers did not fit in the VRAM that was left (a stage of a layer split keeps ~100 MiB), this fell through
         // to the raw BF16 cuBLAS call, which a Pascal card answers with CUBLAS_STATUS_INTERNAL_ERROR (14).  Now the
@@ -1012,7 +1054,7 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
                         if (x_f16) {   // already the converted values (the same slices: the same GEMMs)
                             f16(X + t0 * K, tc_w_, Y + t0 * ldy + n0, n, nn, K, ldy, beta);
                         } else {
-                            bf16_to_f16(X + t0 * K, tc_x_, n * K, (cudaStream_t) stream_);
+                            bf16_to_f16(X + t0 * K, tc_x_, n * K, (cudaStream_t) stream_, 1);
                             f16(tc_x_, tc_w_, Y + t0 * ldy + n0, n, nn, K, ldy, beta);
                         }
                     }
