@@ -724,6 +724,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(strata src/program/generate.cpp)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+  if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
+    # STRATA_PARALLEL_LOAD's GGUF reader against the reference one (CPU only: synthetic shards, no device call)
+    add_executable(parallel_load_test src/core/parallel_load_test.cpp)
+    target_include_directories(parallel_load_test PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(parallel_load_test PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+  endif()
 
   # NEW-MODELS-PLAN.md T1: Qwen3.6-35B-A3B's reference path (one GPU, the model resident, plain kernels), checked
   # against llama.cpp by tools/qwen35/; the engine itself does not run the family yet

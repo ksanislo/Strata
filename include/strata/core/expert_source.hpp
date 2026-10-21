@@ -1306,6 +1306,10 @@ private:
     /// index of the registered range holding [off, off + len), or -1
     int64_t pin_range_of(uint64_t off, uint64_t len) const;
     std::string gguf_;
+    std::vector<int> load_nodes_;
+public:
+    /// STRATA_PARALLEL_LOAD, before open(): each layer's NUMA node (the node of the card that runs it); empty: unpinned.
+    void set_load_layer_nodes(std::vector<int> nodes) { load_nodes_ = std::move(nodes); }
 };
 
 /// Plan v0.3 P6: checks native_experts.txt's GGUF spans against the files, before anything is read: each layer's
@@ -1319,5 +1323,15 @@ bool check_experts_gguf(const std::string& native, const strata::kernels::cpu::E
 LoadStats load_experts_gguf(const std::string& native, uint8_t* dst, const strata::kernels::cpu::ExpertLayout& lay,
                             int threads, bool unbuffered = false, const std::atomic<int>* ready = nullptr,
                             const PadMap* pad = nullptr);
+/// STRATA_PARALLEL_LOAD: the same fill, each (expert, role) piece read straight into its place (no staging copy) by
+/// `threads_per_node` threads per NUMA node of `layer_nodes` (one per layer; a thread runs on its node's CPUs and
+/// fills that node's layers), or `threads_per_node` unpinned threads over every layer when `layer_nodes` is empty.
+LoadStats load_experts_gguf_parallel(const std::string& native, uint8_t* dst,
+                                     const strata::kernels::cpu::ExpertLayout& lay, const std::vector<int>& layer_nodes,
+                                     int threads_per_node, const PadMap* pad = nullptr);
+/// STRATA_PARALLEL_LOAD: 0 off (default), 1 on.  STRATA_PARALLEL_LOAD_REGISTER=first keeps the registration before
+/// the fill (only the fill is parallel); default: the arena is filled first and registered after.
+int parallel_load_mode();
+bool parallel_load_register_first();
 
 }  // namespace strata::core
