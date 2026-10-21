@@ -122,7 +122,7 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_pipe_kernel(float* __res
 // order: the same bits (src/prefill/gdn_rec_parity.cu checks them and times the variants: 1.41x on a 4080 Super).
 // sm_80+ (gdn_keyhead_ok); STRATA_GDN_KEYHEAD=0: gdn_rec_cols_pipe_kernel.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
-#define STRATA_GDN_CP_ASYNC 0   // Turing builds: plain copies (never launched there, see gdn_keyhead_ok)
+#define STRATA_GDN_CP_ASYNC 0   // Turing builds: plain copies (launched there only with STRATA_GDN_KEYHEAD=1)
 #else
 #define STRATA_GDN_CP_ASYNC 1
 #endif
@@ -1367,6 +1367,14 @@ int main(int argc, char** argv) {
     const int64_t Ts[] = {1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 33, 257, 1000, 4099};
     uint64_t seed = 11;
     for (const int64_t T : Ts) fails += check_bits(T, seed++);
+    fails += check_bits(8192, seed++);   // a whole prompt chunk (Turing: the plain-copy staging, STRATA_GDN_KEYHEAD=1)
+    {   // the engine's other condition (gdn_keyhead_ok): all 64 blocks in one wave on this card
+        int per_sm = 0;
+        ck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gdn_rec_kh_kernel, CB * RG, 0), "occupancy");
+        std::printf("gdn_rec_kh_kernel: %d blocks per SM x %d SMs, %s (%s)\n", per_sm, p.multiProcessorCount,
+                    per_sm * p.multiProcessorCount >= HK * NCB ? "one wave" : "two waves: the engine keeps the kernel before",
+                    p.major >= 8 ? "cp.async" : "plain copies");
+    }
     for (const int64_t T : Ts) fails += check_chunked(T, seed++);
     for (const int64_t T : {(int64_t) 8192, (int64_t) 32768}) fails += check_chunked(T, seed++);
     if (do_bench) {
