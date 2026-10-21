@@ -11471,7 +11471,8 @@ int main(int argc, char** argv) {
             for (size_t b = 0; b < bs.size(); ++b) {
                 const BSlot& sl = bs[b];
                 strata::core::SessionState& u = *bslot_ss[k][b];
-                if (sl.active || u.slot_cells < 0 || (int) b == skip || (int) b == admit_slot) continue;
+                if (sl.active || sl.reading || u.slot_cells < 0) continue;   // (STRATA_SLOT_ADMIT: a read writes it)
+                if ((int) b == skip || (int) b == admit_slot) continue;
                 const bool keeps = sl.cached || sl.partial;
                 const int64_t keep = keeps ? (int64_t) sl.ids.size() + 4 : 1;
                 if (u.slot_cells <= keep) continue;
@@ -11505,7 +11506,7 @@ int main(int argc, char** argv) {
                     BSlot& sj = bs[(size_t) j];
                     bool big = false;
                     for (const auto& v : bslot_ss) big = big || v[(size_t) j]->slot_cells > 1;
-                    if (j == b || j == admit_slot || sj.active || sj.partial != (pass == 1) || !big) continue;
+                    if (j == b || j == admit_slot || sj.active || sj.reading || sj.partial != (pass == 1) || !big) continue;
                     for (size_t k = 0; k < bslot_ss.size(); ++k) {
                         strata::core::SessionState& u = *bslot_ss[k][(size_t) j];
                         if (u.slot_cells < 0) continue;
@@ -12255,11 +12256,13 @@ int main(int argc, char** argv) {
                     // loan starts where the chunk itself needs it (the 128-slot floor aside); a chunk that cannot be
                     // lent even then is halved until it can, instead of ending the engine.
                     int64_t need_p = part_slots(p, want_p);
-                    while ((need_p <= 0 || need_p + 128 > p.cache->slots()) && want_p > 256) {
+                    // STRATA_ELASTIC_SLOTS_GIVE: a loan stays above the slots the cache may give the batch slots
+                    const int64_t room_p = give_on ? p.cache->slots() - give_top(p.cache) : p.cache->slots();
+                    while ((need_p <= 0 || need_p + 128 > p.cache->slots() || (give_on && need_p > room_p)) && want_p > 256) {
                         want_p = std::max<int64_t>(256, want_p / 2 / 256 * 256);
                         need_p = part_slots(p, want_p);
                     }
-                    if (need_p <= 0 || need_p + 128 > p.cache->slots()) {
+                    if (need_p <= 0 || need_p + 128 > p.cache->slots() || (give_on && need_p > room_p)) {
                         e = "prefill: no chunk of this request fits the slots that can be lent (#2090)";
                         return false;
                     }
@@ -12533,8 +12536,23 @@ int main(int argc, char** argv) {
                     if (p[(size_t) i] != (int32_t) j.r.ids[(size_t) i]) return false;
                 return true;
             };
+            // STRATA_ELASTIC_SLOTS: the slot backed for the whole prompt before the read writes it; when the budget is short,
+            // everything drains and the old admission's fit runs (it starts the slot over: only its checkpoints resume)
+            bool fresh = false;
+            if (eslots_on) {
+                const std::function<bool(size_t)> busy = [](size_t) { return false; };
+                if (slot_fit(b, n + 1, false, busy) != 0) {
+                    std::string fe;
+                    if (!pipe_drain()) return AdmEnd::fatal;
+                    if (!slot_admit_fit(b, n, fe)) {
+                        sl.cached = false;
+                        return refuse(fe.c_str());
+                    }
+                    fresh = true;
+                }
+            }
             if (o.prompt_cache > 0 && !nan_flush && !sl.tainted && !sl.img && sl.cvec == cvec_cached) {
-                if (sl.cached && pre(sl.ids)) j.resume = (int64_t) sl.ids.size();
+                if (sl.cached && !fresh && pre(sl.ids)) j.resume = (int64_t) sl.ids.size();
                 for (const ConvCheckpoint& c : sl.checks)
                     if (c.imgs.empty() && c.stage_parts.size() == stages.size() && (int64_t) c.ids.size() > j.resume &&
                         pre(c.ids)) {
