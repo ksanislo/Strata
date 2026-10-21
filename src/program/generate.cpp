@@ -49,6 +49,7 @@
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/verify_kernels.hpp"
@@ -15459,6 +15460,7 @@ int main(int argc, char** argv) {
                              100.0 * (double) req_hits / (double) req_look,
                              (long long) req_hits, (long long) req_look, off);
             }
+            strata::kernels::native_q8_0_turing_report();   // STRATA_SM75_Q8G_CHECK, cumulative
             if (drive.d.tail_experts > 0)   // STRATA_ROUTE_TAIL_SKIP, cumulative
                 std::fprintf(stderr, "strata serve: route tail skip: %lld missed experts skipped (%lld entries) since the "
                                      "start\n", (long long) drive.d.tail_experts, (long long) drive.d.tail_skipped);

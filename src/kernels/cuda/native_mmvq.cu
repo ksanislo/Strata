@@ -2875,6 +2875,24 @@ int q8g_rows(int ncols) {
     return ncols > 4 && r > 2 ? 2 : r;   // 5-8 columns: the accumulators of 4 rows would spill
 }
 
+// STRATA_SM75_Q8G_CHECK (debug): 1 = also run the default kernel first and count outputs that differ, keeping the new ones;
+// 2 = the same, keeping the default's.  native_q8_0_turing_report prints the counts.
+int q8g_check_mode() {
+    static const int v = q8g_env_int("STRATA_SM75_Q8G_CHECK", 0);
+    return v == 1 || v == 2 ? v : 0;
+}
+__device__ unsigned long long g_q8g_chk[3];   // calls, outputs, outputs that differ
+__device__ unsigned int g_q8g_first[7];        // the first difference: n_in, n_out, ncols, row, column, default bits, new bits
+
+__device__ __forceinline__ void q8g_check_store(float* out, float v, int check, int n_in, int n_out, int ncols, int row, int col) {
+    const unsigned a = __float_as_uint(*out), b = __float_as_uint(v);
+    if (a != b && atomicAdd(&g_q8g_chk[2], 1ull) == 0) {
+        const unsigned rec[7] = {unsigned(n_in), unsigned(n_out), unsigned(ncols), unsigned(row), unsigned(col), a, b};
+        for (int k = 0; k < 7; ++k) g_q8g_first[k] = rec[k];
+    }
+    if (check == 1) *out = v;
+}
+
 bool q8g_takes(int n_in, int n_out, int ncols) {
     if (ncols < 2 || ncols > MAX_NCOLS || !g_multi_exact || n_in <= 0 || n_in % 32 != 0 || n_out <= 0 || !q8g_on())
         return false;
@@ -2885,7 +2903,7 @@ bool q8g_takes(int n_in, int n_out, int ncols) {
 template<int NCOLS, int R>
 __launch_bounds__(Q8G_WARPS * WARP)
 __global__ void q8g_kernel(const Q80Block* __restrict__ w, const Q81Block* __restrict__ x, float* __restrict__ y,
-                           int n_in, int n_out) {
+                           int n_in, int n_out, int check) {
     extern __shared__ int4 q8g_smem_buf[];
     int* sq = reinterpret_cast<int*>(q8g_smem_buf);                           // [NCOLS][n_in / 4]
     float* sd = reinterpret_cast<float*>(sq + std::size_t(NCOLS) * (n_in / 4));   // [NCOLS][n_in / 32]
@@ -2896,6 +2914,10 @@ __global__ void q8g_kernel(const Q80Block* __restrict__ w, const Q81Block* __res
         if ((i & 7) == 0) sd[i >> 3] = __low2float(b.ds);
     }
     __syncthreads();
+    if (check && blockIdx.x == 0 && threadIdx.x == 0) {
+        atomicAdd(&g_q8g_chk[0], 1ull);
+        atomicAdd(&g_q8g_chk[1], (unsigned long long) n_out * NCOLS);
+    }
     const int lane = int(threadIdx.x) & (WARP - 1);
     const int kqs = 2 * (lane % 4);
     const int nm = (nb + 7) / 8;   // chunks of 8 blocks, 4 to a pass of the exact layout
@@ -2948,7 +2970,10 @@ __global__ void q8g_kernel(const Q80Block* __restrict__ w, const Q81Block* __res
                 s += acc[2][i][j];
                 s += acc[3][i][j];
                 s = warp_sum(s);
-                if (lane == 0 && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = s;
+                if (lane == 0 && row0 + i < n_out) {
+                    if (check) q8g_check_store(y + std::size_t(j) * n_out + row0 + i, s, check, n_in, n_out, NCOLS, row0 + i, j);
+                    else y[std::size_t(j) * n_out + row0 + i] = s;
+                }
             }
     }
 }
@@ -2977,7 +3002,7 @@ void q8g_launch_r(const Q80Block* w, const Q81Block* x, float* y, int n_in, int 
     const int per_sm = std::max(1, std::min(occ[dev].load(), by_smem));
     const int groups = (n_out + R - 1) / R;
     const int grid = std::min((groups + Q8G_WARPS - 1) / Q8G_WARPS, sms[dev].load() * per_sm);
-    q8g_kernel<NCOLS, R><<<unsigned(grid), Q8G_WARPS * WARP, smem, s>>>(w, x, y, n_in, n_out);
+    q8g_kernel<NCOLS, R><<<unsigned(grid), Q8G_WARPS * WARP, smem, s>>>(w, x, y, n_in, n_out, q8g_check_mode());
 }
 
 template<int NCOLS>
@@ -2999,6 +3024,7 @@ bool q8g_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n
     const auto* w = static_cast<const Q80Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
     const auto s = static_cast<cudaStream_t>(stream);
+    if (q8g_check_mode()) launch_multi<SmallTraits<Q80Block, 8>>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
     switch (ncols) {
         case 2: q8g_launch_n<2>(w, x, y, n_in, n_out, s); break;
         case 3: q8g_launch_n<3>(w, x, y, n_in, n_out, s); break;
@@ -3011,7 +3037,28 @@ bool q8g_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n
     launch_check();
     return true;
 }
+
+void q8g_report() {
+    if (!q8g_check_mode()) return;
+    int cur = 0, n = 0;
+    cudaGetDevice(&cur);
+    cudaGetDeviceCount(&n);
+    for (int d = 0; d < n; ++d) {
+        unsigned long long c[3] = {};
+        unsigned int fst[7] = {};
+        if (cudaSetDevice(d) != cudaSuccess || cudaMemcpyFromSymbol(c, g_q8g_chk, sizeof c) != cudaSuccess ||
+            cudaMemcpyFromSymbol(fst, g_q8g_first, sizeof fst) != cudaSuccess) { cudaGetLastError(); continue; }
+        std::fprintf(stderr, "strata: STRATA_SM75_Q8G_CHECK=%d: device %d: %llu calls, %llu outputs, %llu differ from the "
+                     "default kernel", q8g_check_mode(), d, c[0], c[1], c[2]);
+        if (c[2] != 0)
+            std::fprintf(stderr, " (first: %u x %u, %u columns, row %u column %u: default 0x%08x new 0x%08x)", fst[0], fst[1],
+                         fst[2], fst[3], fst[4], fst[5], fst[6]);
+        std::fprintf(stderr, "\n");
+    }
+    cudaSetDevice(cur);
+}
 #else
+void q8g_report() {}
 bool q8g_takes(int, int, int) { return false; }
 bool q8g_mmvq(const void*, const void*, float*, int, int, int, void*) { return false; }
 #endif
@@ -3072,6 +3119,7 @@ void native_q8_0_turing_tune(int force, int rows, int min_out) {
 #endif
 }
 bool native_q8_0_turing_takes(int n_in, int n_out, int ncols) { return q8g_takes(n_in, n_out, ncols); }
+void native_q8_0_turing_report() { q8g_report(); }
 
 void native_q8_0_f32(const void* weights, const float* x, void* scratch_q8_1,
                       float* y, int n_in, int n_out, int ncols, void* stream) {
