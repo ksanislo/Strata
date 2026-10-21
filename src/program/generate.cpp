@@ -8482,6 +8482,12 @@ int main(int argc, char** argv) {
             if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes,
                          o.prefill_head_alias))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
+            // STRATA_P2P_HANDOFF=2: the prompt path's chunks too (2 buffers of a chunk in the reader's VRAM per boundary)
+            if (const char* v = std::getenv("STRATA_P2P_HANDOFF"); v != nullptr && std::atoi(v) >= 2 && multi_gpu)
+                for (size_t i = 0; i <= stages.size(); ++i) {
+                    const std::string line = (i == 0 ? sp : stages[i - 1]->sp).enable_peer_handoff();
+                    if (!line.empty()) std::fprintf(stderr, "strata serve: STRATA_P2P_HANDOFF: %s\n", line.c_str());
+                }
             return 0;
         };
         static constexpr int64_t kStepChunks[] = {6144, 4096, 3072, 2048, 1536, 1024, 512};
@@ -8692,22 +8698,47 @@ int main(int argc, char** argv) {
                     stage_ver_p(st, par).set_always_publish(true);
                 }
         }
+        // STRATA_P2P_HANDOFF=1 (opt-in): a stage boundary whose writer can reach the reader's VRAM (cudaDeviceCanAccessPeer)
+        // hands off there - the writer's copy kernel writes over the peer link, the reader reads its own memory; the
+        // order is the host's, as before (a stream sync or poll between the stages).  Other boundaries stay in mapped
+        // host memory.  Returns the buffer on the reader's device, or null for the host path.
+        const bool p2p_asked = [] { const char* v = std::getenv("STRATA_P2P_HANDOFF"); return v != nullptr && std::atoi(v) != 0; }();
+        int dev0 = 0;
+        (void) cudaGetDevice(&dev0);
+        auto stage_dev = [&](int st) { return st == 0 ? dev0 : stages[(size_t) st - 1]->dev; };
+        auto p2p_handoff = [&](int b, size_t bytes) -> float* {   // boundary b: stage b writes, stage b + 1 reads
+            if (!p2p_asked || split_same || (size_t) b + 1 > stages.size()) return nullptr;
+            const int w = stage_dev(b), r = stage_dev(b + 1);
+            const char* why = nullptr;
+            int can = 0;
+            float* p = nullptr;
+            if (w == r) why = "one device";
+            else if (cudaDeviceCanAccessPeer(&can, w, r) != cudaSuccess || can == 0) why = "no peer access";
+            if (why == nullptr) {
+                const strata::core::OnDevice on(w);
+                const cudaError_t e = cudaDeviceEnablePeerAccess(r, 0);
+                if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) why = "enabling peer access failed";
+            }
+            if (why == nullptr) {
+                const strata::core::OnDevice on(r);
+                if (cudaMalloc((void**) &p, bytes) != cudaSuccess || cudaMemset(p, 0, bytes) != cudaSuccess) {
+                    if (p != nullptr) cudaFree(p);
+                    p = nullptr;
+                    why = "no VRAM for it";
+                }
+            }
+            (void) cudaGetLastError();
+            const std::string how = p != nullptr ? "in CUDA" + std::to_string(r) + "'s VRAM, peer to peer"
+                                                 : std::string("through host memory (") + why + ")";
+            std::fprintf(stderr, "strata serve: STRATA_P2P_HANDOFF: CUDA%d -> CUDA%d hands off %s, %.0f KiB\n", w, r,
+                         how.c_str(), (double) bytes / 1024.0);
+            return p;
+        };
         if (n_stages > 1) {
             // pipelined slot groups write their rows at hbase = group * rows-per-group, so with more than
             // kVerifyMaxT slots in groups the hand-off holds one row per slot (otherwise kVerifyMaxT, as before)
             const int hrows = !batch_mtp && o.batch_groups > 1 ? std::max<int>(strata::kernels::kVerifyMaxT, o.batch)
                                                                : strata::kernels::kVerifyMaxT;
-            const size_t hb = (size_t) hrows * (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
-            std::vector<float*> hand((size_t) n_stages - 1, nullptr);
-            for (float*& h : hand) {
-                float* hh = nullptr;
-                if (cudaHostAlloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
-                    cudaHostGetDevicePointer((void**) &h, hh, 0) != cudaSuccess) {
-                    std::fprintf(stderr, "strata serve: the layer-split hand-off allocation failed\n");
-                    return 1;
-                }
-                std::memset(hh, 0, hb);
-            }
             // STRATA_SPLIT_OVERLAP=1 (opt-in; measured on 2x RX 7900 XTX only): a ready word per hand-off, raised by the
             // writing stage's GPU, so the next stage's window is launched early and the host never syncs between
             // stages (Verifier::set_handoff_flags).  Not for --split-device 0 (both stages on one GPU).
@@ -8720,6 +8751,19 @@ int main(int argc, char** argv) {
             if (overlap_asked && o.pipeline_windows > 0)
                 std::fprintf(stderr, "strata serve: STRATA_SPLIT_OVERLAP is off beside --pipeline-windows %d "
                                      "(that loop overlaps the stages itself)\n", o.pipeline_windows);
+            const size_t hb = (size_t) hrows * (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
+            std::vector<float*> hand((size_t) n_stages - 1, nullptr);
+            for (size_t b = 0; b < hand.size(); ++b) {
+                float*& h = hand[b];
+                if (!overlap && (h = p2p_handoff((int) b, hb)) != nullptr) continue;   // (the ready flag stays mapped)
+                float* hh = nullptr;
+                if (cudaHostAlloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                    cudaHostGetDevicePointer((void**) &h, hh, 0) != cudaSuccess) {
+                    std::fprintf(stderr, "strata serve: the layer-split hand-off allocation failed\n");
+                    return 1;
+                }
+                std::memset(hh, 0, hb);
+            }
             std::vector<uint32_t*> hflag_h((size_t) n_stages - 1, nullptr), hflag_d((size_t) n_stages - 1, nullptr);
             if (overlap)
                 for (size_t i = 0; i < hflag_h.size(); ++i) {
@@ -8791,7 +8835,9 @@ int main(int argc, char** argv) {
             const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             std::vector<float*> hand_b((size_t) n_stages - 1, nullptr);   // the odd windows' hand-off per boundary
-            for (float*& h : hand_b) {
+            for (size_t b = 0; b < hand_b.size(); ++b) {
+                float*& h = hand_b[b];
+                if ((h = p2p_handoff((int) b, hb)) != nullptr) continue;
                 float* hh = nullptr;
                 if (cudaHostAlloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
                     cudaHostGetDevicePointer((void**) &h, hh, 0) != cudaSuccess) {
