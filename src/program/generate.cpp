@@ -13489,7 +13489,8 @@ int main(int argc, char** argv) {
         // Each stage's own pool with STRATA_STAGE_SERVE (prompt_pool_of).  Called on the main thread before a read.
         // The pools go back when the read ends (ShareScope), and while a read holds them no slot window starts
         // (share_live: batch_step and the pump's group start wait), so a slot that begins decoding meanwhile never runs
-        // its windows on a pool a prompt chunk is using.
+        // its windows on a pool a prompt chunk is using.  Queued reads (STRATA_SLOT_ADMIT_MULTI) run beside the windows
+        // by design: never with the share.
         auto read_share_set = [&](bool on) {
             if (!rt_share) return;
             sp.set_cpu_pool(on ? prompt_pool_of(0) : nullptr);
@@ -13501,7 +13502,8 @@ int main(int argc, char** argv) {
             ShareScope(std::function<void(bool)> f, bool on) : set(std::move(f)) { set(on); }
             ~ShareScope() { set(false); }
         };
-        auto read_share_now = [&] { return rt_share && !batch_on() && !pipe_inflight(); };
+        bool share_block = false;   // a run of queued reads (STRATA_SLOT_ADMIT_MULTI) is under way
+        auto read_share_now = [&] { return rt_share && !share_block && !batch_on() && !pipe_inflight(); };
         auto adm_lend_covers = [&](int64_t tokens) {
             const int64_t want = lend_want(tokens);
             for (const PfPart& p : pf_parts)
@@ -13923,6 +13925,12 @@ int main(int argc, char** argv) {
             return v != nullptr && std::atoi(v) != 0;
         }();
         auto adm_multi_run = [&](const std::string& first, int& n_adm) -> bool {
+            read_share_set(false);
+            struct Block {
+                bool& b;
+                ~Block() { b = false; }
+            } share_block_scope{share_block};
+            share_block = true;
             const size_t n_st = stages.size() + 1;
             std::vector<std::unique_ptr<AdmJob>> live;
             struct Joins {   // (after `live`: first to go) every set-up thread joined, no slot left marked queued
