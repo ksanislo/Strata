@@ -439,7 +439,13 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)   // (HIP, Metal: the default priority)
     static const bool hi_prio = [] { const char* v = std::getenv("STRATA_MTP_PRIORITY"); return v == nullptr || std::atoi(v) != 0; }();
     int prio_lo = 0, prio_hi = 0;
-    if (force_on_ && hi_prio && cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi) == cudaSuccess)
+    // (STRATA_SLOT_ADMIT: the slot drafters share their card with prompt reads too)
+    static const bool beside_reads = [] {
+        const char* v = std::getenv("STRATA_SLOT_ADMIT");
+        const char* p = std::getenv("STRATA_PIPED_CONCURRENT_PRIO");
+        return v != nullptr && std::atoi(v) != 0 && (p == nullptr || std::atoi(p) != 0);
+    }();
+    if ((force_on_ || beside_reads) && hi_prio && cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi) == cudaSuccess)
         prio = cudaStreamCreateWithPriority(&cs_, cudaStreamNonBlocking, prio_hi) == cudaSuccess;
     cudaGetLastError();
 #endif
