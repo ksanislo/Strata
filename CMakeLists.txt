@@ -1740,7 +1740,9 @@ if(STRATA_NATIVE_EXPERTS)
     set_source_files_properties(src/kernels/cpu/tq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
     set_source_files_properties(src/kernels/cpu/tq_avx512.cpp PROPERTIES COMPILE_OPTIONS
                                 "-mavx512f;-mavx512bw;-mavx512vl;-mavx512vnni;-mavx512vbmi;-mavx2;-mfma;-mf16c")
-    set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "-mavx")
+    # the router dot and the Q4_K/Q5_1/Q8_0 expert rows for AVX-only CPUs: no AVX2/FMA/F16C may leak in
+    set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS
+                                "-msse4.2;-mavx;-mno-avx2;-mno-fma;-mno-f16c")
     # the older CPUs' Q2_0 rows and activation quantizer (q2_avx1.cpp, issue #1699): SSE4.2 + AVX with
     # AVX2/FMA/F16C explicitly off, so a -march=native build host cannot leak AVX2 code into the file that
     # runs on a Sandy Bridge Xeon
@@ -1794,6 +1796,13 @@ if(STRATA_NATIVE_EXPERTS)
   target_link_libraries(iq_avx1_parity PRIVATE strata_kernels_cpu)
   if(STRATA_BUILD_TESTS)
     add_test(NAME iq_avx1_parity COMMAND iq_avx1_parity)
+  endif()
+  # the older CPUs' Q4_K/Q5_1/Q8_0 expert rows (kq_avx1.cpp) bit for bit against ggml-cpu's __AVX__ dots
+  # (STRATA_ISA_FLOOR=avx builds; elsewhere it has no reference and passes); --bench: old vs new, pinned threads
+  add_executable(kq_avx1_parity src/kernels/cpu/kq_avx1_parity.cpp)
+  target_link_libraries(kq_avx1_parity PRIVATE strata_kernels_cpu)
+  if(STRATA_BUILD_TESTS)
+    add_test(NAME kq_avx1_parity COMMAND kq_avx1_parity)
   endif()
   # the AVX-2 Q8_K activation quantizer against ggml's, byte for byte (--bench: its time)
   add_executable(q8k_quant_parity src/kernels/cpu/q8k_quant_parity.cpp)
