@@ -347,6 +347,13 @@ inline int release_host_inheritors() {
     return n;
 }
 
+/// The CPUs the process could use when `configure` ran (before any thread was pinned).
+inline std::vector<int> allowed_cpus() {
+    detail::State& s = detail::state();
+    std::lock_guard<std::mutex> lk(s.mu);
+    return s.allowed;
+}
+
 /// The aux CPUs of the plan ({} when there is none).
 inline std::vector<int> plan() {
     detail::State& s = detail::state();
@@ -417,6 +424,7 @@ inline void set_enabled(bool) {}
 inline bool enabled() { return false; }
 inline bool place_off_host() { return false; }   // (a new thread does not inherit the host's CPU set here)
 inline int release_host_inheritors() { return 0; }
+inline std::vector<int> allowed_cpus() { return {}; }
 inline std::vector<int> plan() { return {}; }
 inline std::string set_topology(int, const std::vector<int>&) { return "strata aux cpus: not available on this system"; }
 
