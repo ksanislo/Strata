@@ -5176,21 +5176,6 @@ void Prefill::enqueue(std::shared_ptr<PromptJob> job, bool front) {
     jobs_->cv.notify_one();
 }
 
-std::vector<std::shared_ptr<PromptJob>> Prefill::withdraw(const std::function<bool(const PromptJob&)>& pred) {
-    std::vector<std::shared_ptr<PromptJob>> out;
-    if (!jobs_) return out;
-    std::lock_guard<std::mutex> lk(jobs_->mu);
-    for (auto it = jobs_->q.begin(); it != jobs_->q.end();) {
-        if (pred(**it)) {
-            out.push_back(std::move(*it));
-            it = jobs_->q.erase(it);
-        } else {
-            ++it;
-        }
-    }
-    return out;
-}
-
 size_t Prefill::jobs_pending() const {
     if (!jobs_) return 0;
     std::lock_guard<std::mutex> lk(jobs_->mu);
