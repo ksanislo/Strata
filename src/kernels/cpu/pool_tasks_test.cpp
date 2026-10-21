@@ -116,6 +116,7 @@ int main(int argc, char** argv) {
         auto one = [&](const std::vector<int>& cores, std::vector<cpu::ExpertJobMulti>& jobs, std::vector<float>& out) {
             cpu::ExpertPool pool(cores, /*host_works=*/true, 0);
             for (int r = 0; r < 200; ++r) {
+                if (r % 7 == 3) pool.nap();   // parked workers sleep at once; the next batch wakes them
                 std::fill(out.begin(), out.end(), 0.0f);
                 pool.run_split_multi_native(f, jobs.data(), n);
                 if (std::memcmp(ref.data(), out.data(), out.size() * sizeof(float)) != 0) { ++bad; return; }
