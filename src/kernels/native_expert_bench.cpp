@@ -136,10 +136,15 @@ int main(int argc, char** argv) {
                 ++ndiff;
                 worst = std::fmax(worst, std::fabs((double) ref[i] - got[i]) / (std::fabs((double) ref[i]) + 1e-6));
             }
+        // phase 3: phase 1 then phase 2 as two calls, the same launches as phase 0 (a check on the timing itself)
+        auto run3 = [&](int m, int phase) {
+            if (phase == 3) { run(m, 1); run(m, 2); }
+            else run(m, phase);
+        };
         auto time = [&](int m, int phase) {
-            for (int i = 0; i < 10; ++i) run(m, phase);
+            for (int i = 0; i < 10; ++i) run3(m, phase);
             cudaEventRecord(e0, s);
-            for (int i = 0; i < iters; ++i) run(m, phase);
+            for (int i = 0; i < iters; ++i) run3(m, phase);
             cudaEventRecord(e1, s);
             cudaEventSynchronize(e1);
             float ms = 0;
@@ -147,15 +152,20 @@ int main(int argc, char** argv) {
             return 1e3 * ms / iters;
         };
         const double gu_b = (double) G * 2 * f.up_off, d_b = (double) G * dsz;
-        double us[2][3] = {{1e30, 1e30, 1e30}, {1e30, 1e30, 1e30}};
-        for (int round = 0; round < 3; ++round)   // interleaved, the minimum: the clocks wander between runs
-            for (int k = 0; k < 2; ++k)
-                for (int p = 0; p < 3; ++p) us[k][p] = std::fmin(us[k][p], time(k ? mode : mref, p));
-        std::printf("layer %2d %-7s/%-6s G %d T %d | mode %d: all %7.1f us  gu %7.1f us (%3.0f GB/s)  down %6.1f us (%3.0f GB/s)"
-                    " | mode %d: all %7.1f us  gu %7.1f us (%3.0f GB/s)  down %6.1f us (%3.0f GB/s) | %s\n",
+        double us[2][4] = {{1e30, 1e30, 1e30, 1e30}, {1e30, 1e30, 1e30, 1e30}};
+        // interleaved, the minimum: the clocks wander between runs; the phase and mode order rotates every round, so no
+        // measurement always follows the same one (09-kq-layout: "all" came out ~100 us under gu + down for one mode only)
+        for (int round = 0; round < 4; ++round)
+            for (int pi = 0; pi < 4; ++pi)
+                for (int ki = 0; ki < 2; ++ki) {
+                    const int p = (pi + round) % 4, k = (ki + round) & 1;
+                    us[k][p] = std::fmin(us[k][p], time(k ? mode : mref, p));
+                }
+        std::printf("layer %2d %-7s/%-6s G %d T %d | mode %d: all %7.1f us  gu %7.1f us (%3.0f GB/s)  down %6.1f us (%3.0f GB/s)  seq %7.1f"
+                    " | mode %d: all %7.1f us  gu %7.1f us (%3.0f GB/s)  down %6.1f us (%3.0f GB/s)  seq %7.1f | %s\n",
                     l, ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type), G, T,
-                    mref, us[0][0], us[0][1], gu_b / us[0][1] / 1e3, us[0][2], d_b / us[0][2] / 1e3,
-                    mode, us[1][0], us[1][1], gu_b / us[1][1] / 1e3, us[1][2], d_b / us[1][2] / 1e3,
+                    mref, us[0][0], us[0][1], gu_b / us[0][1] / 1e3, us[0][2], d_b / us[0][2] / 1e3, us[0][3],
+                    mode, us[1][0], us[1][1], gu_b / us[1][1] / 1e3, us[1][2], d_b / us[1][2] / 1e3, us[1][3],
                     ndiff ? "DIFFERS" : "bitwise equal");
         if (ndiff) {
             std::printf("          %zu of %zu outputs differ, worst rel %.2e\n", ndiff, ref.size(), worst);
