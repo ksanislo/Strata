@@ -14382,6 +14382,13 @@ int main(int argc, char** argv) {
         auto adm_run = [&](std::string first) -> bool {
             const auto t_run = Clock::now();
             cudaGetDevice(&adm_main_dev);
+            while (img_decoding()) {   // (the position table is the picture conversation's until it ends: see the main loop)
+                {
+                    std::lock_guard<std::mutex> lk(in_mu);
+                    adm_lines();
+                }
+                if (!pump(true)) return false;
+            }
             if (!adm_reserved) {   // (an allocation on the read's thread takes the driver's lock: before it, once)
                 adm_reserved = true;
                 if (!sp.reserve_uploads(sp.chunk()))
@@ -14614,6 +14621,27 @@ int main(int argc, char** argv) {
             if (line.rfind("BSTOP ", 0) == 0) {
                 adm_bstop(std::atoi(line.c_str() + 6));
                 continue;
+            }
+            // --vision beside the slots: every rope kernel reads a cell's position from ONE table, which a picture request
+            // rewrites (and a text request puts back), so a slot decoding meanwhile reads shifted positions - non-finite
+            // logits in the soak right after a picture admission.  A picture request starts when no slot decodes, a
+            // text one when no picture conversation does (the slots decode on meanwhile; BSTOPs are taken)
+            if (slot_admit && o.vision && !adm_direct) {
+                const bool img_line = line.rfind("BGENI ", 0) == 0 || line.rfind("GENI ", 0) == 0;
+                const bool req = img_line || line.rfind("BGEN ", 0) == 0 || line.rfind("GEN ", 0) == 0;
+                bool waited = false;
+                while (req && (img_line ? batch_on() : img_decoding())) {
+                    if (!waited)
+                        std::fprintf(stderr, "strata batch: a %s request waits for the %s\n", img_line ? "picture" : "text",
+                                     img_line ? "decoding slots" : "picture conversation decoding");
+                    waited = true;
+                    {
+                        std::lock_guard<std::mutex> lk(in_mu);
+                        adm_lines();
+                    }
+                    if (!pump(true)) return 1;
+                }
+                if (waited && !pipe_drain()) return 1;
             }
             if (line.rfind("BYIELD", 0) == 0) {   // for a prompt read that has ended meanwhile
                 if (trace && piped)
