@@ -12309,7 +12309,8 @@ int main(int argc, char** argv) {
             for (size_t b = 0; b < bs.size(); ++b)
                 if (bs[b].active)
                     n += strata::core::session_slot_need(*bslot_ss[k][b],
-                                                         strata::core::slot_grow_target(bs[b].p + 2, eslot_step, o.max_context));
+                                                         strata::core::slot_grow_target(bs[b].p + 2 + (piped_mtp ? pm_drafts : 0),
+                                                                                         eslot_step, o.max_context));
             return n;
         };
         // card k is quiet (no window in flight there, no prompt chunk being read): idle slots keep only what their
@@ -13176,10 +13177,11 @@ int main(int argc, char** argv) {
                     if (pick < 0) continue;
                     rr = pick + 1;
                     if (eslots_on) {   // its rows' slots backed on every stage before the window starts (pad rows: cell 0)
-                        bool wait = false;
+                        bool wait = false;   // (STRATA_PIPED_MTP: a slot's window may also write its drafts' cells)
                         for (int t = 0; t < GS; ++t)
                             if (bs[(size_t) (pick * GS + t)].active)
-                                wait = slot_grow_or_end(pick * GS + t, bs[(size_t) (pick * GS + t)].p + 2, stage_quiet) == 2 || wait;
+                                wait = slot_grow_or_end(pick * GS + t, bs[(size_t) (pick * GS + t)].p + 2 + (piped_mtp ? pm_drafts : 0),
+                                                        stage_quiet) == 2 || wait;
                         if (wait || !group_active(pick)) continue;   // (a card to give room is busy: the group starts later)
                     }
                     PGroup& G = pg[(size_t) pick];
