@@ -12577,6 +12577,7 @@ int main(int argc, char** argv) {
                 const std::function<bool(size_t)> busy = [](size_t) { return false; };
                 if (slot_fit(b, n + 1, false, busy) != 0) {
                     std::string fe;
+                    if (adm_quiet && !adm_quiet()) return AdmEnd::fatal;   // (no queued read beside the fit)
                     if (!pipe_drain()) return AdmEnd::fatal;
                     if (!slot_admit_fit(b, n, fe)) {
                         sl.cached = false;
