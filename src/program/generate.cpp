@@ -11022,6 +11022,44 @@ int main(int argc, char** argv) {
                                  (long long) (later_reserve + 768 - sf_mib));
             }
         }
+        // STRATA_SLOT_ADMIT=1: batch admissions read beside the decoding slots (adm_run, at the main loop); the first
+        // stage's PLE gets a scratch of its own for those reads (the windows use the session's)
+        bool slot_admit = false;
+        float* adm_ple_scratch = nullptr;
+        float* adm_ple_emb = nullptr;
+        {
+            strata::program::SlotAdmitSetup sa;
+            const char* v = std::getenv("STRATA_SLOT_ADMIT");
+            sa.asked = v != nullptr && std::atoi(v) != 0;
+            sa.piped = o.batch > 0 && o.batch_groups > 1 && !stages.empty();
+            sa.cvec = strata::kernels::cvec().loaded();
+            sa.head_alias = o.prefill_head_alias;
+            strata::program::ConcurrentReadSetup cs;
+            auto env_on = [](const char* k) {
+                const char* x = std::getenv(k);
+                return x != nullptr && std::atoi(x) != 0;
+            };
+            cs.prefill_help = env_on("STRATA_PREFILL_HELP");
+            cs.split_mtp_batch = env_on("STRATA_SPLIT_MTP_BATCH");
+            cs.fs_slots = env_on("STRATA_FS_SLOTS");
+            cs.pcie_dma = o.pcie_mode == "dma";
+            cs.helper_caches = prefill_src != srcp;
+            for (int r = 0; r < 3; ++r) cs.helper_caches |= o.expert_cache_remote[(size_t) r] > 0;
+            cs.staged_source = srcp == &src && src.stages_blobs();
+            cs.other_source = srcp != &src && srcp != &arena_src;
+            sa.conc_off = strata::program::concurrent_read_off(cs);
+            const char* why = strata::program::slot_admit_off(sa);
+            if (why == nullptr && ss.ple.ready() &&
+                (cudaMalloc((void**) &adm_ple_scratch, strata::core::ple_run_scratch_bytes()) != cudaSuccess ||
+                 cudaMalloc((void**) &adm_ple_emb, (size_t) strata::kernels::NG_N_EMBD * 4) != cudaSuccess)) {
+                cudaGetLastError();
+                why = "no VRAM for its PLE scratch";
+            }
+            slot_admit = why == nullptr;
+            if (sa.asked)
+                std::fprintf(stderr, "strata batch: STRATA_SLOT_ADMIT: %s%s\n",
+                             slot_admit ? "admissions read beside the decoding slots" : "off: ", slot_admit ? "" : why);
+        }
         // what the server's Monitor tab shows (servers before 0.1.8 skip unknown lines until READY)
         {
             size_t free_b = 0, total_b = 0;
@@ -11068,7 +11106,8 @@ int main(int argc, char** argv) {
                         strata::prefill::Prefill::pipe_setting(),
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
-                                       " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
+                                       " batch_groups=" + std::to_string(o.batch_groups) +
+                                       (slot_admit ? " slot_admit=1" : "")).c_str() : "");
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -11298,6 +11337,12 @@ int main(int argc, char** argv) {
             // that state (a checkpoint, a parked conversation), so it is not kept as a cache when it ends
             bool tainted = false;
             ConvCheckpoint::PromptPlan partial_plan;   ///< --prefill-pipe: the segment it stopped in, read on in its chunks
+            // STRATA_SLOT_ADMIT: its prompt is being read into its sessions beside the decoding groups; adm_log: the
+            // admission's line waits for its first token (BGEN at adm_t0, read in adm_read_ms after adm_wait_ms queued)
+            bool reading = false, adm_log = false;
+            Clock::time_point adm_t0{};
+            double adm_read_ms = 0.0, adm_wait_ms = 0.0;
+            int64_t adm_rows = 0, adm_tokens = 0, adm_reused = 0;
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
         // timing of the batch windows since the slots were last all idle (one stderr line then)
@@ -12370,6 +12415,15 @@ int main(int argc, char** argv) {
             for (int t = 0; t < GS; ++t) if (bs[(size_t) (gi * GS + t)].active) return true;
             return false;
         };
+        // STRATA_SLOT_ADMIT: a group whose window would pad a slot that is being read waits until the read is done
+        auto group_held = [&](int gi) {
+            bool act[strata::kernels::kVerifyMaxT] = {}, rd[strata::kernels::kVerifyMaxT] = {};
+            for (int t = 0; t < GS; ++t) {
+                act[t] = bs[(size_t) (gi * GS + t)].active;
+                rd[t] = bs[(size_t) (gi * GS + t)].reading;
+            }
+            return strata::program::group_pads_reading(act, rd, GS);
+        };
         // STRATA_TRACE: the drain before the line in hand (an admission's first phase), and when the first rows came
         // after a batch admission (the pipeline's refill after BADM) or after a drain for another line (drain + refill)
         double line_drain_ms = 0.0, adm_drain_ms = 0.0;
@@ -12442,6 +12496,15 @@ int main(int argc, char** argv) {
                     const int32_t y = outb[t];
                     std::printf("BT %d %d\n", gi * GS + t, (int) y);
                     ++sl.produced;
+                    if (sl.adm_log) {   // STRATA_SLOT_ADMIT: the admission's line, at its first token
+                        sl.adm_log = false;
+                        std::fprintf(stderr, "strata batch: slot %d admitted beside the decoding slots: %lld prompt tokens "
+                                             "(%lld reused) read in %.0f ms after %.0f ms queued; the other slots decoded "
+                                             "%lld rows during the read; first token %.0f ms after its BGEN\n",
+                                     gi * GS + t, (long long) sl.adm_tokens, (long long) sl.adm_reused, sl.adm_read_ms,
+                                     sl.adm_wait_ms, (long long) sl.adm_rows,
+                                     std::chrono::duration<double, std::milli>(Clock::now() - sl.adm_t0).count());
+                    }
                     ++bt_rows;
                     ++pipe_rows;
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
@@ -12493,7 +12556,7 @@ int main(int argc, char** argv) {
                     if (!may_start) continue;
                     for (int j = 0; j < (int) pg.size() && pick < 0; ++j) {
                         const int gi = (int) ((rr + j) % (int64_t) pg.size());
-                        if (!pg[(size_t) gi].inflight && !pg[(size_t) gi].drafting && group_active(gi) &&
+                        if (!pg[(size_t) gi].inflight && !pg[(size_t) gi].drafting && group_active(gi) && !group_held(gi) &&
                             (!piped_mtp || stage_verifier(0).batch_launch_ready(
                                                strata::program::batch_groups::piped_mtp_hbase(gi, pm_group_rows))))
                             pick = gi;
@@ -12621,16 +12684,843 @@ int main(int argc, char** argv) {
                 if (!pump(false)) return false;
             return true;
         };
+        // the prompt path's loans (defined once, outside a request: a read beside the slots uses them too)
+        // the batched path's slots are lent just before its first run and given back (refilled) before a window
+        // reads - so the windows always see the whole expert cache - or once the prompt is read
+        // Every participant gives its loan back here: the rows it lent are refilled into the SAME slots from
+        // the arena, the residency table is restored, and one upload puts it on every device.  A stage refills
+        // through its own cache and its own device - a slot refilled into the wrong cache would leave that
+        // stage's cache holding an expert it does not own, which is silent and produces plausible tokens.
+        // (split in two halves so a layer split can queue every stage's copies before it waits for any: #340)
+        // STRATA_REFILL_PARTS=1 (gfx1151's table): a lent slot of a GGUF read in place is refilled from the pieces in the mapping.
+        // The default assembles the blob in a staging buffer first (a 4 MB copy on this thread), then copies that.
+        static const bool refill_parts = [] { const char* v = std::getenv("STRATA_REFILL_PARTS"); return v != nullptr && std::atoi(v) != 0; }();
+        auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
+            tr("refill start", (long long) p.lent.size());
+            const strata::core::OnDevice on(p.dev);
+            for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
+                strata::core::BlobPart parts[3];
+                const int np = refill_parts && !refill_blocking() ? srcp->blob_parts(i / g.n_expert, i % g.n_expert, parts) : 0;
+                if (np > 0) {   // the GGUF read in place: the tensors' pieces go from the mapping to the slot, no assembled copy
+                    if (!p.cache->fill_slot_queued_parts(slot, parts, np, e)) return false;
+                    host_res[(size_t) i] = slot;
+                    continue;
+                }
+                const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
+                const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
+                                                        : p.cache->fill_slot_queued(slot, b, e, nb)))
+                    return false;
+                if (!refill_blocking()) srcp->note_async_read(b, nullptr);   // #1237
+                host_res[(size_t) i] = slot;
+            }
+            return true;
+        };
+        auto refill_wait = [&](PfPart& p, std::string& e) -> bool {
+            const strata::core::OnDevice on(p.dev);
+            if (!p.cache->sync_queued(e)) return false;
+#if defined(_WIN32)
+            // The copies have landed: the file pages touched by the loan need not stay in the working set.
+            for (const auto& [i, slot] : p.lent)
+                srcp->release(i / g.n_expert, i % g.n_expert);
+#endif
+            p.lent.clear();
+            p.lent_chunk = 0;
+            return true;
+        };
+        auto refill_one = [&](PfPart& p, std::string& e) -> bool {
+            if (p.lent.empty()) return true;
+            return refill_issue(p, e) && refill_wait(p, e);
+        };
+        // #340: with several stages every stage's copies go out first (each card on its own link), then each is
+        // waited for - the same copies into the same slots, so the same cache; one stage: refill_one exactly.
+        // STRATA_REFILL_SERIAL=1: stage after stage, as 0.1.30/0.1.31.
+        static const bool refill_serial = std::getenv("STRATA_REFILL_SERIAL") != nullptr;
+        auto refill = [&](std::string& e) -> bool {
+            const auto t_rf = Clock::now();
+            int64_t n_lent = 0, n_parts = 0;
+            for (PfPart& p : pf_parts)
+                if (!p.lent.empty()) { n_lent += (int64_t) p.lent.size(); ++n_parts; }
+            if (n_parts > 1 && !refill_serial) {
+                for (PfPart& p : pf_parts)
+                    if (!p.lent.empty() && !refill_issue(p, e)) return false;
+                for (PfPart& p : pf_parts)
+                    if (!p.lent.empty() && !refill_wait(p, e)) return false;
+            } else {
+                for (PfPart& p : pf_parts)
+                    if (!p.lent.empty() && !refill_one(p, e)) return false;
+            }
+            if (n_parts > 0) res_upload();
+            if (trace && n_parts > 0) {
+                std::fprintf(stderr, "strata trace: refilled %lld slots on %lld stage(s) in %.1f ms\n",
+                             (long long) n_lent, (long long) n_parts,
+                             std::chrono::duration<double, std::milli>(Clock::now() - t_rf).count());
+                std::fflush(stderr);
+            }
+            return true;
+        };
+        // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
+        // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
+        // participant's own cache, and marking only that participant's own layers
+        int64_t seg_lend = 0;   // the loan the last lend left (the largest participant's chunk; 0: none)
+        auto lend_want = [&](int64_t tokens) -> int64_t {
+            // what this segment needs, capped by the configured chunk: a request lends only what its own
+            // prompt needs, so a large chunk costs a short prompt nothing
+            const int64_t want_full = planned_chunk(tokens, o.prefill_chunk, pf_plan_chunk);
+            // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
+            return o.prefill_head_alias ? o.prefill_chunk
+                 : split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small) : want_full;
+        };
+        auto lend = [&](int64_t tokens, std::string& e, int64_t exact) -> bool {
+            seg_lend = 0;
+            if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
+            const auto t_ln = Clock::now();
+            const int64_t want_seg = lend_want(tokens);
+            // `exact`: a planned segment read on - the loan it was read with (what is left would size another)
+            const int64_t want = exact > 0 ? std::min(exact, o.prefill_chunk) : want_seg;
+            if (want <= 0) {
+                e = "prefill: cannot lend buffers for an empty request segment";
+                return false;
+            }
+            bool any = false;
+            for (PfPart& p : pf_parts) {
+                if (p.first < 0) continue;
+                if (!p.lent.empty()) {
+                    if (want <= p.lent_chunk) continue;            // its current loan already covers this
+                    // ONLY this participant's loan goes back: `refill` would return the other participants'
+                    // loans too, and their buffers are still laid out in their caches - marking those slots
+                    // resident again would hand the next window a prompt buffer in place of an expert
+                    if (!refill_one(p, e)) return false;
+                }
+                const strata::core::OnDevice on(p.dev);
+                int64_t want_p = want;
+                int32_t first = p.first_now;
+                // --prefill-head-alias: the loan laid out at start (slot 1 on) is kept; a hybrid layout cannot relayout
+                if (!o.prefill_head_alias) {
+                    // #2090: the loan a chunk needs is NOT monotonic in the chunk: a chunk above the scan's small_max
+                    // lays out the byte-budget ring (199 slots at 5120), one at or below it 0.1.39's (384 at 4096), so
+                    // a request's smaller chunk can need MORE slots than the auto chunk's region (p.first) holds.  The
+                    // loan starts where the chunk itself needs it (the 128-slot floor aside); a chunk that cannot be
+                    // lent even then is halved until it can, instead of ending the engine.
+                    int64_t need_p = part_slots(p, want_p);
+                    while ((need_p <= 0 || need_p + 128 > p.cache->slots()) && want_p > 256) {
+                        want_p = std::max<int64_t>(256, want_p / 2 / 256 * 256);
+                        need_p = part_slots(p, want_p);
+                    }
+                    if (need_p <= 0 || need_p + 128 > p.cache->slots()) {
+                        e = "prefill: no chunk of this request fits the slots that can be lent (#2090)";
+                        return false;
+                    }
+                    if (want_p != want)
+                        std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens for this request: its "
+                                     "buffers do not fit the slots that can be lent (#2090)\n", (long long) want,
+                                     (long long) want_p);
+                    if (need_p > p.cache->slots() - p.first)   // the case that ended the engine before (#2090)
+                        std::fprintf(stderr, "strata serve: the loan for a chunk of %lld tokens (%lld slots) is larger than the "
+                                     "auto chunk's (%lld slots): starting it earlier (#2090)\n", (long long) want_p,
+                                     (long long) need_p, (long long) (p.cache->slots() - p.first));
+                    first = (int32_t) (p.cache->slots() - need_p);
+                }
+                if (want_p != p.sp->chunk() || first != p.first_now) {
+                    if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
+                    p.first_now = first;
+                }
+                for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
+                    for (int64_t ex = 0; ex < g.n_expert; ++ex) {
+                        const size_t i = (size_t) (l * g.n_expert + ex);
+                        if (host_res[i] >= first) {
+                            p.lent.emplace_back((int32_t) i, host_res[i]);
+                            host_res[i] = strata::core::kNotResident;
+                            any = true;
+                        }
+                    }
+                p.lent_chunk = want_p;
+            }
+            for (const PfPart& p : pf_parts)
+                if (p.first >= 0) seg_lend = std::max(seg_lend, p.lent_chunk);
+            if (any) res_upload();
+            if (trace) {
+                int64_t n_lent = 0;
+                for (const PfPart& p : pf_parts) n_lent += (int64_t) p.lent.size();
+                std::fprintf(stderr, "strata trace: lent %lld slots for %lld tokens in %.1f ms\n", (long long) n_lent,
+                             (long long) want, std::chrono::duration<double, std::milli>(Clock::now() - t_ln).count());
+                std::fflush(stderr);
+            }
+            return true;
+        };
+        // ---- STRATA_SLOT_ADMIT=1 (the pipelined groups, opt-in): a BGEN's prompt is read straight into its slot's
+        // sessions on every stage, on a thread of its own while the groups decode (STRATA_PIPED_CONCURRENT's doorbell
+        // thread; each stage's prompt path pointed at the slot's session), and its last prompt token is the slot's
+        // first row: no solo window, no copy into the slot, no drain but the loan's.  The engine answers a BGEN at once
+        // with `BQ <slot> 1` (queued: then BRP <slot> <done> <total> <ms> <tok/s> while it reads, BRA <slot> <1|0> ...
+        // when it decodes or does not, BRE <slot> <why> when it failed, then BT/BDONE) or `BQ <slot> 0` (read the old
+        // way, answered on the control lines).  One read at a time; further BGENs queue behind it.
+        static const int64_t adm_gain = [] {   // another cache this much longer than the slot's own: the old way
+            const char* v = std::getenv("STRATA_SLOT_ADMIT_GAIN");
+            return v != nullptr ? (int64_t) std::atoll(v) : (int64_t) 16384;
+        }();
+        std::vector<char> adm_queued(bs.size(), 0), adm_cancel(bs.size(), 0), adm_paused(bs.size(), 0);
+        std::vector<int64_t> adm_queued_len(bs.size(), 0);   // its prompt's length (the shorter-first test)
+        std::vector<Clock::time_point> adm_queued_at(bs.size());
+        int adm_reading = -1;               // the slot whose prompt is being read
+        std::atomic<bool> adm_stop{false};  // BSTOP for it
+        bool adm_active = false;            // a run of admissions (reads and the loan between them) is under way
+        struct AdmReq {
+            int slot = -1;
+            long long max_new = 0;
+            bool img = false, bias = false, ckpt = true;
+            strata::kernels::SamplerParams sp;
+            std::vector<int64_t> ids;
+        };
+        auto adm_parse = [&](const std::string& l, AdmReq& r) -> bool {
+            r.img = l.rfind("BGENI ", 0) == 0;
+            if (r.img || l.rfind("BGEN ", 0) != 0) return false;
+            char* e1 = nullptr;
+            r.slot = (int) std::strtol(l.c_str() + 5, &e1, 10);
+            char* e = nullptr;
+            r.max_new = std::strtoll(e1, &e, 10);
+            if (e == e1) return false;
+            float temperature = 0.0f, top_p = 1.0f, min_p = 0.0f, rep = 1.0f, freq = 0.0f, pres = 0.0f;
+            int top_k = 20, last_n = 0;
+            unsigned long long seed = 0;
+            for (;;) {   // the request path's keys (the sampling ones; the rest are its own)
+                while (*e == ' ') ++e;
+                const char* start = e;
+                while (*e != '\0' && *e != ' ') ++e;
+                if (e == start) break;
+                const std::string tok(start, (size_t) (e - start));
+                const size_t eq = tok.find('=');
+                if (eq == std::string::npos) { e = const_cast<char*>(start); break; }
+                const std::string key = tok.substr(0, eq);
+                const char* val = tok.c_str() + eq + 1;
+                const float fv = std::strtof(val, nullptr);
+                if (key == "logit_bias") r.bias = true;
+                else if (key == "ckpt") r.ckpt = std::atoi(val) != 0;
+                else if (key == "temperature") temperature = fv;
+                else if (key == "top_p") top_p = fv;
+                else if (key == "top_k") top_k = std::atoi(val);
+                else if (key == "min_p") min_p = fv;
+                else if (key == "penalty_last_n") last_n = std::atoi(val);
+                else if (key == "penalty_repeat") rep = fv;
+                else if (key == "penalty_freq") freq = fv;
+                else if (key == "penalty_present") pres = fv;
+                else if (key == "seed") seed = std::strtoull(val, nullptr, 10);
+            }
+            std::string pe;
+            if (!parse_i64_list(e, r.ids, pe)) return false;
+            r.sp.greedy = temperature <= 0.0f;
+            r.sp.temperature = temperature;
+            r.sp.top_p = top_p;
+            r.sp.top_k = top_k;
+            r.sp.seed = seed ? seed : (unsigned long long) std::chrono::steady_clock::now().time_since_epoch().count();
+            r.sp.min_p = std::clamp(min_p, 0.0f, 1.0f);
+            r.sp.penalty_last_n = std::max(last_n, 0);
+            r.sp.penalty_repeat = rep;
+            r.sp.penalty_freq = freq;
+            r.sp.penalty_present = pres;
+            r.sp.counter = 0;
+            return true;
+        };
+        // a BGEN as it comes: beside the decoding slots or the old way (slot_admit_direct), answered with BQ; the line
+        // is marked with the answer (\x01 beside, \x02 the old way) for when its turn comes
+        auto adm_decide = [&](std::string& l) -> bool {
+            AdmReq r;
+            bool direct = false;
+            const bool ok = adm_parse(l, r) && !r.bias && mrope_identity && r.slot >= 0 && r.slot < (int) bs.size() &&
+                            !bs[(size_t) r.slot].active && !adm_queued[(size_t) r.slot] && !adm_paused[(size_t) r.slot] && adm_reading != r.slot &&
+                            r.max_new >= 1 && !r.ids.empty();
+            if (ok) {
+                const int64_t n = (int64_t) r.ids.size();
+                auto pre = [&](const std::vector<int32_t>& p) -> int64_t {   // its tokens, when they start the prompt
+                    const int64_t L = (int64_t) p.size();
+                    if (L < 1 || L > n - 1) return 0;
+                    for (int64_t i = 0; i < L; ++i)
+                        if (p[(size_t) i] != (int32_t) r.ids[(size_t) i]) return 0;
+                    return L;
+                };
+                int64_t own = 0, other = 0;
+                if (o.prompt_cache > 0 && !nan_flush) {
+                    for (size_t b = 0; b < bs.size(); ++b) {
+                        const BSlot& sl = bs[b];
+                        int64_t best = !sl.active && sl.cached && !sl.reading ? pre(sl.ids) : 0;
+                        if (!sl.tainted)
+                            for (const ConvCheckpoint& c : sl.checks)
+                                if (c.imgs.empty()) best = std::max(best, pre(c.ids));
+                        int64_t& to = (int) b == r.slot ? own : other;
+                        to = std::max(to, best);
+                    }
+                    if (live_ok && live_imgs.empty()) other = std::max(other, pre(live));
+                    for (const ConvCheckpoint& c : checks)
+                        if (c.imgs.empty()) other = std::max(other, pre(c.ids));
+                    other = std::max<int64_t>(other, (int64_t) conversations.best(r.ids, {}, cvec_cached).tokens);
+                }
+                direct = strata::program::slot_admit_direct(batch_on() || pipe_inflight() || adm_active, false, own,
+                                                             other, adm_gain);
+                if (trace)
+                    std::fprintf(stderr, "strata trace: BGEN %d: %s (the slot holds %lld of %lld tokens, another cache "
+                                         "%lld)\n", r.slot, direct ? "read beside the slots" : "the old way",
+                                 (long long) own, (long long) n, (long long) other);
+            }
+            if (direct) {
+                adm_queued[(size_t) r.slot] = 1;
+                adm_cancel[(size_t) r.slot] = 0;
+                adm_queued_len[(size_t) r.slot] = (int64_t) r.ids.size();
+                adm_queued_at[(size_t) r.slot] = Clock::now();
+            }
+            std::printf("BQ %d %d\n", r.slot, direct ? 1 : 0);
+            std::fflush(stdout);
+            l.insert(l.begin(), direct ? '\x01' : '\x02');
+            return direct;
+        };
+        // the line in hand: a BGEN decided now or when it came (its mark taken off); true = read beside the slots
+        auto adm_take = [&](std::string& l) -> bool {
+            if (!slot_admit) return false;
+            if (!l.empty() && (l[0] == '\x01' || l[0] == '\x02')) {
+                const bool d = l[0] == '\x01';
+                l.erase(0, 1);
+                return d;
+            }
+            if (l.rfind("BGEN", 0) != 0) return false;
+            const bool d = adm_decide(l);
+            l.erase(0, 1);
+            return d;
+        };
+        // BSTOP <slot>: ends a decoding slot at its next window, a read beside the slots at its next chunk, a queued
+        // admission before it starts
+        auto adm_bstop = [&](int b) {
+            if (b < 0 || b >= (int) bs.size()) return;
+            if (adm_reading == b) adm_stop.store(true);
+            else if (adm_queued[(size_t) b] || adm_paused[(size_t) b]) adm_cancel[(size_t) b] = 1;
+            else bs[(size_t) b].stop = true;
+        };
+        // the lines that came during a read (in_mu held): BSTOPs taken, a BYIELD dropped (no read gives way here), a
+        // BGEN answered at once; the rest wait their turn
+        auto adm_lines = [&]() {
+            for (auto it = in_lines.begin(); it != in_lines.end();) {
+                if (it->rfind("BSTOP ", 0) == 0) {
+                    adm_bstop(std::atoi(it->c_str() + 6));
+                    it = in_lines.erase(it);
+                } else if (it->rfind("BYIELD", 0) == 0) {
+                    it = in_lines.erase(it);
+                } else {
+                    if (it->rfind("BGEN", 0) == 0) adm_decide(*it);
+                    ++it;
+                }
+            }
+        };
+        auto adm_lend_covers = [&](int64_t tokens) {
+            const int64_t want = lend_want(tokens);
+            for (const PfPart& p : pf_parts)
+                if (p.first >= 0 && (p.lent.empty() || want > p.lent_chunk)) return false;
+            return true;
+        };
+        auto stage_prefill = [&](size_t k) -> strata::prefill::Prefill& { return k == 0 ? sp : stages[k - 1]->sp; };
+        auto stage_ss = [&](size_t k) -> strata::core::SessionState& { return k == 0 ? ss : stages[k - 1]->ss; };
+        auto stage_stream = [&](size_t k) -> cudaStream_t { return k == 0 ? main_stream : (cudaStream_t) stages[k - 1]->stream; };
+        auto adm_thread_cpus = [] {
+            strata::aux_cpus::pin_current_thread();
+#if !defined(_WIN32)
+            if (!strata::aux_cpus::enabled()) (void) strata::aux_cpus::place_off_host();
+#endif
+        };
+        // one admission's read, which a shorter admission can pause at a chunk boundary (it lives in its own slot, so
+        // it goes on from there later): its request, where it stands, its turn checkpoint once taken
+        struct AdmJob {
+            AdmReq r;
+            int64_t n = 0, resume = 0, at = 0, turn_at = -1;
+            const ConvCheckpoint* ck = nullptr;   // the slot's checkpoint to restore before the first read
+            bool started = false, have_ck = false;
+            ConvCheckpoint turn_ck;
+            Clock::time_point t_bgen{};
+            double wait_ms = 0.0, read_ms = 0.0;
+            int64_t rows = 0;
+            int pauses = 0;
+        };
+        enum class AdmEnd { done, paused, fatal, ready };
+        int adm_main_dev = 0;
+        bool adm_reserved = false;
+        double adm_fence_ms = 0.0;
+        std::vector<char> adm_mtp_ready(bs.size(), 0);   // --batch-mtp: the slot drafter's prompt pass reserved
+        std::atomic<int64_t> adm_at{0};                  // where the read in flight stands (its shorter-first test)
+        std::string adm_short;                           // a shorter admission taken out of line to go first
+        // (in_mu held) a queued admission at most half as long as what the read in flight has left: it goes first
+        auto adm_find_short = [&](int64_t left) -> bool {
+            if (!adm_short.empty()) return false;
+            for (auto it = in_lines.begin(); it != in_lines.end() && !it->empty() && (*it)[0] == '\x01'; ++it) {
+                const int s = (int) std::strtol(it->c_str() + 6, nullptr, 10);   // "\x01BGEN <slot>"
+                if (s < 0 || s >= (int) bs.size() || adm_cancel[(size_t) s]) continue;
+                if (adm_queued_len[(size_t) s] * 2 <= left) {
+                    adm_short = it->substr(1);
+                    in_lines.erase(it);
+                    return true;
+                }
+            }
+            return false;
+        };
+        // a job's first step (main thread): refused (BRE, done), or the slot set up to be read into
+        auto adm_prepare = [&](AdmJob& j) -> AdmEnd {
+            const int b = j.r.slot;
+            BSlot& sl = bs[(size_t) b];
+            j.n = (int64_t) j.r.ids.size();
+            const int64_t n = j.n;
+            auto refuse = [&](const char* why) {
+                std::fprintf(stderr, "strata batch: slot %d: the admission is refused: %s\n", b, why);
+                std::printf("BRE %d %s\n", b, why);
+                std::fflush(stdout);
+                return AdmEnd::done;
+            };
+            if (sl.active) return refuse("the slot is decoding");
+            if (n + j.r.max_new + 8 > o.max_context) return refuse("the prompt and max_new exceed the context");
+            for (int64_t t : j.r.ids)
+                if (t < 0 || t >= n_vocab) return refuse("a token id is outside the vocabulary");
+            // what the slot itself holds of this prompt: all it held, or one of its turn checkpoints
+            auto pre = [&](const std::vector<int32_t>& p) {
+                const int64_t L = (int64_t) p.size();
+                if (L < 1 || L > n - 1) return false;
+                for (int64_t i = 0; i < L; ++i)
+                    if (p[(size_t) i] != (int32_t) j.r.ids[(size_t) i]) return false;
+                return true;
+            };
+            if (o.prompt_cache > 0 && !nan_flush && !sl.tainted && !sl.img && sl.cvec == cvec_cached) {
+                if (sl.cached && pre(sl.ids)) j.resume = (int64_t) sl.ids.size();
+                for (const ConvCheckpoint& c : sl.checks)
+                    if (c.imgs.empty() && c.stage_parts.size() == stages.size() && (int64_t) c.ids.size() > j.resume &&
+                        pre(c.ids)) {
+                        j.resume = (int64_t) c.ids.size();
+                        j.ck = &c;
+                    }
+            }
+            j.at = j.resume;
+            j.turn_at = o.prompt_cache > 0 && j.r.ckpt
+                ? strata::program::admit_turn_cut(j.r.ids, j.resume, o.turn_token, o.tail_role_token) : -1;
+            sl.cached = false;
+            sl.partial = false;
+            sl.reading = true;
+            // a hole below an active slot of its group: a window of that group in flight may have it as a pad row
+            if (GS > 1 && pg[(size_t) (b / GS)].inflight && group_held(b / GS) && !pipe_drain()) return AdmEnd::fatal;
+            std::string e;
+            if (batch_mtp && !adm_mtp_ready[(size_t) b]) {   // its graphs captured with nothing in flight (#31), once
+                if (!pipe_drain()) return AdmEnd::fatal;
+                if (!slot_mtp[(size_t) b]->reserve_prefill(sp.chunk(), e)) {
+                    std::printf("ERR batch MTP slot %d: %s\n", b, e.c_str());
+                    return AdmEnd::fatal;
+                }
+                adm_mtp_ready[(size_t) b] = 1;
+            }
+            return AdmEnd::ready;
+        };
+        // read (on with) a job beside the slots: done (the slot decodes, or BRA 0 / BRE said), paused (a shorter one
+        // was taken out of line: adm_short), fatal (the engine cannot go on)
+        auto adm_read = [&](AdmJob& j) -> AdmEnd {
+            const int b = j.r.slot;
+            BSlot& sl = bs[(size_t) b];
+            const int64_t n = j.n;
+            auto end_slot = [&] {   // nothing of it is kept
+                sl.reading = false;
+                sl.ids.clear();
+                if (ckpt_pool.on())
+                    for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
+                sl.checks.clear();
+            };
+            if (adm_cancel[(size_t) b]) {   // BSTOP while it waited paused
+                adm_cancel[(size_t) b] = 0;
+                end_slot();
+                std::printf("BRA %d 0 cancel\n", b);
+                std::fflush(stdout);
+                return AdmEnd::done;
+            }
+            const int64_t read_n = n - 1 - j.at;
+            std::string e;
+            if (read_n > 0 && !adm_lend_covers(read_n)) {   // the loan changes only with no window in flight
+                const auto tf = Clock::now();
+                if (!pipe_drain()) return AdmEnd::fatal;
+                if (!adapt_tick(true)) { std::printf("ERR an adaptive refill failed\n"); return AdmEnd::fatal; }
+                if (!lend(read_n, e, 0)) {
+                    std::printf("ERR lending the prompt path its slots failed: %s\n", e.c_str());
+                    return AdmEnd::fatal;
+                }
+                adm_fence_ms += std::chrono::duration<double, std::milli>(Clock::now() - tf).count();
+            }
+            // every stage's prompt path reads into the slot's session (PLE on the first: the stage's tables and weights,
+            // the slot's history), with its own callbacks; all put back after the read
+            const size_t n_st = stages.size() + 1;
+            strata::prefill::Prefill& rep = multi_gpu ? stages.back()->sp : sp;   // the stage that reports a chunk
+            std::vector<std::function<bool(int64_t, std::string&)>> old_stage_chunk(n_st);
+            auto old_chunk = std::move(rep.on_chunk);
+            auto old_stop = std::move(sp.should_stop);
+            auto old_yield = std::move(sp.stop_at_chunk);
+            struct Swap {   // (after what it puts back: destroyed first)
+                std::function<void()> undo;
+                ~Swap() { if (undo) undo(); }
+            } swap;
+            for (size_t k = 0; k < n_st; ++k) {
+                stage_prefill(k).set_session(*bslot_ss[k][(size_t) b]);
+                old_stage_chunk[k] = std::move(stage_prefill(k).on_stage_chunk);
+                stage_prefill(k).on_stage_chunk = nullptr;
+            }
+            strata::core::SessionState& s0 = *bslot_ss[0][(size_t) b];
+            if (ss.ple.ready()) {
+                s0.ple = ss.ple;
+                s0.ple.hist = s0.ple_hist;
+                s0.ple.prev = s0.ple_prev;
+                s0.ple.token = &s0.ple_token;
+                s0.ple.scratch = adm_ple_scratch;
+                s0.ple.emb_dev = adm_ple_emb;
+            }
+            swap.undo = [&] {
+                for (size_t k = 0; k < n_st; ++k) {
+                    stage_prefill(k).set_session(stage_ss(k));
+                    stage_prefill(k).on_stage_chunk = std::move(old_stage_chunk[k]);
+                }
+                rep.on_chunk = std::move(old_chunk);
+                sp.should_stop = std::move(old_stop);
+                sp.stop_at_chunk = std::move(old_yield);
+                s0.ple = strata::core::PleRun{};
+            };
+            sp.embd_rows = nullptr;
+            strata::prefill::Prefill::set_pipe_request(-1.0);
+            const std::vector<int64_t>& ids = j.r.ids;
+            strata::core::MtpDrafter* dr = batch_mtp ? slot_mtp[(size_t) b].get() : nullptr;
+            const auto t_read = Clock::now();
+            const int64_t at0 = j.at;
+            adm_at.store(j.at);
+            // the last stage's chunk: progress, and (--batch-mtp) the slot drafter's K/V from the chunk's final rows
+            rep.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& err) -> bool {
+                if (dr != nullptr) {
+                    std::vector<int32_t> nxt((size_t) T);
+                    for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) ids[(size_t) (p0 + t + 1)];
+                    if (!dr->prefill(R_rows, nxt.data(), T, p0, err)) return false;
+                }
+                const int64_t done = p0 + T;
+                adm_at.store(done);
+                const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t_read).count();
+                std::printf("BRP %d %lld %lld %.0f %.1f\n", b, (long long) done, (long long) n, ms,
+                            ms > 0.0 ? 1000.0 * (double) (done - at0) / ms : 0.0);
+                std::fflush(stdout);
+                strata::core::progress_at("reading a prompt into a batch slot, done up to token", done);
+                strata::core::progress_beat();
+                return true;
+            };
+            std::atomic<bool> give_way{false};
+            sp.should_stop = [&] { return adm_stop.load(std::memory_order_acquire); };
+            sp.stop_at_chunk = [&] { return give_way.load(std::memory_order_acquire); };
+            std::atomic<bool> done{false};
+            bool read_ok = true, paused = false;
+            std::string read_err;
+            adm_stop.store(false);
+            adm_reading = b;
+            const int64_t rows0 = pipe_rows;
+            auto sync_stages = [&]() -> bool {
+                for (size_t k = 0; k < n_st; ++k) {
+                    const strata::core::OnDevice on(k == 0 ? adm_main_dev : stages[k - 1]->dev);
+                    if (cudaDeviceSynchronize() != cudaSuccess) return false;
+                }
+                return true;
+            };
+            // the read's thread: (first time) the slot's state to `resume` (its checkpoint, kept as it is, or zero);
+            // then the prompt from where it stands to the turn boundary, the slot's turn checkpoint, the rest but the
+            // last token - or up to the chunk where a shorter admission takes over
+            auto read = [&](std::string& err) -> bool {
+                if (!j.started) {
+                    for (size_t k = 0; k < n_st; ++k) {
+                        const strata::core::OnDevice on(k == 0 ? adm_main_dev : stages[k - 1]->dev);
+                        strata::core::SessionState& x = *bslot_ss[k][(size_t) b];
+                        if (j.ck != nullptr) {
+                            if (!checkpoint_restore(k == 0 ? *j.ck : j.ck->stage_parts[k - 1], x, g)) {
+                                err = "restoring the slot's turn checkpoint failed";
+                                return false;
+                            }
+                        } else if (j.resume == 0) {
+                            strata::core::session_zero(x, g, nullptr, (void*) stage_stream(k));
+                            if (cudaStreamSynchronize(stage_stream(k)) != cudaSuccess) { err = "zeroing the slot failed"; return false; }
+                        }
+                    }
+                    if (dr != nullptr) {   // the drafter's K/V below `resume` is what it held (stale is allowed)
+                        const strata::core::OnDevice on(dr->device());
+                        if (!dr->idle(err)) return false;
+                        if (j.resume > 0) dr->kv_restore(j.resume);
+                        dr->set_prompt_len(n);
+                    }
+                    j.ck = nullptr;
+                    j.started = true;
+                }
+                for (size_t k = 0; k < n_st; ++k) {
+                    strata::core::SessionState& x = *bslot_ss[k][(size_t) b];
+                    x.ple_prev[0] = j.at >= 2 ? (int32_t) ids[(size_t) j.at - 2] : -1;
+                    x.ple_prev[1] = j.at >= 1 ? (int32_t) ids[(size_t) j.at - 1] : -1;
+                }
+                // [j.at, z): false on an error; `paused` when it stopped early (j.at is where)
+                auto run = [&](int64_t z) -> bool {
+                    if (z <= j.at) return true;
+                    const int64_t a = j.at, c = sp.plan_chunk(z - a);
+                    if (c > 0) {
+                        const bool chunked = c < std::min(z - a, sp.chunk());
+                        if (chunked) strata::prefill::Prefill::log_plan(z - a, c, sp.stage_count());
+                        sp.force_chunk(c, z - a <= c, chunked);
+                    }
+                    if (!sp.run(ids.data() + a, z - a, a, err)) return false;
+                    const int64_t stopped = sp.stopped_at();
+                    j.at = stopped >= 0 ? a + stopped : z;
+                    paused = stopped >= 0;
+                    return true;
+                };
+                if (j.turn_at > j.at) {
+                    if (!run(j.turn_at)) return false;
+                    if (paused) return true;
+                    if (!sync_stages()) { err = "a device sync before the slot's turn checkpoint failed"; return false; }
+                    j.turn_ck = ConvCheckpoint{};
+                    j.turn_ck.ids.assign(ids.begin(), ids.begin() + j.turn_at);
+                    for (size_t k = 0; k < n_st; ++k) {
+                        const strata::core::OnDevice on(k == 0 ? adm_main_dev : stages[k - 1]->dev);
+                        ConvCheckpoint part;
+                        part.ids = j.turn_ck.ids;
+                        if (!checkpoint_save(k == 0 ? j.turn_ck : part, *bslot_ss[k][(size_t) b], g)) {
+                            err = "saving the slot's turn checkpoint failed";
+                            return false;
+                        }
+                        if (k > 0) j.turn_ck.stage_parts.push_back(std::move(part));
+                    }
+                    j.have_ck = true;
+                }
+                return run(n - 1);
+            };
+            std::thread reader([&] {
+                adm_thread_cpus();
+                try {
+                    read_ok = read(read_err);
+                } catch (const std::exception& x) {
+                    read_ok = false;
+                    read_err = std::string("the prompt read failed: ") + x.what();
+                } catch (...) {
+                    read_ok = false;
+                    read_err = "the prompt read failed";
+                }
+                done.store(true, std::memory_order_release);
+                { std::lock_guard<std::mutex> lk(in_mu); }
+                in_cv.notify_all();
+            });
+            bool pump_ok = true;
+            size_t seen = 0;
+            while (!done.load(std::memory_order_acquire)) {
+                const bool decoding = pump_ok && (batch_on() || pipe_inflight());
+                if (decoding) pump_ok = pump(true);
+                std::unique_lock<std::mutex> lk(in_mu);
+                if (!decoding)
+                    in_cv.wait_for(lk, std::chrono::milliseconds(2), [&] {
+                        return done.load(std::memory_order_acquire) || in_lines.size() != seen;
+                    });
+                adm_lines();
+                if (!give_way.load() && adm_find_short(n - 1 - adm_at.load())) give_way.store(true);
+                seen = in_lines.size();
+            }
+            reader.join();
+            adm_reading = -1;
+            swap.undo();
+            swap.undo = nullptr;
+            const double read_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_read).count();
+            j.read_ms += read_ms;
+            j.rows += pipe_rows - rows0;
+            if (!pump_ok) return AdmEnd::fatal;   // (pump said ERR)
+            if (!read_ok) {
+                end_slot();
+                if (adm_stop.load()) {
+                    std::fprintf(stderr, "strata batch: slot %d: its admission was cancelled during the read (%.0f ms)\n",
+                                 b, j.read_ms);
+                    std::printf("BRA %d 0 cancel\n", b);
+                    std::fflush(stdout);
+                    return AdmEnd::done;
+                }
+                std::fprintf(stderr, "strata batch: slot %d: the prompt read failed: %s\n", b, read_err.c_str());
+                std::printf("BRE %d %s\n", b, read_err.c_str());
+                std::printf("ERR %s\n", read_err.c_str());
+                std::fflush(stdout);
+                return AdmEnd::fatal;
+            }
+            if (paused) {
+                ++j.pauses;
+                std::fprintf(stderr, "strata batch: slot %d: its read pauses at %lld of %lld tokens for a shorter "
+                                     "admission (it goes on from its slot after it)\n", b, (long long) j.at, (long long) n);
+                return AdmEnd::paused;
+            }
+            if (ckpt_pool.on())
+                for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
+            sl = BSlot{};
+            sl.active = true;
+            sl.x = (int32_t) ids[(size_t) n - 1];
+            sl.p = n - 1;
+            sl.max_new = j.r.max_new;
+            sl.t0 = Clock::now();
+            sl.ids.assign(ids.begin(), ids.end() - 1);
+            sl.cvec = cvec_cached;
+            if (j.have_ck) sl.checks.push_back(std::move(j.turn_ck));
+            sl.adm_log = true;
+            sl.adm_t0 = j.t_bgen;
+            sl.adm_read_ms = j.read_ms;
+            sl.adm_wait_ms = j.wait_ms;
+            sl.adm_rows = j.rows;
+            sl.adm_tokens = n;
+            sl.adm_reused = j.resume;
+            // (no first draft: that needs the last prompt token's row, which the slot's first window computes)
+            ver.set_slot_sampling(b, j.r.sp);
+            std::printf("BRA %d 1 prompt=%lld reused=%lld read_ms=%.1f wait_ms=%.1f\n", b, (long long) n,
+                        (long long) j.resume, j.read_ms, j.wait_ms);
+            std::fflush(stdout);
+            return AdmEnd::done;
+        };
+        // a run of admissions read beside the slots: the first is `first`, then every one that is next in line; the
+        // doorbells are served on a thread of their own throughout, the loan is refilled once at the end
+        auto adm_run = [&](std::string first) -> bool {
+            const auto t_run = Clock::now();
+            cudaGetDevice(&adm_main_dev);
+            if (!adm_reserved) {   // (an allocation on the read's thread takes the driver's lock: before it, once)
+                adm_reserved = true;
+                if (!sp.reserve_uploads(sp.chunk()))
+                    std::fprintf(stderr, "strata batch: the prompt path's pinned upload slots could not be reserved "
+                                         "(they grow at first use)\n");
+            }
+            adm_active = true;
+            in_prompt_read = true;
+            adm_fence_ms = 0.0;
+            static const bool released = [] {   // threads that inherited the host's core: off it (Linux; as the concurrent read)
+                if (!strata::aux_cpus::enabled())
+                    if (const int moved = strata::aux_cpus::release_host_inheritors(); moved > 0)
+                        std::fprintf(stderr, "strata batch: %d threads that ran on the host thread's core moved off it, for "
+                                             "reads beside the slots\n", moved);
+                return true;
+            }();
+            (void) released;
+            struct Bells {
+                std::atomic<bool> on{true};
+                std::thread th;
+                std::function<void()> stop;
+                ~Bells() { if (stop) stop(); }
+            } bells;
+            for (int k = 0; k < n_pipe; ++k) stage_verifier(k).set_external_serve(true);
+            conc_serving = true;
+            bells.stop = [&] {
+                bells.on.store(false, std::memory_order_release);
+                {
+                    std::lock_guard<std::mutex> lk(bell_mu);
+                    bell_cv.notify_one();
+                }
+                if (bells.th.joinable()) bells.th.join();
+                for (int k = 0; k < n_pipe; ++k) stage_verifier(k).set_external_serve(false);
+                conc_serving = false;
+                adm_active = false;
+                in_prompt_read = false;
+            };
+            bells.th = std::thread([&] {
+                adm_thread_cpus();
+                auto any_busy = [&] {
+                    for (int k = 0; k < n_pipe; ++k)
+                        if (stage_verifier(k).batch_busy()) return true;
+                    return false;
+                };
+                while (bells.on.load(std::memory_order_acquire)) {
+                    bool busy = false;
+                    for (int k = 0; k < n_pipe; ++k) {
+                        auto& vk = stage_verifier(k);
+                        if (vk.batch_busy()) {
+                            busy = true;
+                            vk.batch_serve(win_pool_fn, win_pool_user);
+                        }
+                    }
+                    if (busy) continue;
+                    std::unique_lock<std::mutex> lk(bell_mu);
+                    bell_waiting.store(true, std::memory_order_relaxed);
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    bell_cv.wait_for(lk, std::chrono::milliseconds(2),
+                                     [&] { return !bells.on.load(std::memory_order_acquire) || any_busy(); });
+                    bell_waiting.store(false, std::memory_order_relaxed);
+                }
+            });
+            int n_adm = 0;
+            bool fatal = false;
+            std::vector<std::unique_ptr<AdmJob>> paused;   // reads a shorter one paused, the latest last
+            // the job of a line taken out of in_lines: nullptr when it ends at once (a bad line, cancelled, refused)
+            auto take = [&](const std::string& l) -> std::unique_ptr<AdmJob> {
+                auto j = std::make_unique<AdmJob>();
+                if (!adm_parse(l, j->r) || j->r.slot < 0 || j->r.slot >= (int) bs.size()) {   // (adm_decide parsed it)
+                    std::printf("ERR BGEN: a bad line\n");
+                    std::fflush(stdout);
+                    return nullptr;
+                }
+                const size_t b = (size_t) j->r.slot;
+                adm_queued[b] = 0;
+                ++n_adm;
+                if (adm_cancel[b]) {
+                    adm_cancel[b] = 0;
+                    std::printf("BRA %d 0 cancel\n", j->r.slot);
+                    std::fflush(stdout);
+                    return nullptr;
+                }
+                j->t_bgen = adm_queued_at[b];
+                j->wait_ms = std::chrono::duration<double, std::milli>(Clock::now() - j->t_bgen).count();
+                const AdmEnd e = adm_prepare(*j);
+                if (e == AdmEnd::fatal) { j.reset(); fatal = true; }
+                else if (e == AdmEnd::done) j.reset();
+                return j;
+            };
+            std::unique_ptr<AdmJob> cur = take(first);
+            for (;;) {
+                if (fatal) return false;
+                if (cur) {
+                    adm_paused[(size_t) cur->r.slot] = 0;
+                    const AdmEnd e = adm_read(*cur);
+                    if (e == AdmEnd::fatal) return false;
+                    if (e == AdmEnd::paused) {
+                        adm_paused[(size_t) cur->r.slot] = 1;
+                        paused.push_back(std::move(cur));
+                    }
+                    cur.reset();
+                }
+                // next: a shorter one taken out of line, the latest paused read, the next admission in line
+                if (!adm_short.empty()) {
+                    const std::string l = std::move(adm_short);
+                    adm_short.clear();
+                    cur = take(l);
+                    continue;
+                }
+                if (!paused.empty()) {
+                    cur = std::move(paused.back());
+                    paused.pop_back();
+                    continue;
+                }
+                std::lock_guard<std::mutex> lk(in_mu);
+                adm_lines();
+                if (in_lines.empty() || in_lines.front().empty() || in_lines.front()[0] != '\x01') break;
+                const std::string l = in_lines.front().substr(1);
+                in_lines.pop_front();
+                cur = take(l);
+            }
+            bells.stop();
+            bells.stop = nullptr;
+            const auto tf = Clock::now();
+            std::string e;
+            if (!pipe_drain()) return false;
+            if (!refill(e)) {
+                std::printf("ERR refilling a lent slot failed: %s\n", e.c_str());
+                return false;
+            }
+            adm_fence_ms += std::chrono::duration<double, std::milli>(Clock::now() - tf).count();
+            std::fprintf(stderr, "strata batch: %d admission%s read beside the slots in %.0f ms; the groups stopped %.0f ms "
+                                 "for the loan (lend, refill)\n", n_adm, n_adm == 1 ? "" : "s",
+                         std::chrono::duration<double, std::milli>(Clock::now() - t_run).count(), adm_fence_ms);
+            return true;
+        };
         for (;;) {
             line_drain_ms = 0.0;
+            bool adm_direct = false;   // STRATA_SLOT_ADMIT: this BGEN is read beside the slots (adm_run)
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
                     if (!(piped ? pump(true) : batch_step())) return 1;
                     continue;
                 }
+                adm_direct = adm_take(line);
                 // a request reads its prompt through every stage: the groups in flight finish first
-                // (STRATA_PIPE_BYIELD_NODRAIN: not for a BYIELD, which is dropped below)
-                if (piped && line.rfind("BSTOP ", 0) != 0 &&
+                // (STRATA_PIPE_BYIELD_NODRAIN: not for a BYIELD, which is dropped below; STRATA_SLOT_ADMIT: not for a
+                // prompt read beside the slots)
+                if (piped && line.rfind("BSTOP ", 0) != 0 && !adm_direct &&
                     !(pipe_byield_nodrain_env() && line.rfind("BYIELD", 0) == 0)) {
                     const int in_flight = trace ? (int) std::count_if(pg.begin(), pg.end(), [](const PGroup& G) {
                                                       return G.inflight; }) : 0;
@@ -12648,12 +13538,13 @@ int main(int argc, char** argv) {
                 }
             } else if (!next_line(line)) {
                 break;
+            } else {
+                adm_direct = adm_take(line);
             }
             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
             // request's prompt and first token as a GEN 1, then continues it in that slot
             if (line.rfind("BSTOP ", 0) == 0) {
-                const int b = std::atoi(line.c_str() + 6);
-                if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
+                adm_bstop(std::atoi(line.c_str() + 6));
                 continue;
             }
             if (line.rfind("BYIELD", 0) == 0) {   // for a prompt read that has ended meanwhile
@@ -12672,12 +13563,12 @@ int main(int argc, char** argv) {
             }
             // a command may touch the expert cache (a request lends slots, a K/V growth moves them, a session restore
             // quiesces it): a round of the asynchronous tier that the batch windows left in flight lands first
-            if (!adapt_tick(true)) {
+            if (!adm_direct && !adapt_tick(true)) {
                 std::printf("ERR an adaptive refill failed\n");
                 return 1;
             }
             admit_slot = -1;
-            if (line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0) {
+            if (!adm_direct && (line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0)) {
                 const bool bimg = line.rfind("BGENI ", 0) == 0;
                 char* e1 = nullptr;
                 const long b = std::strtol(line.c_str() + (bimg ? 6 : 5), &e1, 10);
@@ -12728,6 +13619,10 @@ int main(int argc, char** argv) {
                                      (long long) ((o.vram_reserve_mib + (kVramSafeMib - vf) + 63) / 64 * 64));
                     }
                 }
+            }
+            if (adm_direct) {   // STRATA_SLOT_ADMIT: read beside the decoding slots
+                if (!adm_run(line)) return 1;
+                continue;
             }
             stop_req.store(false);   // a STOP that arrived between requests is stale
             err.clear();
@@ -13922,169 +14817,6 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 return true;
             };
-            // the batched path's slots are lent just before its first run and given back (refilled) before a window
-            // reads - so the windows always see the whole expert cache - or once the prompt is read
-            // Every participant gives its loan back here: the rows it lent are refilled into the SAME slots from
-            // the arena, the residency table is restored, and one upload puts it on every device.  A stage refills
-            // through its own cache and its own device - a slot refilled into the wrong cache would leave that
-            // stage's cache holding an expert it does not own, which is silent and produces plausible tokens.
-            // (split in two halves so a layer split can queue every stage's copies before it waits for any: #340)
-            // STRATA_REFILL_PARTS=1 (gfx1151's table): a lent slot of a GGUF read in place is refilled from the pieces in the mapping.
-            // The default assembles the blob in a staging buffer first (a 4 MB copy on this thread), then copies that.
-            static const bool refill_parts = [] { const char* v = std::getenv("STRATA_REFILL_PARTS"); return v != nullptr && std::atoi(v) != 0; }();
-            auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
-                tr("refill start", (long long) p.lent.size());
-                const strata::core::OnDevice on(p.dev);
-                for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
-                    strata::core::BlobPart parts[3];
-                    const int np = refill_parts && !refill_blocking() ? srcp->blob_parts(i / g.n_expert, i % g.n_expert, parts) : 0;
-                    if (np > 0) {   // the GGUF read in place: the tensors' pieces go from the mapping to the slot, no assembled copy
-                        if (!p.cache->fill_slot_queued_parts(slot, parts, np, e)) return false;
-                        host_res[(size_t) i] = slot;
-                        continue;
-                    }
-                    const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
-                    const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
-                    if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
-                                                            : p.cache->fill_slot_queued(slot, b, e, nb)))
-                        return false;
-                    if (!refill_blocking()) srcp->note_async_read(b, nullptr);   // #1237
-                    host_res[(size_t) i] = slot;
-                }
-                return true;
-            };
-            auto refill_wait = [&](PfPart& p, std::string& e) -> bool {
-                const strata::core::OnDevice on(p.dev);
-                if (!p.cache->sync_queued(e)) return false;
-#if defined(_WIN32)
-                // The copies have landed: the file pages touched by the loan need not stay in the working set.
-                for (const auto& [i, slot] : p.lent)
-                    srcp->release(i / g.n_expert, i % g.n_expert);
-#endif
-                p.lent.clear();
-                p.lent_chunk = 0;
-                return true;
-            };
-            auto refill_one = [&](PfPart& p, std::string& e) -> bool {
-                if (p.lent.empty()) return true;
-                return refill_issue(p, e) && refill_wait(p, e);
-            };
-            // #340: with several stages every stage's copies go out first (each card on its own link), then each is
-            // waited for - the same copies into the same slots, so the same cache; one stage: refill_one exactly.
-            // STRATA_REFILL_SERIAL=1: stage after stage, as 0.1.30/0.1.31.
-            static const bool refill_serial = std::getenv("STRATA_REFILL_SERIAL") != nullptr;
-            auto refill = [&](std::string& e) -> bool {
-                const auto t_rf = Clock::now();
-                int64_t n_lent = 0, n_parts = 0;
-                for (PfPart& p : pf_parts)
-                    if (!p.lent.empty()) { n_lent += (int64_t) p.lent.size(); ++n_parts; }
-                if (n_parts > 1 && !refill_serial) {
-                    for (PfPart& p : pf_parts)
-                        if (!p.lent.empty() && !refill_issue(p, e)) return false;
-                    for (PfPart& p : pf_parts)
-                        if (!p.lent.empty() && !refill_wait(p, e)) return false;
-                } else {
-                    for (PfPart& p : pf_parts)
-                        if (!p.lent.empty() && !refill_one(p, e)) return false;
-                }
-                if (n_parts > 0) res_upload();
-                if (trace && n_parts > 0) {
-                    std::fprintf(stderr, "strata trace: refilled %lld slots on %lld stage(s) in %.1f ms\n",
-                                 (long long) n_lent, (long long) n_parts,
-                                 std::chrono::duration<double, std::milli>(Clock::now() - t_rf).count());
-                    std::fflush(stderr);
-                }
-                return true;
-            };
-            // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
-            // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
-            // participant's own cache, and marking only that participant's own layers
-            int64_t seg_lend = 0;   // the loan the last lend left (the largest participant's chunk; 0: none)
-            auto lend = [&](int64_t tokens, std::string& e, int64_t exact) -> bool {
-                seg_lend = 0;
-                if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
-                const auto t_ln = Clock::now();
-                // what this segment needs, capped by the configured chunk: a request lends only what its own
-                // prompt needs, so a large chunk costs a short prompt nothing
-                const int64_t want_full = planned_chunk(tokens, o.prefill_chunk, pf_plan_chunk);
-                // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
-                const int64_t want_seg = o.prefill_head_alias ? o.prefill_chunk
-                                       : split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
-                                                                                     : want_full;
-                // `exact`: a planned segment read on - the loan it was read with (what is left would size another)
-                const int64_t want = exact > 0 ? std::min(exact, o.prefill_chunk) : want_seg;
-                if (want <= 0) {
-                    e = "prefill: cannot lend buffers for an empty request segment";
-                    return false;
-                }
-                bool any = false;
-                for (PfPart& p : pf_parts) {
-                    if (p.first < 0) continue;
-                    if (!p.lent.empty()) {
-                        if (want <= p.lent_chunk) continue;            // its current loan already covers this
-                        // ONLY this participant's loan goes back: `refill` would return the other participants'
-                        // loans too, and their buffers are still laid out in their caches - marking those slots
-                        // resident again would hand the next window a prompt buffer in place of an expert
-                        if (!refill_one(p, e)) return false;
-                    }
-                    const strata::core::OnDevice on(p.dev);
-                    int64_t want_p = want;
-                    int32_t first = p.first_now;
-                    // --prefill-head-alias: the loan laid out at start (slot 1 on) is kept; a hybrid layout cannot relayout
-                    if (!o.prefill_head_alias) {
-                        // #2090: the loan a chunk needs is NOT monotonic in the chunk: a chunk above the scan's small_max
-                        // lays out the byte-budget ring (199 slots at 5120), one at or below it 0.1.39's (384 at 4096), so
-                        // a request's smaller chunk can need MORE slots than the auto chunk's region (p.first) holds.  The
-                        // loan starts where the chunk itself needs it (the 128-slot floor aside); a chunk that cannot be
-                        // lent even then is halved until it can, instead of ending the engine.
-                        int64_t need_p = part_slots(p, want_p);
-                        // STRATA_ELASTIC_SLOTS_GIVE: a loan stays above the slots the cache may give the batch slots
-                        const int64_t room_p = give_on ? p.cache->slots() - give_top(p.cache) : p.cache->slots();
-                        while ((need_p <= 0 || need_p + 128 > p.cache->slots() || (give_on && need_p > room_p)) && want_p > 256) {
-                            want_p = std::max<int64_t>(256, want_p / 2 / 256 * 256);
-                            need_p = part_slots(p, want_p);
-                        }
-                        if (need_p <= 0 || need_p + 128 > p.cache->slots() || (give_on && need_p > room_p)) {
-                            e = "prefill: no chunk of this request fits the slots that can be lent (#2090)";
-                            return false;
-                        }
-                        if (want_p != want)
-                            std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens for this request: its "
-                                         "buffers do not fit the slots that can be lent (#2090)\n", (long long) want,
-                                         (long long) want_p);
-                        if (need_p > p.cache->slots() - p.first)   // the case that ended the engine before (#2090)
-                            std::fprintf(stderr, "strata serve: the loan for a chunk of %lld tokens (%lld slots) is larger than the "
-                                         "auto chunk's (%lld slots): starting it earlier (#2090)\n", (long long) want_p,
-                                         (long long) need_p, (long long) (p.cache->slots() - p.first));
-                        first = (int32_t) (p.cache->slots() - need_p);
-                    }
-                    if (want_p != p.sp->chunk() || first != p.first_now) {
-                        if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
-                        p.first_now = first;
-                    }
-                    for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
-                        for (int64_t ex = 0; ex < g.n_expert; ++ex) {
-                            const size_t i = (size_t) (l * g.n_expert + ex);
-                            if (host_res[i] >= first) {
-                                p.lent.emplace_back((int32_t) i, host_res[i]);
-                                host_res[i] = strata::core::kNotResident;
-                                any = true;
-                            }
-                        }
-                    p.lent_chunk = want_p;
-                }
-                for (const PfPart& p : pf_parts)
-                    if (p.first >= 0) seg_lend = std::max(seg_lend, p.lent_chunk);
-                if (any) res_upload();
-                if (trace) {
-                    int64_t n_lent = 0;
-                    for (const PfPart& p : pf_parts) n_lent += (int64_t) p.lent.size();
-                    std::fprintf(stderr, "strata trace: lent %lld slots for %lld tokens in %.1f ms\n", (long long) n_lent,
-                                 (long long) want, std::chrono::duration<double, std::milli>(Clock::now() - t_ln).count());
-                    std::fflush(stderr);
-                }
-                return true;
-            };
             // --batch: a prompt read while slots are decoding goes one prompt chunk at a time (the same chunks as one
             // run: each run starts where the last ended, at a multiple of the chunk), and between two chunks the slots
             // decode for a share of the time the chunk took (STRATA_BATCH_DECODE_SHARE, default 0.5), so a long
@@ -14239,7 +14971,9 @@ int main(int argc, char** argv) {
                     }
                     return true;
                 }();
-                if (piped && pr_conc && req_imgs.empty()) {   // (with no slot decoding it only watches for a BYIELD)
+                // (STRATA_SLOT_ADMIT: every read on the control lines too, so a lone long read gives way to a shorter
+                // request at its next chunk and goes on beside the slots after it)
+                if (piped && (pr_conc || slot_admit) && req_imgs.empty()) {   // (with no slot decoding it only watches for a BYIELD)
                     // the drafter's prompt pass captures its graphs and grows its records at first use, and the
                     // prompt path's pinned upload slots grow at their first larger upload: done here, with nothing in
                     // flight (on the reader's thread a capture, an allocation or a free takes the driver's lock and
@@ -14417,8 +15151,7 @@ int main(int argc, char** argv) {
                             // its next chunk
                             for (auto it = in_lines.begin(); it != in_lines.end();) {
                                 if (it->rfind("BSTOP ", 0) == 0) {
-                                    const int b = std::atoi(it->c_str() + 6);
-                                    if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
+                                    adm_bstop(std::atoi(it->c_str() + 6));
                                     it = in_lines.erase(it);
                                 } else if (it->rfind("BYIELD ", 0) == 0 && want_yield.load() < 0) {
                                     want_yield.store(std::atoi(it->c_str() + 7), std::memory_order_release);
@@ -14545,8 +15278,7 @@ int main(int argc, char** argv) {
                         std::lock_guard<std::mutex> lk(in_mu);
                         for (auto it = in_lines.begin(); it != in_lines.end();) {
                             if (it->rfind("BSTOP ", 0) == 0) {
-                                const int b = std::atoi(it->c_str() + 6);
-                                if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
+                                adm_bstop(std::atoi(it->c_str() + 6));
                                 it = in_lines.erase(it);
                             } else if (it->rfind("BYIELD ", 0) == 0) {
                                 ys = std::atoi(it->c_str() + 7);
