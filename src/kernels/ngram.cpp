@@ -535,7 +535,19 @@ bool PleTable::collect(float* out2560, std::string& err) {
     return true;
 }
 
+static std::atomic<size_t> g_gather_piece{0};
+void PleTable::set_gather_piece(size_t tokens) { g_gather_piece.store(tokens); }
+
 bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err) {
+    const size_t piece = g_gather_piece.load();
+    if (piece == 0 || n_tokens <= piece) return gather_one(rows, n_tokens, out, err);
+    for (size_t t = 0; t < n_tokens; t += piece)
+        if (!gather_one(rows + t * PLE_N_HEADS, std::min(piece, n_tokens - t), out + t * PLE_N_HEADS * PLE_HEAD_DIM, err))
+            return false;
+    return true;
+}
+
+bool PleTable::gather_one(const uint32_t* rows, size_t n_tokens, float* out, std::string& err) {
     std::lock_guard<std::recursive_mutex> lk(impl_->mu);
     if (impl_->pending) { err = "PleTable::gather_batch while a token is in flight"; return false; }
     const size_t n = n_tokens * (size_t) PLE_N_HEADS;
