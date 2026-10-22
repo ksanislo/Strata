@@ -132,6 +132,13 @@ using Clock = std::chrono::steady_clock;
 constexpr float EPS = 1e-6f;
 constexpr int64_t N = 2560, HC = 4, D = N * HC, LR = 320, K = 10, NE = 512;
 constexpr int64_t C = 10240, ZV = 6144, HV = 48;
+constexpr int64_t kConvCh = C;   // (run_impl's C is the chunk)
+// one prompt's rows [r0, r0 + n) of a chunk, at positions p0.., read into `ss` (prev: its two tokens before p0)
+struct RunSeg {
+    core::SessionState* ss;
+    int64_t r0, n, p0;
+    int32_t prev[2];
+};
 // plan v0.3 P6: staging holds the largest blob of the pack (a native pack's blobs differ per layer)
 inline int64_t MAXBLOB() { return (int64_t) strata::kernels::cpu::expert_layout().max_blob; }
 constexpr int STAGE = 8;           // host->device expert staging ring (chunks below stream_all_min())
@@ -2704,15 +2711,37 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const core::OnDevice on_device(m.device);
     const core::ModelGeometry& g = *m.g;
     // STRATA_PREFILL_MULTI: a queued prompt's own session and callbacks on this stage
-    core::SessionState& ss = job && depth < job->sessions.size() && job->sessions[depth] ? *job->sessions[depth] : *m.ss;
+    auto job_ss = [&](const PromptJob& pj) -> core::SessionState& {
+        return depth < pj.sessions.size() && pj.sessions[depth] ? *pj.sessions[depth] : *m.ss;
+    };
+    // STRATA_BATCH_READS: a chunk of several prompts' pieces; `ss` is the first one's (shapes, weights), each segment's
+    // sequence state its own (bsegs)
+    const bool bat = job && !job->segs.empty();
+    core::SessionState& ss = bat ? job_ss(*job->segs[0].job) : job ? job_ss(*job) : *m.ss;
+    std::vector<RunSeg> bsegs;
+    if (bat) {
+        int64_t r0 = 0;
+        for (const PromptJob::Seg& sg : job->segs) {
+            core::SessionState& x = job_ss(*sg.job);
+            bsegs.push_back(RunSeg{&x, r0, sg.n, sg.job->pos0 + sg.off, {x.ple_prev[0], x.ple_prev[1]}});
+            r0 += sg.n;
+        }
+        if (r0 != n || n > m.T) {
+            err = "prefill: a batched chunk does not match its segments or the buffers";
+            return false;
+        }
+    }
     static const std::function<bool(int64_t, std::string&)> no_stage_cb;
     const auto& stage_cb = !job ? on_stage_chunk : depth < job->on_stage_chunk.size() ? job->on_stage_chunk[depth] : no_stage_cb;
     const auto& chunk_cb = job ? job->on_chunk : on_chunk;
     const auto& stop_cb = job ? job->should_stop : should_stop;
     const float* const* const embd_rows = job ? job->embd_rows : this->embd_rows;
-    if (job && &ss != m.ss && m.ss->ple.ready() && !ss.ple.ready() && stage_lb_ <= 1 && 1 < stage_le_) {
-        err = "prefill: the prompt's session has no PLE run (the stage's own has one)";
-        return false;
+    for (size_t i = 0; i < std::max<size_t>(1, bsegs.size()); ++i) {
+        const core::SessionState& x = bsegs.empty() ? ss : *bsegs[i].ss;
+        if (job && &x != m.ss && m.ss->ple.ready() && !x.ple.ready() && stage_lb_ <= 1 && 1 < stage_le_) {
+            err = "prefill: the prompt's session has no PLE run (the stage's own has one)";
+            return false;
+        }
     }
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
@@ -2755,8 +2784,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
               std::to_string((long long) m.T);
         return false;
     }
-    const int64_t planned_C = forced > 0 ? 0 : plan_chunk(n);
-    const int64_t C = forced > 0 ? forced : planned_C > 0 ? planned_C : m.T;
+    const bool one = bat || (job && job->whole && n <= m.T);   // (a batch: one chunk)
+    const int64_t planned_C = forced > 0 || one ? 0 : plan_chunk(n);
+    const int64_t C = one ? n : forced > 0 ? forced : planned_C > 0 ? planned_C : m.T;
     if (planned_C > 0 && C < std::min(n, m.T)) log_plan(n, C, stage_count());
     const bool single_chunk = hand_in_ == nullptr ? (forced > 0 ? forced_single : n <= C) : single_chunk_;
     // a read the pipe chunked takes no CPU share: its chunks overlap on the stages by design, and which stage won the
@@ -2798,8 +2828,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                            (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
                            m.region_bytes / ((uint64_t) (3 * strata::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
     const int32_t prev0[2] = {prev[0], prev[1]};
-    auto ple_gather = [&m, &ss, tokens, n, prev0, C](int64_t c0, int buf, std::string& e) -> bool {
+    auto ple_gather = [&m, &ss, &bsegs, tokens, n, prev0, C](int64_t c0, int buf, std::string& e) -> bool {
         const int64_t T = std::min(C, n - c0);
+        for (const RunSeg& sg : bsegs) {   // a batch (one chunk): each segment's n-grams from its own history
+            int32_t pv[2] = {sg.prev[0], sg.prev[1]};
+            for (int64_t t = sg.r0; t < sg.r0 + sg.n; ++t) {
+                const int32_t tok = (int32_t) tokens[t];
+                strata::kernels::ngram_rows(&tok, pv, 1, ss.ple.consts,
+                                            m.ple_rows[buf].data() + t * strata::kernels::PLE_N_HEADS);
+                pv[0] = pv[1];
+                pv[1] = tok;
+            }
+        }
+        if (!bsegs.empty()) return ss.ple.table->gather_batch(m.ple_rows[buf].data(), (size_t) T, m.ple_emb_host[buf], e);
         auto at = [&](int64_t i) { return i < 2 ? prev0[i] : (int32_t) tokens[i - 2]; };   // prev0, then the tokens
         int32_t pv[2] = {at(c0), at(c0 + 1)};
         for (int64_t t = 0; t < T; ++t) {
@@ -2815,6 +2856,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     std::future<bool> ple_next;             // declared after everything it reads: an early return waits for it
     int ple_buf = 0;
 
+    // a batch's chunk on this stage is read (its stream synchronized): each prompt's own callbacks; one that fails ends
+    // that prompt only (the others' state is theirs)
+    auto seg_report = [&](bool last_stage) {
+        for (size_t i = 0; i < job->segs.size(); ++i) {
+            const PromptJob::Seg& sg = job->segs[i];
+            const RunSeg& rs = bsegs[i];
+            if (sg.job->failed()) continue;
+            std::string e;
+            const auto& scb = depth < sg.job->on_stage_chunk.size() ? sg.job->on_stage_chunk[depth] : no_stage_cb;
+            bool ok = !scb || scb(rs.p0 + rs.n, e);
+            if (ok && last_stage && sg.job->on_chunk) ok = sg.job->on_chunk(m.R + rs.r0 * D, rs.n, rs.p0, e);
+            if (!ok) sg.job->finish(false, e.empty() ? std::string("prefill: a batched prompt's callback failed") : e);
+        }
+    };
     if (hand_in_ == nullptr) stopped_at_ = -1;
     for (int64_t c0 = 0; c0 < n; c0 += C) {
         if (stop_cb && stop_cb()) { err = "cancelled"; return false; }
@@ -2966,8 +3021,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             return true;
         };
         for (int64_t t = 0; t < T; ++t) { prev[0] = prev[1]; prev[1] = (int32_t) tokens[c0 + t]; }
+        // the chunk's segments: the run itself, or a batch's prompts (each its own positions and sequence state)
+        const std::vector<RunSeg> segv = bat ? bsegs : std::vector<RunSeg>{RunSeg{&ss, 0, T, p0, {prev[0], prev[1]}}};
         // ---- the QSA step records of every position in the chunk
-        for (int64_t t = 0; t < T; ++t) strata::kernels::qsa_step_fill(m.steps_host.data() + t * strata::kernels::kStepCount, p0 + t, s);
+        for (const RunSeg& sg : segv)
+            for (int64_t t = sg.r0; t < sg.r0 + sg.n; ++t)
+                strata::kernels::qsa_step_fill(m.steps_host.data() + t * strata::kernels::kStepCount, sg.p0 + (t - sg.r0), s);
         if (!m.steps_up.upload(m.steps_dev, m.steps_host.data(), (size_t) T * strata::kernels::kStepCount, m.cs)) {
             err = "prefill: the QSA step records' upload failed";
             return false;
@@ -3226,8 +3285,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 constexpr int64_t HD = strata::kernels::NG_HC_DIM;
                 const uint64_t per_token = (uint64_t) (3 * HD + N + 4) * 4 + (uint64_t) N * (bf16x2(m.f16_io) ? 4 : 2) + 4096;
                 const int64_t SB = std::min<int64_t>(T, (int64_t) (m.region_bytes / per_token));
-                for (int64_t s0 = 0; s0 < T; s0 += SB) {
-                    const int64_t nb = std::min(SB, T - s0);
+                for (const RunSeg& sg : segv)   // (each segment's history its own)
+                for (int64_t s0 = sg.r0; s0 < sg.r0 + sg.n; s0 += SB) {
+                    const int64_t nb = std::min(SB, sg.r0 + sg.n - s0);
                     uint8_t* q = m.region;
                     auto carve_f = [&](size_t n) { float* p = (float*) q; q += (n * 4 + 255) & ~(size_t) 255; return p; };
                     float* key = carve_f((size_t) nb * HD);
@@ -3251,7 +3311,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     m.gemm.bf16(e16, pw.value_bf16, val, nb, N, N);
                     if (e16_lo) m.gemm.bf16(e16_lo, pw.value_bf16, val, nb, N, N, 0, 1.0f);
                     try {
-                        strata::kernels::native_ple_postops_batch(key, m.R + s0 * D, val, ss.ple.hist, pw, qn, gated,
+                        strata::kernels::native_ple_postops_batch(key, m.R + s0 * D, val, sg.ss->ple.hist, pw, qn, gated,
                                                                   gate, (int) nb, m.cs);
                     } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
                 }
@@ -3259,15 +3319,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             } else if (l == 1 && ple_on) {
                 pt.mark(kPfPle, cs);
                 const auto tp = Clock::now();
-                for (int64_t t = 0; t < T; ++t) {
+                for (const RunSeg& sg : segv)
+                for (int64_t t = sg.r0; t < sg.r0 + sg.n; ++t) {
                     strata::kernels::PleOut po;
                     po.normalized = m.ple_norm;
                     po.result = m.R + t * D;
                     try {
-                        strata::kernels::ple_block(m.ple_emb + t * N, m.R + t * D, ss.ple.hist, ss.ple.w, po,
-                                                   ss.ple.scratch, m.cs);
+                        strata::kernels::ple_block(m.ple_emb + t * N, m.R + t * D, sg.ss->ple.hist, ss.ple.w, po,
+                                                   sg.ss->ple.scratch, m.cs);
                     } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
-                    strata::kernels::ple_history_advance(ss.ple.hist, m.ple_norm, m.cs);
+                    strata::kernels::ple_history_advance(sg.ss->ple.hist, m.ple_norm, m.cs);
                 }
                 stats_.ms_ple += ms_since(tp);
             }
@@ -3363,25 +3424,29 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           *wsa = need(v, "ssm_a", err);
                     if (!wqkv || !wg || !wo || !wa || !wb || !wc || !wnm || !wdt || !wsa) return false;
                     pt.mark(kPfGdn, cs);
-                    float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
-                    float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
                     if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
                     if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     pt.mark(kPfGdnConv, cs);   // "gdn" is the projections in; the rest on their own lines
                     gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
-                    gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
-                    pt.mark(kPfGdnRec, cs);
                     const int64_t ld_y = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
-                    gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs,
-                                   ld_y);
+                    for (const RunSeg& sg : segv) {   // the conv and the recurrence: each segment from its own state
+                        float* state = sg.ss->gdn_state + (size_t) (gdn_index - sg.ss->gdn_ord0) * gdn_floats;
+                        float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                        const int64_t r0 = sg.r0;
+                        if (segv.size() > 1) pt.mark(kPfGdnConv, cs);
+                        gdn_conv(conv, m.qkv + r0 * kConvCh, (const float*) wc->data, m.hbuf + r0 * kConvCh, sg.n, EPS, m.cs);
+                        pt.mark(kPfGdnRec, cs);
+                        gdn_recurrence(state, m.hbuf + r0 * kConvCh, m.gate + r0 * HV, m.beta + r0 * HV, m.z + r0 * ZV,
+                                       (const float*) wnm->data, EPS, m.y + r0 * ZV, m.y_h + r0 * (ld_y > 0 ? ld_y : ZV),
+                                       sg.n, m.cs, ld_y);
+                    }
                     pt.mark(kPfGdnOut, cs);
                     if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err, 0, ld_y)) return false;
                     ++gdn_index;
                 } else if (half == 0) {
                     // ======================= QSA =======================
-                    const core::QsaState& st = ss.qsa_states[qsa_index];
                     const core::WeightRef *wq = need(v, "attn_q.weight", err), *wk = need(v, "attn_k.weight", err),
                                           *wv = need(v, "attn_v.weight", err), *wo = need(v, "attn_output.weight", err),
                                           *wik = need(v, "indexer.k_proj.weight", err),
@@ -3396,228 +3461,240 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                     if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
-                    rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.cs);
-                    rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), m.cs);
-                    // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
-                    // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks
-                    const bool staged = st.kv_mode == 1;
-                    if (staged) {
-                        pt.mark(kPfKvStage, cs);
-                        if (kv_pending == qsa_index) {
-                            if (cudaStreamWaitEvent(cs, m.kv_ready, 0) != cudaSuccess) {
-                                err = "prefill: waiting for KV prefetch";
-                                return false;
-                            }
-                            kv_pending = -1;
-                        } else strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host,
-                                                            core::qsa_kv_format(st),
-                                                            (p0 + s.page_size - 1) / s.page_size, s, m.cs);
-                        pt.mark(kPfQsa, cs);
-                        pf_step("reading the prompt (batched, step sync): the K/V staged from RAM at layer", l);
-                    }
-                    // #579 #613 (HIP, opt-in A/B, STRATA_KV_HOST_DMA=1): the append writes the staging pool and the
-                    // resident slots only, and one DMA copies the chunk's blocks from the staging pool to the host copy
-                    // - no kernel writes host memory over PCIe.  The bytes every reader sees are the same (the staged
-                    // first block is complete; past the chunk's last cell nothing is read until a later append writes
-                    // it).  CUDA: never.
+                    // the sequence-dependent part per segment (rope, K/V append, indexer, selection, attention), each
+                    // against its own session; the projections above and below run over the whole chunk
+                    for (const RunSeg& sg : segv) {
+                        const int64_t T = sg.n, p0 = sg.p0, r0 = sg.r0;
+                        const core::QsaState& st = sg.ss->qsa_states[qsa_index];
+                        float *const Kc = m.Kc + r0 * 512, *const Vc = m.Vc + r0 * 512, *const Qf = m.Qf + r0 * 12288;
+                        float *const q = m.q + r0 * ZV, *const idx_raw = m.idx_raw + r0 * 128, *const q_idx = m.q_idx + r0 * 512;
+                        float* const attn = m.attn + r0 * ZV;
+                        int32_t* const sel_ids = m.sel_ids + r0 * m.cap;
+                        const int32_t* const steps_dev = m.steps_dev + r0 * strata::kernels::kStepCount;
+                        const int32_t* const steps_host = m.steps_host.data() + r0 * strata::kernels::kStepCount;
+                        rms_rows(Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.cs);
+                        rope(Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), m.cs);
+                        // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
+                        // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks
+                        const bool staged = st.kv_mode == 1;
+                        if (staged) {
+                            pt.mark(kPfKvStage, cs);
+                            if (kv_pending == qsa_index) {
+                                if (cudaStreamWaitEvent(cs, m.kv_ready, 0) != cudaSuccess) {
+                                    err = "prefill: waiting for KV prefetch";
+                                    return false;
+                                }
+                                kv_pending = -1;
+                            } else strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host,
+                                                                core::qsa_kv_format(st),
+                                                                (p0 + s.page_size - 1) / s.page_size, s, m.cs);
+                            pt.mark(kPfQsa, cs);
+                            pf_step("reading the prompt (batched, step sync): the K/V staged from RAM at layer", l);
+                        }
+                        // #579 #613 (HIP, opt-in A/B, STRATA_KV_HOST_DMA=1): the append writes the staging pool and the
+                        // resident slots only, and one DMA copies the chunk's blocks from the staging pool to the host copy
+                        // - no kernel writes host memory over PCIe.  The bytes every reader sees are the same (the staged
+                        // first block is complete; past the chunk's last cell nothing is read until a later append writes
+                        // it).  CUDA: never.
 #if defined(STRATA_USE_HIP)
-                    static const bool kv_host_dma = [] { const char* e = std::getenv("STRATA_KV_HOST_DMA"); return e && e[0] == '1'; }();
+                        static const bool kv_host_dma = [] { const char* e = std::getenv("STRATA_KV_HOST_DMA"); return e && e[0] == '1'; }();
 #else
-                    constexpr bool kv_host_dma = false;
+                        constexpr bool kv_host_dma = false;
 #endif
-                    const bool host_by_dma = staged && kv_host_dma;
-                    const strata::kernels::KvHostPools* host_w = host_by_dma ? nullptr : &st.host;
-                    if (st.kv_hybrid) {   // K8V4: K INT8 unrotated, V rotated Q4_0 (only V and the output rotate)
-                        // streamed: each half writes its part of the host copy and of the staging pool
-                        strata::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
-                        const strata::kernels::KvHostPools hk = strata::kernels::kv_hybrid_k_half(st.host),
-                                                           hv = strata::kernels::kv_hybrid_v_half(st.host),
-                                                           sk = strata::kernels::kv_hybrid_k_half(m.stage),
-                                                           sv = strata::kernels::kv_hybrid_v_half(m.stage);
-                        const bool mirror = st.host.present();
-                        kv_append(m.Kc, m.Kc, T, p0, st.page_table, s.page_size, nullptr, nullptr,
-                                  st.k_q, st.k_q, st.k_scale, st.k_scale, m.cs, mirror ? &hk : nullptr,
-                                  staged ? &sk : nullptr);
-                        strata::kernels::kv_append_q4(st.v_q4, st.v_q4, st.page_table, p0, T, m.Vc, m.Vc, s, m.cs,
-                                                      mirror ? &hv : nullptr, staged ? &sv : nullptr);
-                    } else {
-                        if (st.kv_rot) {   // rotated K and V (kv_q4.hpp), the queries below too, the output back
-                            strata::kernels::fwht256_inplace_cuda(m.Kc, T * 2, m.cs);
-                            strata::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
-                        }
-                        if (st.kv_q4)
-                            strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs,
-                                                          host_w, staged ? &m.stage : nullptr);
-                        else
-                            kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
-                                      st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
-                                      host_w, staged ? &m.stage : nullptr);
-                        if (host_by_dma)
-                            strata::kernels::kv_unstage_to_host(pools_of(m.stage, m.ident_table), st.host,
-                                                                core::qsa_kv_format(st), p0 / s.page_size,
-                                                                (p0 + T + s.page_size - 1) / s.page_size, s, m.cs);
-                    }
-                    if (staged) pf_step("reading the prompt (batched, step sync): the K/V append at layer", l);
-                    split_q(m.Qf, m.q, T, m.cs);
-                    rms_rows(m.q, (const float*) wqn->data, T * 24, 256, 256, EPS, m.cs);
-                    rope(m.q, T, 24, 256, 6144, p0, strata::kernels::rope_scaling(), m.cs);
-                    if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(m.q, T * 24, m.cs);
-                    rms_rows(m.q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, m.cs);
-                    rope(m.q_idx, T, 4, 128, 512, p0, strata::kernels::rope_scaling(), m.cs);
-                    // the indexer appends, token by token; then scores + selection for many queries at once:
-                    // a query reads completed blocks (final once completed) and `dead` for its own tail block
-                    const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
-                    pt.mark(kPfQsaIdx, cs);
-                    // C-2: the chunk's appends in three launches instead of one per token (the same end state:
-                    // the queries below read it only after the whole chunk is appended). STRATA_INDEXER_PER_TOKEN=1: the old
-                    try {
-                        static const bool per_token = std::getenv("STRATA_INDEXER_PER_TOKEN") != nullptr;
-                        if (!per_token) {
-                            strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data,
-                                                                             EPS, ib, s, st.max_cells,
-                                                                             strata::kernels::rope_scaling(), m.cs);
-                        }
-                        for (int64_t t = 0; per_token && t < T; ++t) {
-                            const int32_t* step_t = m.steps_dev + t * strata::kernels::kStepCount;
-                            strata::kernels::native_qsa_indexer_append(m.idx_raw + t * 128, step_t + strata::kernels::kStepPos, 0,
-                                                                       (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                                                       strata::kernels::rope_scaling(), m.cs);
-                        }
-                    } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
-                    pt.mark(kPfQsaSel, cs);
-                    for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
-                        const int64_t nb = std::min(m.sel_batch, T - t0);
-                        const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
-                        // C-1: the grid reaches the batch's last query's n_bid (they rise with the position)
-                        const int64_t active = (int64_t) m.steps_host[(size_t) ((t0 + nb - 1) * strata::kernels::kStepCount +
-                                                                                strata::kernels::kStepNBid)] + 1;
-                        // the scores on tensor cores (3xTF32: FP32-level, not bitwise), below sm_80 the FP32 tiled kernel with STRATA_SELECT_SIMT=1;
-                        // STRATA_SELECT_OLD=1: the warp kernel
-                        static const bool old_sel = std::getenv("STRATA_SELECT_OLD") != nullptr;
-                        if (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512,
-                                                                             steps0, nb, m.max_blocks, s, m.sel_scores,
-                                                                             m.cs, active))
-                            strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
-                                                              m.max_blocks, s, m.sel_scores, m.cs, active);
-                        strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
-                                                        m.sel_ids + t0 * m.cap, m.cs, active);
-                    }
-                    // STRATA_SEL_OVERLAP (debug, D-1's question): how much do neighbouring queries' selections share?
-                    // Per tile of 16 queries: the union of their selected cells against the sum of their widths.
-                    if (static const bool ovl = std::getenv("STRATA_SEL_OVERLAP") != nullptr; ovl && qsa_index == 0) {
-                        std::vector<int32_t> ids((size_t) (T * m.cap));
-                        cudaMemcpyAsync(ids.data(), m.sel_ids, ids.size() * 4, cudaMemcpyDeviceToHost, m.cs);
-                        cudaStreamSynchronize(m.cs);
-                        double sum_w = 0, sum_u = 0;
-                        for (int64_t t0 = 0; t0 + 16 <= T; t0 += 16) {
-                            std::vector<int32_t> u;
-                            for (int64_t t = t0; t < t0 + 16; ++t) {
-                                const int64_t w = m.steps_host[(size_t) (t * strata::kernels::kStepCount + strata::kernels::kStepWidth)];
-                                sum_w += (double) w;
-                                u.insert(u.end(), ids.begin() + t * m.cap, ids.begin() + t * m.cap + w);
+                        const bool host_by_dma = staged && kv_host_dma;
+                        const strata::kernels::KvHostPools* host_w = host_by_dma ? nullptr : &st.host;
+                        if (st.kv_hybrid) {   // K8V4: K INT8 unrotated, V rotated Q4_0 (only V and the output rotate)
+                            // streamed: each half writes its part of the host copy and of the staging pool
+                            strata::kernels::fwht256_inplace_cuda(Vc, T * 2, m.cs);
+                            const strata::kernels::KvHostPools hk = strata::kernels::kv_hybrid_k_half(st.host),
+                                                               hv = strata::kernels::kv_hybrid_v_half(st.host),
+                                                               sk = strata::kernels::kv_hybrid_k_half(m.stage),
+                                                               sv = strata::kernels::kv_hybrid_v_half(m.stage);
+                            const bool mirror = st.host.present();
+                            kv_append(Kc, Kc, T, p0, st.page_table, s.page_size, nullptr, nullptr,
+                                      st.k_q, st.k_q, st.k_scale, st.k_scale, m.cs, mirror ? &hk : nullptr,
+                                      staged ? &sk : nullptr);
+                            strata::kernels::kv_append_q4(st.v_q4, st.v_q4, st.page_table, p0, T, Vc, Vc, s, m.cs,
+                                                          mirror ? &hv : nullptr, staged ? &sv : nullptr);
+                        } else {
+                            if (st.kv_rot) {   // rotated K and V (kv_q4.hpp), the queries below too, the output back
+                                strata::kernels::fwht256_inplace_cuda(Kc, T * 2, m.cs);
+                                strata::kernels::fwht256_inplace_cuda(Vc, T * 2, m.cs);
                             }
-                            std::sort(u.begin(), u.end());
-                            sum_u += (double) (std::unique(u.begin(), u.end()) - u.begin());
+                            if (st.kv_q4)
+                                strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, Kc, Vc, s, m.cs,
+                                                              host_w, staged ? &m.stage : nullptr);
+                            else
+                                kv_append(Kc, Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
+                                          st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
+                                          host_w, staged ? &m.stage : nullptr);
+                            if (host_by_dma)
+                                strata::kernels::kv_unstage_to_host(pools_of(m.stage, m.ident_table), st.host,
+                                                                    core::qsa_kv_format(st), p0 / s.page_size,
+                                                                    (p0 + T + s.page_size - 1) / s.page_size, s, m.cs);
                         }
-                        std::fprintf(stderr, "strata prefill: selection overlap at %lld: 16-query tiles read %.1f%% of the "
-                                             "cells one query at a time does\n", (long long) p0, sum_w > 0 ? 100.0 * sum_u / sum_w : 0.0);
-                    }
-                    // STRATA_IDX_FP16_CHECK: would FP16 pooled indexer keys select the same cells? (the KV-streaming
-                    // design's last question). Every query is selected again from the pooled keys and `dead` rounded
-                    // to fp16 (exactly what an fp16 store reads back); the agreement with the fp32 selection is
-                    // printed cumulatively after each chunk's last QSA layer. Debug: syncs per layer.
-                    if (static const bool f16chk = std::getenv("STRATA_IDX_FP16_CHECK") != nullptr; f16chk) {
-                        static float *pooled16 = nullptr, *dead16 = nullptr;
-                        static int32_t* ids16 = nullptr;
-                        static double shared = 0, cells = 0;
-                        static long long queries = 0, same = 0, sel_queries = 0;
-                        const int64_t rows = st.idx_pooled_rows;
-                        if (pooled16 == nullptr &&
-                            (cudaMalloc((void**) &pooled16, (size_t) rows * s.idx_dim * 4) != cudaSuccess ||
-                             cudaMalloc((void**) &dead16, (size_t) s.idx_dim * 4) != cudaSuccess ||
-                             cudaMalloc((void**) &ids16, (size_t) (m.T * m.cap) * 4) != cudaSuccess)) {
-                            err = "STRATA_IDX_FP16_CHECK: no room for its buffers";
-                            return false;
-                        }
-                        round_f16(st.idx_pooled, pooled16, rows * s.idx_dim, m.cs);
-                        round_f16(st.idx_dead, dead16, s.idx_dim, m.cs);
+                        if (staged) pf_step("reading the prompt (batched, step sync): the K/V append at layer", l);
+                        split_q(Qf, q, T, m.cs);
+                        rms_rows(q, (const float*) wqn->data, T * 24, 256, 256, EPS, m.cs);
+                        rope(q, T, 24, 256, 6144, p0, strata::kernels::rope_scaling(), m.cs);
+                        if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(q, T * 24, m.cs);
+                        rms_rows(q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, m.cs);
+                        rope(q_idx, T, 4, 128, 512, p0, strata::kernels::rope_scaling(), m.cs);
+                        // the indexer appends, token by token; then scores + selection for many queries at once:
+                        // a query reads completed blocks (final once completed) and `dead` for its own tail block
+                        const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+                        pt.mark(kPfQsaIdx, cs);
+                        // C-2: the chunk's appends in three launches instead of one per token (the same end state:
+                        // the queries below read it only after the whole chunk is appended). STRATA_INDEXER_PER_TOKEN=1: the old
+                        try {
+                            static const bool per_token = std::getenv("STRATA_INDEXER_PER_TOKEN") != nullptr;
+                            if (!per_token) {
+                                strata::kernels::native_qsa_indexer_append_batch(idx_raw, T, p0, 0, (const float*) wikn->data,
+                                                                                 EPS, ib, s, st.max_cells,
+                                                                                 strata::kernels::rope_scaling(), m.cs);
+                            }
+                            for (int64_t t = 0; per_token && t < T; ++t) {
+                                const int32_t* step_t = steps_dev + t * strata::kernels::kStepCount;
+                                strata::kernels::native_qsa_indexer_append(idx_raw + t * 128, step_t + strata::kernels::kStepPos, 0,
+                                                                           (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                                           strata::kernels::rope_scaling(), m.cs);
+                            }
+                        } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
+                        pt.mark(kPfQsaSel, cs);
                         for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
                             const int64_t nb = std::min(m.sel_batch, T - t0);
-                            const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
-                            strata::kernels::qsa_block_scores(pooled16, dead16, m.q_idx + t0 * 512, steps0, nb,
-                                                              m.max_blocks, s, m.sel_scores, m.cs);
+                            const int32_t* steps0 = steps_dev + t0 * strata::kernels::kStepCount;
+                            // C-1: the grid reaches the batch's last query's n_bid (they rise with the position)
+                            const int64_t active = (int64_t) steps_host[(size_t) ((t0 + nb - 1) * strata::kernels::kStepCount +
+                                                                                    strata::kernels::kStepNBid)] + 1;
+                            // the scores on tensor cores (3xTF32: FP32-level, not bitwise), below sm_80 the FP32 tiled kernel with STRATA_SELECT_SIMT=1;
+                            // STRATA_SELECT_OLD=1: the warp kernel
+                            static const bool old_sel = std::getenv("STRATA_SELECT_OLD") != nullptr;
+                            if (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, q_idx + t0 * 512,
+                                                                                 steps0, nb, m.max_blocks, s, m.sel_scores,
+                                                                                 m.cs, active))
+                                strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, q_idx + t0 * 512, steps0, nb,
+                                                                  m.max_blocks, s, m.sel_scores, m.cs, active);
                             strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
-                                                            ids16 + t0 * m.cap, m.cs);
+                                                            sel_ids + t0 * m.cap, m.cs, active);
                         }
-                        std::vector<int32_t> a((size_t) (T * m.cap)), b((size_t) (T * m.cap));
-                        cudaMemcpyAsync(a.data(), m.sel_ids, a.size() * 4, cudaMemcpyDeviceToHost, m.cs);
-                        cudaMemcpyAsync(b.data(), ids16, b.size() * 4, cudaMemcpyDeviceToHost, m.cs);
-                        cudaStreamSynchronize(m.cs);
-                        for (int64_t t = 0; t < T; ++t) {
-                            const int64_t w = m.steps_host[(size_t) (t * strata::kernels::kStepCount + strata::kernels::kStepWidth)];
-                            const int32_t *x = a.data() + t * m.cap, *y = b.data() + t * m.cap;
-                            int64_t i = 0, j = 0, c = 0;
-                            while (i < w && j < w) {
-                                if (x[i] == y[j]) { ++c; ++i; ++j; } else if (x[i] < y[j]) ++i; else ++j;
-                            }
-                            ++queries;
-                            same += c == w;
-                            if (p0 + t + 1 > m.cap) { ++sel_queries; shared += (double) c; cells += (double) w; }
-                        }
-                        if (qsa_index + 1 == g.n_qsa_layers())
-                            std::fprintf(stderr, "strata prefill: FP16 indexer keys: %lld of %lld selections identical; "
-                                                 "where the selection is sparse, %.4f%% of cells shared (%lld queries)\n",
-                                         same, queries, cells > 0 ? 100.0 * shared / cells : 100.0, sel_queries);
-                    }
-                    // STRATA_QSA_DUMP=<file>: append every QSA layer's selected cells for the prompt's last
-                    // STRATA_QSA_DUMP_LAST (4096) positions - records of int32 {qsa layer, pos0, T, cap} + T*cap cells,
-                    // for tools/qsa_locality.py (how local the sparse attention's reads are: the KV-streaming question).
-                    // STRATA_QSA_DUMP_LAYER=i: QSA layer i only; STRATA_QSA_DUMP_STEPS=1: each record then ends with the
-                    // T * kStepCount steps too (tests/cuda/pa_bench.cpp replays such a record)
-                    if (static const char* dump = std::getenv("STRATA_QSA_DUMP"); dump != nullptr) {
-                        static const long long last = std::getenv("STRATA_QSA_DUMP_LAST")
-                                                          ? std::atoll(std::getenv("STRATA_QSA_DUMP_LAST")) : 4096;
-                        static const int only = std::getenv("STRATA_QSA_DUMP_LAYER") ? std::atoi(std::getenv("STRATA_QSA_DUMP_LAYER")) : -1;
-                        if (p0 + T > pos0 + n - last && (only < 0 || only == (int) qsa_index)) {
-                            // STRATA_QSA_DUMP_TRIM=1: only the rows inside the last positions (pos0 / T of the header follow)
-                            static const bool trim = std::getenv("STRATA_QSA_DUMP_TRIM") != nullptr;
-                            const int64_t r0 = trim ? std::max<int64_t>(0, pos0 + n - last - p0) : 0, nr = T - r0;
-                            std::vector<int32_t> h((size_t) (nr * m.cap));
-                            cudaMemcpyAsync(h.data(), m.sel_ids + r0 * m.cap, h.size() * 4, cudaMemcpyDeviceToHost, m.cs);
+                        // STRATA_SEL_OVERLAP (debug, D-1's question): how much do neighbouring queries' selections share?
+                        // Per tile of 16 queries: the union of their selected cells against the sum of their widths.
+                        if (static const bool ovl = std::getenv("STRATA_SEL_OVERLAP") != nullptr; ovl && qsa_index == 0) {
+                            std::vector<int32_t> ids((size_t) (T * m.cap));
+                            cudaMemcpyAsync(ids.data(), sel_ids, ids.size() * 4, cudaMemcpyDeviceToHost, m.cs);
                             cudaStreamSynchronize(m.cs);
-                            static std::mutex dump_mu;   // a layer split's stages read their chunks on their own threads
-                            const std::lock_guard<std::mutex> lk(dump_mu);
-                            if (std::FILE* f = std::fopen(dump, "ab")) {
-                                const int32_t hdr[4] = {(int32_t) qsa_index, (int32_t) (p0 + r0), (int32_t) nr, (int32_t) m.cap};
-                                std::fwrite(hdr, 4, 4, f);
-                                std::fwrite(h.data(), 4, h.size(), f);
-                                if (std::getenv("STRATA_QSA_DUMP_STEPS")) {
-                                    std::vector<int32_t> sv((size_t) (nr * strata::kernels::kStepCount));
-                                    cudaMemcpy(sv.data(), m.steps_dev + r0 * strata::kernels::kStepCount, sv.size() * 4,
-                                               cudaMemcpyDeviceToHost);
-                                    std::fwrite(sv.data(), 4, sv.size(), f);
+                            double sum_w = 0, sum_u = 0;
+                            for (int64_t t0 = 0; t0 + 16 <= T; t0 += 16) {
+                                std::vector<int32_t> u;
+                                for (int64_t t = t0; t < t0 + 16; ++t) {
+                                    const int64_t w = steps_host[(size_t) (t * strata::kernels::kStepCount + strata::kernels::kStepWidth)];
+                                    sum_w += (double) w;
+                                    u.insert(u.end(), ids.begin() + t * m.cap, ids.begin() + t * m.cap + w);
                                 }
-                                std::fclose(f);
+                                std::sort(u.begin(), u.end());
+                                sum_u += (double) (std::unique(u.begin(), u.end()) - u.begin());
+                            }
+                            std::fprintf(stderr, "strata prefill: selection overlap at %lld: 16-query tiles read %.1f%% of the "
+                                                 "cells one query at a time does\n", (long long) p0, sum_w > 0 ? 100.0 * sum_u / sum_w : 0.0);
+                        }
+                        // STRATA_IDX_FP16_CHECK: would FP16 pooled indexer keys select the same cells? (the KV-streaming
+                        // design's last question). Every query is selected again from the pooled keys and `dead` rounded
+                        // to fp16 (exactly what an fp16 store reads back); the agreement with the fp32 selection is
+                        // printed cumulatively after each chunk's last QSA layer. Debug: syncs per layer.
+                        if (static const bool f16chk = std::getenv("STRATA_IDX_FP16_CHECK") != nullptr; f16chk) {
+                            static float *pooled16 = nullptr, *dead16 = nullptr;
+                            static int32_t* ids16 = nullptr;
+                            static double shared = 0, cells = 0;
+                            static long long queries = 0, same = 0, sel_queries = 0;
+                            const int64_t rows = st.idx_pooled_rows;
+                            if (pooled16 == nullptr &&
+                                (cudaMalloc((void**) &pooled16, (size_t) rows * s.idx_dim * 4) != cudaSuccess ||
+                                 cudaMalloc((void**) &dead16, (size_t) s.idx_dim * 4) != cudaSuccess ||
+                                 cudaMalloc((void**) &ids16, (size_t) (m.T * m.cap) * 4) != cudaSuccess)) {
+                                err = "STRATA_IDX_FP16_CHECK: no room for its buffers";
+                                return false;
+                            }
+                            round_f16(st.idx_pooled, pooled16, rows * s.idx_dim, m.cs);
+                            round_f16(st.idx_dead, dead16, s.idx_dim, m.cs);
+                            for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
+                                const int64_t nb = std::min(m.sel_batch, T - t0);
+                                const int32_t* steps0 = steps_dev + t0 * strata::kernels::kStepCount;
+                                strata::kernels::qsa_block_scores(pooled16, dead16, q_idx + t0 * 512, steps0, nb,
+                                                                  m.max_blocks, s, m.sel_scores, m.cs);
+                                strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
+                                                                ids16 + t0 * m.cap, m.cs);
+                            }
+                            std::vector<int32_t> a((size_t) (T * m.cap)), b((size_t) (T * m.cap));
+                            cudaMemcpyAsync(a.data(), sel_ids, a.size() * 4, cudaMemcpyDeviceToHost, m.cs);
+                            cudaMemcpyAsync(b.data(), ids16, b.size() * 4, cudaMemcpyDeviceToHost, m.cs);
+                            cudaStreamSynchronize(m.cs);
+                            for (int64_t t = 0; t < T; ++t) {
+                                const int64_t w = steps_host[(size_t) (t * strata::kernels::kStepCount + strata::kernels::kStepWidth)];
+                                const int32_t *x = a.data() + t * m.cap, *y = b.data() + t * m.cap;
+                                int64_t i = 0, j = 0, c = 0;
+                                while (i < w && j < w) {
+                                    if (x[i] == y[j]) { ++c; ++i; ++j; } else if (x[i] < y[j]) ++i; else ++j;
+                                }
+                                ++queries;
+                                same += c == w;
+                                if (p0 + t + 1 > m.cap) { ++sel_queries; shared += (double) c; cells += (double) w; }
+                            }
+                            if (qsa_index + 1 == g.n_qsa_layers())
+                                std::fprintf(stderr, "strata prefill: FP16 indexer keys: %lld of %lld selections identical; "
+                                                     "where the selection is sparse, %.4f%% of cells shared (%lld queries)\n",
+                                             same, queries, cells > 0 ? 100.0 * shared / cells : 100.0, sel_queries);
+                        }
+                        // STRATA_QSA_DUMP=<file>: append every QSA layer's selected cells for the prompt's last
+                        // STRATA_QSA_DUMP_LAST (4096) positions - records of int32 {qsa layer, pos0, T, cap} + T*cap cells,
+                        // for tools/qsa_locality.py (how local the sparse attention's reads are: the KV-streaming question).
+                        // STRATA_QSA_DUMP_LAYER=i: QSA layer i only; STRATA_QSA_DUMP_STEPS=1: each record then ends with the
+                        // T * kStepCount steps too (tests/cuda/pa_bench.cpp replays such a record)
+                        if (static const char* dump = std::getenv("STRATA_QSA_DUMP"); dump != nullptr) {
+                            static const long long last = std::getenv("STRATA_QSA_DUMP_LAST")
+                                                              ? std::atoll(std::getenv("STRATA_QSA_DUMP_LAST")) : 4096;
+                            static const int only = std::getenv("STRATA_QSA_DUMP_LAYER") ? std::atoi(std::getenv("STRATA_QSA_DUMP_LAYER")) : -1;
+                            if (p0 + T > pos0 + n - last && (only < 0 || only == (int) qsa_index)) {
+                                // STRATA_QSA_DUMP_TRIM=1: only the rows inside the last positions (pos0 / T of the header follow)
+                                static const bool trim = std::getenv("STRATA_QSA_DUMP_TRIM") != nullptr;
+                                const int64_t r0 = trim ? std::max<int64_t>(0, pos0 + n - last - p0) : 0, nr = T - r0;
+                                std::vector<int32_t> h((size_t) (nr * m.cap));
+                                cudaMemcpyAsync(h.data(), sel_ids + r0 * m.cap, h.size() * 4, cudaMemcpyDeviceToHost, m.cs);
+                                cudaStreamSynchronize(m.cs);
+                                static std::mutex dump_mu;   // a layer split's stages read their chunks on their own threads
+                                const std::lock_guard<std::mutex> lk(dump_mu);
+                                if (std::FILE* f = std::fopen(dump, "ab")) {
+                                    const int32_t hdr[4] = {(int32_t) qsa_index, (int32_t) (p0 + r0), (int32_t) nr, (int32_t) m.cap};
+                                    std::fwrite(hdr, 4, 4, f);
+                                    std::fwrite(h.data(), 4, h.size(), f);
+                                    if (std::getenv("STRATA_QSA_DUMP_STEPS")) {
+                                        std::vector<int32_t> sv((size_t) (nr * strata::kernels::kStepCount));
+                                        cudaMemcpy(sv.data(), steps_dev + r0 * strata::kernels::kStepCount, sv.size() * 4,
+                                                   cudaMemcpyDeviceToHost);
+                                        std::fwrite(sv.data(), 4, sv.size(), f);
+                                    }
+                                    std::fclose(f);
+                                }
                             }
                         }
+                        const strata::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
+                                                                           : core::qsa_attn_pools(st);
+                        pt.mark(kPfQsaAttn, cs);
+                        // perf-review D-1: the whole chunk on tensor cores, one block per (query, KV head), FP32-level
+                        // accuracy but not bitwise (qsa_prompt_attn.hpp). Q4_0 KV, or STRATA_PROMPT_ATTN_OLD=1: the
+                        // decode kernel, 32 queries at a time (K8V4 runs the tensor kernel's mode 3: INT8 K,
+                        // V dequantized from its q4_0 blocks to fp16 at gather)
+                        static const bool old_attn = std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr;
+                        if (old_attn || !strata::kernels::qsa_prompt_attn_batch(q, pools, sel_ids, steps_dev, m.cap, s,
+                                                                                attn, T, m.cs))
+                            for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
+                                const int64_t nb = std::min(m.attn_batch, T - t0);
+                                strata::kernels::qsa_decode_attn_batch(q + t0 * ZV, pools, sel_ids + t0 * m.cap,
+                                                                       steps_dev + t0 * strata::kernels::kStepCount, m.cap,
+                                                                       s, m.attn_scratch, attn + t0 * ZV, nb, m.cs);
+                            }
+                        if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(attn, T * 24, m.cs);
                     }
-                    const strata::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
-                                                                       : core::qsa_attn_pools(st);
-                    pt.mark(kPfQsaAttn, cs);
-                    // perf-review D-1: the whole chunk on tensor cores, one block per (query, KV head), FP32-level
-                    // accuracy but not bitwise (qsa_prompt_attn.hpp). Q4_0 KV, or STRATA_PROMPT_ATTN_OLD=1: the
-                    // decode kernel, 32 queries at a time (K8V4 runs the tensor kernel's mode 3: INT8 K,
-                    // V dequantized from its q4_0 blocks to fp16 at gather)
-                    static const bool old_attn = std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr;
-                    if (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
-                                                                            m.attn, T, m.cs))
-                        for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
-                            const int64_t nb = std::min(m.attn_batch, T - t0);
-                            strata::kernels::qsa_decode_attn_batch(m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
-                                                                   m.steps_dev + t0 * strata::kernels::kStepCount, m.cap,
-                                                                   s, m.attn_scratch, m.attn + t0 * ZV, nb, m.cs);
-                        }
-                    if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
                     pt.mark(kPfQsa, cs);
                     const int64_t ld_a = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
                     gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs, ld_a);
@@ -5024,6 +5101,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             // Wait only for the DIRECT successor's previous chunk. That successor
             // may already have forwarded its older chunk to later GPUs.
             if (stage_cb && !stage_cb(p0 + T, err)) return false;
+            if (bat) seg_report(false);
             if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
             next_err_.clear();
             next_->hand_in_ = h;
@@ -5103,14 +5181,27 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             const auto toc2 = Clock::now();
             if (stage_cb && !stage_cb(p0 + T, err)) return false;
             if (chunk_cb && !chunk_cb(m.R, T, p0, err)) return false;
+            if (bat) seg_report(true);
             host_sync_ms += std::chrono::duration<double, std::milli>(toc2 - toc).count();
             host_chunk_ms += ms_since(toc2);
         }
     }
     // Do not drain the successor here. This is the overlap: an intermediate
     // stage can return while later GPUs are still processing the previous chunk.
-    ss.ple_prev[0] = prev[0];
-    ss.ple_prev[1] = prev[1];
+    if (bat) {
+        for (const RunSeg& sg : bsegs) {   // each segment's last two tokens (or what it had before them)
+            int32_t pv[2] = {sg.prev[0], sg.prev[1]};
+            for (int64_t t = std::max<int64_t>(sg.r0, sg.r0 + sg.n - 2); t < sg.r0 + sg.n; ++t) {
+                pv[0] = pv[1];
+                pv[1] = (int32_t) tokens[t];
+            }
+            sg.ss->ple_prev[0] = pv[0];
+            sg.ss->ple_prev[1] = pv[1];
+        }
+    } else {
+        ss.ple_prev[0] = prev[0];
+        ss.ple_prev[1] = prev[1];
+    }
     if (std::getenv("STRATA_DBG_NAN") != nullptr) {   // debug: the state the prompt leaves for the token path
         cudaStreamSynchronize(m.cs);
         auto bad = [&](const float* d, int64_t n) {
@@ -5220,7 +5311,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::fprintf(stderr, "strata prefill: GDN_HASH %s\n", line.c_str());
     }
     // the last stage has read a queued prompt's last chunk; every earlier stage synchronized before handing it on
-    if (job && next_ == nullptr && job_last) job->finish(true, std::string());
+    if (job && next_ == nullptr && job_last) {
+        for (const PromptJob::Seg& sg : job->segs)
+            if (sg.last) sg.job->finish(true, std::string());
+        job->finish(true, std::string());
+    }
     return true;
 }
 
@@ -5262,6 +5357,10 @@ bool Prefill::reserve_uploads(int64_t T) {
 }
 
 void Prefill::enqueue(std::shared_ptr<PromptJob> job, bool front) {
+    enqueue(std::vector<std::shared_ptr<PromptJob>>{std::move(job)}, front);
+}
+
+void Prefill::enqueue(std::vector<std::shared_ptr<PromptJob>> jobs, bool front) {
     if (!jobs_) {
         jobs_ = std::make_unique<JobQueue>();
         jobs_->th = std::thread([this] {
@@ -5273,12 +5372,17 @@ void Prefill::enqueue(std::shared_ptr<PromptJob> job, bool front) {
                     std::unique_lock<std::mutex> lk(jq.mu);
                     jq.cv.wait(lk, [&] { return jq.stop || !jq.q.empty(); });
                     if (jq.q.empty()) return;
-                    j = std::move(jq.q.front());
-                    jq.q.pop_front();
+                    j = take_batch(jq.q);
+                    if (!j) {
+                        j = std::move(jq.q.front());
+                        jq.q.pop_front();
+                    }
                     jq.busy = true;
                 }
                 std::string e;
-                if (!j->failed() && !run_impl(j->tokens.data(), (int64_t) j->tokens.size(), j->pos0, e, j, 0, true))
+                const int64_t off = j->segs.empty() ? j->taken : 0;   // (the rest of a prompt a batch sliced)
+                if (!j->failed() && !run_impl(j->tokens.data() + off, (int64_t) j->tokens.size() - off, j->pos0 + off, e,
+                                              j, 0, true))
                     j->finish(false, e.empty() ? std::string("prefill: the prompt read failed") : e);
                 (void) cudaGetLastError();
                 {
@@ -5291,10 +5395,122 @@ void Prefill::enqueue(std::shared_ptr<PromptJob> job, bool front) {
     }
     {
         std::lock_guard<std::mutex> lk(jobs_->mu);
-        if (front) jobs_->q.push_front(std::move(job));
-        else jobs_->q.push_back(std::move(job));
+        if (front) jobs_->q.insert(jobs_->q.begin(), jobs.begin(), jobs.end());
+        else jobs_->q.insert(jobs_->q.end(), jobs.begin(), jobs.end());
     }
     jobs_->cv.notify_one();
+}
+
+int Prefill::batch_reads_max() {
+    static const int v = [] {
+        const char* on = std::getenv("STRATA_BATCH_READS");
+        if (on == nullptr || std::atoi(on) == 0) return 0;
+        const char* mx = std::getenv("STRATA_BATCH_READS_MAX");
+        return std::max(2, std::min(16, mx != nullptr ? std::atoi(mx) : 4));
+    }();
+    return v;
+}
+
+std::vector<int64_t> Prefill::batch_shares(const std::vector<int64_t>& left, int64_t budget) {
+    std::vector<int64_t> got(left.size(), 0);
+    for (;;) {   // an even share of what is left for the prompts that still want tokens; what one leaves goes round
+        int64_t want = 0;
+        for (size_t i = 0; i < left.size(); ++i) want += got[i] < left[i] ? 1 : 0;
+        if (want == 0 || budget <= 0) return got;
+        const int64_t share = budget / want;   // (a remainder below one token each is left: equal prompts, equal shares)
+        if (share == 0) return got;
+        for (size_t i = 0; i < left.size() && budget > 0; ++i) {
+            const int64_t g = std::min({share, left[i] - got[i], budget});
+            got[i] += g;
+            budget -= g;
+        }
+    }
+}
+
+int64_t Prefill::batch_budget() const {
+    int64_t budget = impl_ != nullptr ? impl_->T : 0;   // (every stage's buffers hold the chunk)
+    for (const Prefill* p = next_; p != nullptr; p = p->next_) budget = std::min(budget, p->impl_ ? p->impl_->T : 0);
+    return budget;
+}
+
+size_t Prefill::jobs_queued_for(const core::SessionState* s0) const {
+    if (!jobs_) return 0;
+    std::lock_guard<std::mutex> lk(jobs_->mu);
+    size_t c = 0;
+    for (const auto& j : jobs_->q) c += !j->sessions.empty() && j->sessions[0] == s0 ? 1 : 0;
+    return c;
+}
+
+Prefill::BatchPlan Prefill::plan_batch(const std::deque<std::shared_ptr<PromptJob>>& q, int max_segs, int64_t budget) {
+    BatchPlan p;
+    if (max_segs < 2 || q.size() < 2 || budget < 2 || !batchable(*q.front())) return p;
+    std::vector<const core::SessionState*> seen;   // a session's later pieces wait for its first one
+    for (size_t i = 0; i < q.size() && (int) p.at.size() < max_segs; ++i) {
+        const PromptJob& j = *q[i];
+        const core::SessionState* s0 = j.sessions.empty() ? nullptr : j.sessions[0];
+        if (s0 != nullptr && std::find(seen.begin(), seen.end(), s0) != seen.end()) continue;
+        if (s0 != nullptr) seen.push_back(s0);
+        if (batchable(j)) p.at.push_back(i);
+    }
+    if (p.at.size() < 2) {
+        p.at.clear();
+        return p;
+    }
+    std::vector<int64_t> left;
+    for (size_t i : p.at) left.push_back((int64_t) q[i]->tokens.size() - q[i]->taken);
+    p.got = batch_shares(left, budget);
+    return p;
+}
+
+// (queue lock held) STRATA_BATCH_READS: the first queued prompt of up to batch_reads_max() sessions, in queue order, as
+// one chunk of at most the buffers' tokens; null when fewer than two can go (the front one is read the usual way)
+std::shared_ptr<PromptJob> Prefill::take_batch(std::deque<std::shared_ptr<PromptJob>>& q) {
+    const BatchPlan pl = plan_batch(q, batch_reads_max(), batch_budget());
+    if (pl.at.empty()) return nullptr;
+    auto b = std::make_shared<PromptJob>();
+    std::vector<size_t> gone;
+    for (size_t k = 0; k < pl.at.size(); ++k) {
+        if (pl.got[k] <= 0) continue;
+        const std::shared_ptr<PromptJob>& j = q[pl.at[k]];
+        PromptJob::Seg sg;
+        sg.job = j;
+        sg.off = j->taken;
+        sg.n = pl.got[k];
+        sg.last = j->taken + sg.n == (int64_t) j->tokens.size();
+        b->tokens.insert(b->tokens.end(), j->tokens.begin() + sg.off, j->tokens.begin() + sg.off + sg.n);
+        j->taken += sg.n;
+        if (sg.last) gone.push_back(pl.at[k]);
+        b->segs.push_back(std::move(sg));
+    }
+    if (b->segs.size() < 2) {   // (a budget below the prompts' count: undone, the front one goes alone)
+        for (auto& sg : b->segs) sg.job->taken -= sg.n;
+        return nullptr;
+    }
+    for (auto it = gone.rbegin(); it != gone.rend(); ++it) q.erase(q.begin() + (std::ptrdiff_t) *it);
+    std::string parts;
+    for (const auto& sg : b->segs) parts += (parts.empty() ? "" : "+") + std::to_string((long long) sg.n);
+    std::fprintf(stderr, "strata prefill: STRATA_BATCH_READS: one chunk of %zu prompts (%s tokens)\n", b->segs.size(),
+                 parts.c_str());
+    // a stage that fails the chunk fails every prompt in it; each prompt's own end is reported by the last stage
+    b->on_done = [segs = b->segs](bool ok, const std::string& e) {
+        if (ok) return;
+        for (const auto& sg : segs) sg.job->finish(false, e);
+    };
+    return b;
+}
+
+// a queued prompt that can share a chunk: its own sessions, text only, not cancelled; the K/V prefetch's single
+// staging pool is per chunk (off: STRATA_KV_PREFETCH)
+bool Prefill::batchable(const PromptJob& j) {
+    if (j.failed() || j.sessions.empty() || j.sessions[0] == nullptr || j.embd_rows != nullptr || !j.segs.empty())
+        return false;
+    if (j.should_stop && j.should_stop()) return false;
+    if ((int64_t) j.tokens.size() - j.taken <= 0) return false;
+    static const bool kv_prefetch = [] {
+        const char* e = std::getenv("STRATA_KV_PREFETCH");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return !kv_prefetch;
 }
 
 std::vector<std::shared_ptr<PromptJob>> Prefill::withdraw(const std::function<bool(const PromptJob&)>& pred) {
@@ -5302,7 +5518,7 @@ std::vector<std::shared_ptr<PromptJob>> Prefill::withdraw(const std::function<bo
     if (!jobs_) return out;
     std::lock_guard<std::mutex> lk(jobs_->mu);
     for (auto it = jobs_->q.begin(); it != jobs_->q.end();) {
-        if (pred(**it)) {
+        if ((*it)->taken == 0 && pred(**it)) {   // (one a batch sliced has started)
             out.push_back(std::move(*it));
             it = jobs_->q.erase(it);
         } else {
