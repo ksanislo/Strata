@@ -1,6 +1,7 @@
 // src/core/pinned.cu - P2.S1: the pinned host arena and the parallel expert load.
 #include "strata/core/pinned.hpp"
 #include "strata/platform/memory.hpp"
+#include "strata/platform/numa.hpp"
 #include "strata/core/pin_budget.hpp"
 
 #include <cuda_runtime.h>
@@ -341,6 +342,27 @@ uint64_t fnv1a64(const uint8_t* p, uint64_t n, uint64_t seed) {
 
 namespace {
 bool clear_error() { (void) cudaGetLastError(); return true; }
+
+std::vector<strata::platform::NumaSpan> g_numa_plan;
+// STRATA_NUMA_PLACE: before the registration faults the pages in, bind the planned spans to their nodes
+void apply_numa_plan(void* base, uint64_t bytes, PageBacking backing, std::string& note) {
+    std::vector<strata::platform::NumaSpan> plan;
+    plan.swap(g_numa_plan);
+    if (base == nullptr || plan.empty()) return;
+    const bool strict = strata::platform::numa_place_mode() == 2;
+    std::string bound, err;
+    for (const auto& sp : plan) {
+        if (sp.off >= bytes) continue;
+        uint64_t n = std::min<uint64_t>(sp.len, bytes - sp.off);
+        if (backing == PageBacking::LargePages && sp.off + n == bytes) n = (n + (2ull << 20) - 1) & ~((2ull << 20) - 1);   // a hugetlb VMA splits at 2 MiB only
+        if (!strata::platform::numa_bind((uint8_t*) base + sp.off, n, sp.node, strict, &err)) {
+            note = "NUMA placement refused (" + err + "); " + note;
+            return;
+        }
+        bound += (bound.empty() ? "" : ", ") + std::to_string(n >> 20) + " MiB node " + std::to_string(sp.node);
+    }
+    note = "NUMA " + std::string(strict ? "bound" : "preferred") + ": " + bound + "; " + note;
+}
 }  // namespace
 
 bool arena_no_register() {
@@ -401,6 +423,8 @@ std::vector<uint64_t> uniform_bounds(uint64_t bytes, uint64_t slice) {
 }
 }  // namespace
 
+void pinned_arena_numa_plan(std::vector<strata::platform::NumaSpan> spans) { g_numa_plan = std::move(spans); }
+
 PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, uniform_bounds(bytes, slice)) {
     if (slice_bytes) slice_bytes = slice;   // sliced registration: record the uniform size
 }
@@ -414,6 +438,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
         mapping_base = base;
         mapping_bytes = bytes;
     }
+    if (shared_file.empty()) apply_numa_plan(base, bytes, backing, note);
 
     // Register with CUDA BEFORE any page is touched: cudaHostRegister pins what is resident now, and a region
     // that has already been faulted in page by page is far more expensive to register and may fail outright.
@@ -550,6 +575,7 @@ PinnedArena::PinnedArena(uint64_t bytes, ByNeed, const std::vector<std::pair<uin
         mapping_base = base;
         mapping_bytes = bytes;
     }
+    if (shared_file.empty()) apply_numa_plan(base, bytes, backing, note);
     if (base == nullptr) return;
     // Register BEFORE any page is touched (see the first constructor).  Same caps as there: the engine's
     // `max_pinned_bytes`, else STRATA_ARENA_PIN_GIB=N (> 0); "auto" (-2) is the sliced pin's and does not apply.
@@ -637,6 +663,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, De
         mapping_base = base;
         mapping_bytes = bytes;
     }
+    apply_numa_plan(base, bytes, backing, note);
     slice_bytes = 1;   // sliced: one registration per layer
 }
 
