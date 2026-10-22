@@ -266,9 +266,8 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, agg, 
     `</span></div><div class="state-card__row"><span class="muted">${detail}</span></div>` +
     `<div class="st-progress"><div class="st-progress__bar" style="width:${pct || 0}%"></div></div></div>`;
   const STATE = {decoding: "generating", reading: "reading", queued: "queued", waiting: "queued"};
-  let html = conv.map((c) => {
+  const one = (c, title) => {
     const s = STATE[c.state] || c.state;
-    const slot = c.slot == null ? "Request" : `Slot ${c.replica != null ? `${c.replica}:` : ""}${c.slot}`;
     let detail, pct = 0;
     if (s === "reading") {
       pct = c.prompt_read != null && c.prompt_tokens ? Math.min(100, (100 * c.prompt_read) / c.prompt_tokens) : 0;
@@ -278,18 +277,24 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, agg, 
       pct = c.max_tokens ? Math.min(100, (100 * (c.generated || 0)) / c.max_tokens) : 0;
       detail = `${fmt(c.generated)}${c.max_tokens ? ` / ${kfmt(c.max_tokens)}` : ""} tokens · ${fmt(c.tok_s, 1)} tok/s` +
                ` · context ${kfmt(c.context_tokens)}${c.ttft_s != null ? ` · TTFT ${fmt(c.ttft_s, 1)} s` : ""}`;
+    } else if (s === "idle") {
+      detail = c.held_tokens ? `Idle · holds a conversation of ${kfmt(c.held_tokens)} tokens` : "Idle";
     } else {
       detail = `Waiting${c.queued_s != null ? ` ${fmt(c.queued_s, 1)} s` : ""} · ${kfmt(c.prompt_tokens)} prompt tokens`;
     }
-    return block(slot, s, detail, pct);
-  }).join("");
-  if (!conv.length) {
-    const s = live.state === "generating" ? "generating" : live.state === "reading" ? "reading" : "idle";
-    const detail = s !== "idle" ? (s === "reading" ? "Reading prompt" : "Generating")
-                 : last ? `Waiting for a request · last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`
-                 : "Waiting for a request";
-    html = block("Model", s, detail, 0);
-  }
+    return block(title, s, detail, pct);
+  };
+  // every configured slot, in order and numbered from 1, so a conversation keeps its place; requests outside the
+  // slots (queued, or on the single-request path) follow
+  const bySlot = new Map(conv.filter((c) => c.slot != null).map((c) => [c.slot, c]));
+  const slots = (live.slots || []).slice().sort((x, y) => x.slot - y.slot);
+  let html = slots.map((x) => {
+    const c = bySlot.get(x.slot);
+    return one(c ? {...c, held_tokens: x.held_tokens} : {...x, context_tokens: (x.prompt_tokens || 0) + (x.generated || 0)},
+               `Slot ${x.slot + 1}`);
+  }).join("") + conv.filter((c) => c.slot == null || !slots.length).map((c) =>
+    one(c, c.slot == null ? (c.state === "queued" || c.state === "waiting" ? "Queued" : "Request") : `Slot ${c.slot + 1}`)).join("");
+  if (!slots.length && conv.length) html = conv.map((c) => one(c, c.slot == null ? "Request" : `Slot ${c.slot + 1}`)).join("");
   $("conv-states").innerHTML = html;
 
   // the eight cards; Decode and Prefill: every slot together (the engine's own counts over the last 10 s)
