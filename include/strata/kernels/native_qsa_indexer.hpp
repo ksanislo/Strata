@@ -41,13 +41,16 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
 void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_device,
                                int32_t pos_base, const float* gamma, float epsilon,
                                const QsaIndexerBuffers& buffers, const QsaShapes& shapes,
-                               int64_t max_cells, const RopeScaling& scaling, void* stream);
+                               int64_t max_cells, const RopeScaling& scaling, void* stream,
+                               const int32_t* thw = nullptr);
 
+// thw (device, 3 per step; null: the shared position table): a completed block's rotary (t, h, w), staged per row
 void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_pos_device,
                                      int pos_stride, int n_steps, int32_t pos_base,
                                      const float* gamma, float epsilon,
                                      const QsaIndexerBuffers& buffers, const QsaShapes& shapes,
-                                     int64_t max_cells, const RopeScaling& scaling, void* stream);
+                                     int64_t max_cells, const RopeScaling& scaling, void* stream,
+                                     const int32_t* thw = nullptr);
 
 // engine-latency: the commit's append of the same window rows into several QSA layers in one launch.  Layer i reads
 // raw0 + i * raw_stride and its own gamma/buffers; with tail_src[i] set its tail is first restored from there (the
