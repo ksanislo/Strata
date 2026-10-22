@@ -34,7 +34,19 @@ inline cudaError_t end_capture(cudaStream_t s, cudaGraph_t* graph) {
     return e;
 }
 
+// STRATA_FAST_LANE's save of an idle slot: on this thread, device_sync() waits only for the streams that can write
+// that slot (set by a scope around the save; null: the whole device, as always)
+inline cudaError_t (*&device_sync_override())(void*) {
+    thread_local cudaError_t (*f)(void*) = nullptr;
+    return f;
+}
+inline void*& device_sync_override_arg() {
+    thread_local void* a = nullptr;
+    return a;
+}
+
 inline cudaError_t device_sync() {
+    if (auto f = device_sync_override()) return f(device_sync_override_arg());
     std::unique_lock<std::shared_mutex> lock(capture_mutex());
     return cudaDeviceSynchronize();
 }
