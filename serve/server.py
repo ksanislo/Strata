@@ -1311,13 +1311,14 @@ class StrataEngine:
                 if sample is not None and self.proc is proc:
                     self.terminal_stage_sample = {**sample, "observed_monotonic": time.monotonic()}
                 continue
-            if line.startswith("KMEM "):               # KMEM <cards> (<device> <total> <free>)...: the slots' context memory
+            if line.startswith("KMEM "):               # KMEM <cards> (<device> <budget> <free> [<givable>])...: context memory
                 f = line.split()
                 try:
                     n = int(f[1])
-                    cards = [{"device": int(f[2 + 3 * i]), "total": int(f[3 + 3 * i]), "free": int(f[4 + 3 * i])}
-                             for i in range(n)]
-                except (IndexError, ValueError):
+                    w = (len(f) - 2) // n if n > 0 else 0   # 3 per card, or 4 with what the expert cache can still give
+                    cards = [{"device": int(f[2 + w * i]), "total": int(f[3 + w * i]), "free": int(f[4 + w * i]),
+                              "givable": int(f[5 + w * i]) if w >= 4 else 0} for i in range(n)] if w >= 3 else None
+                except (IndexError, ValueError, ZeroDivisionError):
                     cards = None
                 if cards and self.proc is proc:
                     self.info["slot_memory"] = cards
