@@ -264,7 +264,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, agg, 
     `<div class="conv-state"><div class="state-card__head"><span>${esc(title)}</span><span class="badges">` +
     BADGES.map(([k, cls, t]) => `<span class="st-badge ${cls}${k === s ? " on" : ""}">${t}</span>`).join("") +
     `</span></div><div class="state-card__row"><span class="muted">${detail}</span></div>` +
-    `<div class="st-progress"><div class="st-progress__bar" style="width:${pct || 0}%"></div></div></div>`;
+    `<div class="st-progress"${s === "reading" ? ' data-tone="info"' : ""}><div class="st-progress__bar" style="width:${pct || 0}%"></div></div></div>`;
   const STATE = {decoding: "generating", reading: "reading", queued: "queued", waiting: "queued"};
   const one = (c, title) => {
     const s = STATE[c.state] || c.state;
