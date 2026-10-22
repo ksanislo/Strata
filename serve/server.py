@@ -4951,7 +4951,10 @@ class Service:
             gen = int(st.get("generated") or (sl or {}).get("generated") or 0)
             read = None
             if state == "reading":
-                read = sl.get("prompt_read") if sl is not None else (progress[0] if progress else None)
+                read = sl.get("prompt_read") if sl is not None else None
+                # a read on the control lines reports PP per chunk; the slot's own record only catches up when quiet
+                if progress and abs(int(progress[1]) - prompt) <= 2:
+                    read = max(int(read or 0), int(progress[0]))
             queued_at = row.get("queued_at")
             conv.append({"id": rid, "slot": sl.get("slot") if sl else None,
                          "replica": sl.get("replica") if sl else row.get("replica"), "state": state,
