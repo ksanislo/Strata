@@ -96,6 +96,7 @@
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/program/batch_groups.hpp"
 #include "strata/program/fast_lane.hpp"
+#include "../core/conversation_copy.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/device.hpp"
@@ -9819,8 +9820,73 @@ int main(int argc, char** argv) {
             if (!sdir || !live_ok || live.empty() || spill_skip_rewind) return;
             spill_from(ParkFrom{live, live_imgs, checks, cvec_cached, -1});
         };
+        // STRATA_PARK_STAGING_MIB (default 2048, 0 = off; --batch): a slot's park copies through a pinned buffer at
+        // PCIe speed (pageable copies ran at ~1 GB/s: 0.5-1 s for a 30k conversation on the admission path), and a
+        // thread moves them into the parked image behind; the image is stored at the next line or park (park_finish)
+        strata::core::conversation_detail::StagedCopies park_stg;
+        if (o.batch > 0) {
+            const char* v = std::getenv("STRATA_PARK_STAGING_MIB");
+            const size_t mib = v != nullptr ? (size_t) std::max(0, std::atoi(v)) : 2048;
+            void* p = nullptr;
+            if (mib > 0 && cudaHostAlloc(&p, mib << 20, cudaHostAllocPortable) == cudaSuccess) {
+                park_stg.base = static_cast<uint8_t*>(p);
+                park_stg.cap = mib << 20;
+                std::fprintf(stderr, "strata serve: STRATA_PARK_STAGING_MIB: a slot's park copies through %zu MiB of "
+                                     "pinned RAM\n", mib);
+            } else if (mib > 0) {
+                (void) cudaGetLastError();
+                std::fprintf(stderr, "strata serve: STRATA_PARK_STAGING_MIB: no pinned buffer (%zu MiB): parks copy "
+                                     "as before\n", mib);
+            }
+        }
+        struct ParkJob {
+            strata::core::SavedConversation image;
+            size_t held = 0, n_ids = 0, reused = 0;
+            uint64_t floor = 0;
+            std::string who;
+            Clock::time_point t0;
+            std::thread th;
+            std::atomic<bool> done{false};
+            ~ParkJob() { if (th.joinable()) th.join(); }
+        };
+        std::unique_ptr<ParkJob> park_job;
+        // a captured image into the conversation cache (and the session dir behind it); false: not kept
+        auto park_store = [&](strata::core::SavedConversation&& image, size_t held, size_t n_ids, size_t reused_bytes,
+                              uint64_t floor, const std::string& who, Clock::time_point t0) -> bool {
+            const auto mem_after = strata::core::sample_host_memory();
+            if (!strata::core::conversation_memory_admit(
+                    mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt, 0, floor)) {
+                std::fprintf(stderr, "strata serve: conversation cache: skip parking (RAM floor after capture: %lld MiB needed, %s)\n",
+                             (long long) o.conversation_cache_min_free_mib, ram_note(mem_after).c_str());
+                return false;
+            }
+            const size_t snapshot_bytes = image.bytes();
+            const bool stored = conversations.put(std::move(image), held);
+            if (stored && sdir) sdir->write(conversations.newest());   // written behind, after its delay
+            if (stored) {   // the server's log: a conversation going out, to RAM
+                std::printf("INFO sess_event=parked sess_tokens=%zu sess_bytes=%zu sess_ms=%.0f sess_why=ram\n",
+                            n_ids, snapshot_bytes, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                std::fflush(stdout);
+            }
+            std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu%s\n",
+                         stored ? "parked" : "skipped", n_ids,
+                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                         conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes, reused_bytes,
+                         who.c_str());
+            return stored;
+        };
+        // a staged park whose copies have landed (or, `wait`, once they have) goes into the cache; the buffer is free
+        auto park_finish = [&](bool wait) {
+            if (!park_job || (!wait && !park_job->done.load(std::memory_order_acquire))) return;
+            park_job->th.join();
+            ParkJob& j = *park_job;
+            (void) park_store(std::move(j.image), j.held, j.n_ids, j.reused, j.floor, j.who, j.t0);
+            park_job.reset();
+            park_stg.reset();
+        };
         auto park_body = [&](const ParkFrom& f, size_t held) -> bool {
             if (f.ids.empty()) return true;
+            park_finish(true);   // (the cache as it is, and the staging buffer free)
             auto spill = [&]() { if (f.slot < 0) spill_current(); else spill_from(f); };
             // " (batch slot N)" after a slot's lines; the main sessions' lines as they were
             const std::string who = f.slot < 0 ? std::string() : " (batch slot " + std::to_string(f.slot) + ")";
@@ -9960,43 +10026,82 @@ int main(int argc, char** argv) {
                                  (long long) o.conversation_cache_min_free_mib);
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
-                if (!strata::core::conversation_snapshot_save(image, view, park_ss(f, 0), g, draft0, err,
-                        std::move(reuse), &reused_bytes)) return false;
-                for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
-                    auto& st = stages[k];
-                    const strata::core::OnDevice on(st->dev);
-                    if (strata::core::device_sync() != cudaSuccess) { err = "stage sync failed"; return false; }
-                    const strata::core::ConversationView view_k{f.ids, f.imgs, cs.parts[k], f.cvec};
-                    strata::core::SavedConversation part;
-                    if (!strata::core::conversation_snapshot_save(part, view_k, park_ss(f, k + 1), g, draft_of(k), err,
-                            std::move(stage_reuse[k]), &reused_bytes))
-                        return false;
-                    image.stage_images.push_back(std::move(part));
+                // STRATA_PARK_STAGING_MIB: a slot's copies into pageable RAM are queued into the pinned buffer
+                struct StageScope {
+                    bool on;
+                    StageScope(bool o_, strata::core::conversation_detail::StagedCopies* s) : on(o_) {
+                        if (on) strata::core::conversation_detail::staged_copies() = s;
+                    }
+                    ~StageScope() { if (on) strata::core::conversation_detail::staged_copies() = nullptr; }
+                };
+                const bool staged = f.slot >= 0 && park_stg.base != nullptr;
+                if (staged) park_stg.reset();   // (a park that failed part-way left its items)
+                {
+                    StageScope stage_scope(staged, &park_stg);
+                    if (!strata::core::conversation_snapshot_save(image, view, park_ss(f, 0), g, draft0, err,
+                            std::move(reuse), &reused_bytes)) return false;
+                    for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
+                        auto& st = stages[k];
+                        const strata::core::OnDevice on(st->dev);
+                        if (strata::core::device_sync() != cudaSuccess) { err = "stage sync failed"; return false; }
+                        const strata::core::ConversationView view_k{f.ids, f.imgs, cs.parts[k], f.cvec};
+                        strata::core::SavedConversation part;
+                        if (!strata::core::conversation_snapshot_save(part, view_k, park_ss(f, k + 1), g, draft_of(k), err,
+                                std::move(stage_reuse[k]), &reused_bytes))
+                            return false;
+                        image.stage_images.push_back(std::move(part));
+                    }
                 }
-                const auto mem_after = strata::core::sample_host_memory();
-                if (!strata::core::conversation_memory_admit(
-                        mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt, 0, floor)) {
-                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (RAM floor after capture: %lld MiB needed, %s)\n",
-                                 (long long) o.conversation_cache_min_free_mib, ram_note(mem_after).c_str());
-                    image = {};   // the copy goes before the direct write
-                    spill();
+                if (staged && !park_stg.items.empty()) {
+                    // the queued copies have read the slot before anything may write it; the bytes go into the
+                    // image on a thread, and the image into the cache at park_finish
+                    for (const int d : park_stg.devices) {
+                        const strata::core::OnDevice on(d);
+                        cudaStream_t s = nullptr;
+                        if (strata::core::conversation_detail::private_stream(s) != cudaSuccess ||
+                            cudaStreamSynchronize(s) != cudaSuccess) {
+                            err = "the park's staged copies failed";
+                            park_stg.reset();
+                            return false;
+                        }
+                    }
+                    static const bool stg_check = [] {   // tests: the staged bytes against a plain copy of the same sources
+                        const char* v = std::getenv("STRATA_PARK_STAGING_CHECK");
+                        return v != nullptr && v[0] == '1';
+                    }();
+                    if (stg_check) {
+                        size_t bad = 0;
+                        std::vector<uint8_t> tmp;
+                        for (const auto& it : park_stg.items) {
+                            tmp.resize(it.n);
+                            if (strata::core::conversation_detail::copy_nonblocking(tmp.data(), it.src, it.n) != cudaSuccess ||
+                                std::memcmp(tmp.data(), park_stg.base + it.off, it.n) != 0) ++bad;
+                        }
+                        std::fprintf(stderr, "strata serve: STRATA_PARK_STAGING_CHECK: %zu copies, %zu MiB: %s%s\n",
+                                     park_stg.items.size(), park_stg.used >> 20,
+                                     bad ? (std::to_string(bad) + " differ").c_str() : "identical", who.c_str());
+                    }
+                    auto j = std::make_unique<ParkJob>();
+                    j->image = std::move(image);
+                    j->held = held;
+                    j->n_ids = f.ids.size();
+                    j->reused = reused_bytes;
+                    j->floor = floor;
+                    j->who = who;
+                    j->t0 = t0;
+                    ParkJob* jp = j.get();
+                    j->th = std::thread([jp, &park_stg] {
+                        park_stg.land();
+                        jp->done.store(true, std::memory_order_release);
+                    });
+                    park_job = std::move(j);
+                    std::fprintf(stderr, "strata serve: conversation cache: %zu tokens copied off the cards in %.1f ms "
+                                         "(%zu MiB staged); stored behind%s\n", f.ids.size(),
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                                 park_stg.used >> 20, who.c_str());
                     return true;
                 }
-                const size_t snapshot_bytes = image.bytes();
-                const bool stored = conversations.put(std::move(image), held);
-                if (stored && sdir) sdir->write(conversations.newest());   // written behind, after its delay
-                if (stored) {   // the server's log: a conversation going out, to RAM
-                    std::printf("INFO sess_event=parked sess_tokens=%zu sess_bytes=%zu sess_ms=%.0f sess_why=ram\n",
-                                f.ids.size(), snapshot_bytes,
-                                std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
-                    std::fflush(stdout);
-                }
-                if (!stored) spill();
-                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu%s\n",
-                             stored ? "parked" : "skipped", f.ids.size(),
-                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
-                             conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes, reused_bytes,
-                             who.c_str());
+                if (!park_store(std::move(image), held, f.ids.size(), reused_bytes, floor, who, t0)) spill();
             } catch (const std::bad_alloc&) {
                 // The active state has not been touched. Continue with normal
                 // prompt processing rather than killing a serving process.
@@ -11388,12 +11493,18 @@ int main(int argc, char** argv) {
             st->eof = true;
             st->cv.notify_one();
         }).detach();
+        // STRATA_PARK_STAGING_MIB: a staged park goes into the cache before a line that may look it up (not for
+        // BSTOP / BYIELD, which only take it if it has landed)
+        auto park_gate = [&](const std::string& l) { park_finish(l.rfind("BSTOP ", 0) != 0 && l.rfind("BYIELD", 0) != 0); };
         auto next_line = [&](std::string& out) -> bool {
-            std::unique_lock<std::mutex> lk(in_mu);
-            in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
-            if (in_lines.empty()) return false;
-            out = std::move(in_lines.front());
-            in_lines.pop_front();
+            {
+                std::unique_lock<std::mutex> lk(in_mu);
+                in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
+                if (in_lines.empty()) return false;
+                out = std::move(in_lines.front());
+                in_lines.pop_front();
+            }
+            park_gate(out);
             return true;
         };
         sp.should_stop = [&] { return stop_req.load(); };
@@ -11864,10 +11975,13 @@ int main(int argc, char** argv) {
         long long admit_max_new = 0;
         auto batch_on = [&] { for (const BSlot& b : bs) if (b.active) return true; return false; };
         auto try_next_line = [&](std::string& out) -> bool {
-            std::lock_guard<std::mutex> lk(in_mu);
-            if (in_lines.empty()) return false;
-            out = std::move(in_lines.front());
-            in_lines.pop_front();
+            {
+                std::lock_guard<std::mutex> lk(in_mu);
+                if (in_lines.empty()) return false;
+                out = std::move(in_lines.front());
+                in_lines.pop_front();
+            }
+            park_gate(out);
             return true;
         };
         // the session a request just left behind (its prompt) -> slot b's sessions, on every stage
@@ -11932,27 +12046,6 @@ int main(int argc, char** argv) {
                 r += x;
             }
             return r;
-        };
-        // per card, the slot budget and its free part on stdout whenever they change (the server's context memory):
-        // KMEM <cards> then <device> <total bytes> <free bytes> per card
-        std::vector<uint64_t> kmem_last;
-        auto kmem_note = [&]() {
-            if (!eslots_on) return;
-            std::vector<uint64_t> v;
-            for (size_t k = 0; k < bslot_ss.size(); ++k) {
-                uint64_t t = 0, f = 0;
-                strata::core::qsa_slot_budget(eslot_dev(k), t, f);
-                v.push_back(t);
-                v.push_back(f);
-            }
-            if (v == kmem_last) return;
-            kmem_last = v;
-            std::string ln = "KMEM " + std::to_string(bslot_ss.size());   // one write: other threads print lines too
-            for (size_t k = 0; k < bslot_ss.size(); ++k)
-                ln += " " + std::to_string(eslot_dev(k)) + " " + std::to_string(v[2 * k]) + " " + std::to_string(v[2 * k + 1]);
-            ln += "\n";
-            std::fwrite(ln.data(), 1, ln.size(), stdout);
-            std::fflush(stdout);
         };
         // ---- STRATA_ELASTIC_SLOTS_GIVE: per card, the expert cache gives the slot budget whole chunks from the slots
         // just below its prompt loan when the slots need them, and takes them back when the slots let them go (kvg_ensure
@@ -12021,6 +12114,31 @@ int main(int argc, char** argv) {
                              (double) (bt + got) / 1048576.0, (double) full / 1048576.0);
             }
         const bool eidle_on = eslots_on && give_on && elastic_idle_env();
+        // per card, the slot budget, its free part and what the expert cache can still give it (STRATA_ELASTIC_SLOTS_GIVE,
+        // down to give_floor) on stdout whenever they change (the server's context memory):
+        // KMEM <cards> then <device> <budget bytes> <free bytes> <givable bytes> per card
+        std::vector<uint64_t> kmem_last;
+        auto kmem_note = [&]() {
+            if (!eslots_on) return;
+            std::vector<uint64_t> v;
+            for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                uint64_t t = 0, f = 0;
+                strata::core::qsa_slot_budget(eslot_dev(k), t, f);
+                v.push_back(t);
+                v.push_back(f);
+                v.push_back(give_on && k < gv.size() && gv[k].lo > give_floor
+                                ? (uint64_t) (gv[k].cache->bytes_of(gv[k].lo) - gv[k].cache->bytes_of(give_floor)) : 0);
+            }
+            if (v == kmem_last) return;
+            kmem_last = v;
+            std::string ln = "KMEM " + std::to_string(bslot_ss.size());   // one write: other threads print lines too
+            for (size_t k = 0; k < bslot_ss.size(); ++k)
+                ln += " " + std::to_string(eslot_dev(k)) + " " + std::to_string(v[3 * k]) + " " + std::to_string(v[3 * k + 1]) +
+                      " " + std::to_string(v[3 * k + 2]);
+            ln += "\n";
+            std::fwrite(ln.data(), 1, ln.size(), stdout);
+            std::fflush(stdout);
+        };
         // the free budget chunks card k keeps beyond its decoding slots' next step: what was made at load, or the spare
         auto budget_keep = [&](size_t k, int64_t made) -> int64_t {
             if (!eidle_on) return made;
@@ -13362,6 +13480,7 @@ int main(int argc, char** argv) {
                         elastic_idle((size_t) k, !in_prompt_read, -1);
                     }
             if (piped_mtp && !pm_collect()) return false;
+            park_finish(false);   // (STRATA_PARK_STAGING_MIB: a staged park that has landed)
             // start waiting groups on free stages, the longest waiting first; a new step on stage 0 round-robin
             for (int k = n_pipe - 1; k >= 0; --k) {
                 if (stage_group[(size_t) k] >= 0) continue;
@@ -15460,8 +15579,10 @@ int main(int argc, char** argv) {
                     other = cy_on && cy_yield_line();
                     seen = in_lines.size();
                 }
-                for (const std::string& l : fresh)
+                for (const std::string& l : fresh) {
+                    park_gate(l);
                     if (!fl_take(l) && !take(l)) return false;
+                }
                 // yield at the next piece boundary: nothing more fed, the pieces stage 0 has not started taken back
                 // (they never ran), the ones in flight finish; a run that went on from held reads feeds one piece first
                 if (other && !yielding && !live.empty() && (resumed == 0 || cy_fed > 0)) {
@@ -15946,6 +16067,7 @@ int main(int argc, char** argv) {
                     if (!eidle_tick()) return 1;
                 }
                 if (!got) break;
+                park_gate(line);
                 adm_direct = adm_take(line);
             } else if (!next_line(line)) {
                 break;
@@ -20029,6 +20151,7 @@ int main(int argc, char** argv) {
                 helper_bytes_before = bytes;
             }
         }
+        park_finish(true);   // (STRATA_PARK_STAGING_MIB: a staged park still landing)
         if (sdir) {   // --session-dir: the active conversation too, then everything queued, before the engine ends
             sdir->begin_exit();
             park_current(0);
