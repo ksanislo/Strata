@@ -14637,6 +14637,23 @@ int main(int argc, char** argv) {
             const char* v = std::getenv("STRATA_SLOT_ADMIT_MULTI");
             return v != nullptr && std::atoi(v) != 0;
         }();
+        // STRATA_BATCH_READS=1 (with STRATA_SLOT_ADMIT_MULTI): pending reads share prompt chunks, up to
+        // STRATA_BATCH_READS_MAX (4) of them, each an even share of a chunk (Prefill::take_batch); 0: off.
+        // STRATA_BATCH_READS_CHUNK=N: the reads' loan sized for N-token shared chunks (default: the piece's)
+        static const int br_max = [] {
+            const int m = strata::prefill::Prefill::batch_reads_max();
+            if (m > 0 && !adm_multi) {
+                std::fprintf(stderr, "strata batch: STRATA_BATCH_READS needs STRATA_SLOT_ADMIT_MULTI=1: off\n");
+                return 0;
+            }
+            if (m > 0) std::fprintf(stderr, "strata batch: STRATA_BATCH_READS: up to %d reads beside the slots share a "
+                                            "prompt chunk\n", m);
+            return m;
+        }();
+        static const int64_t br_chunk = [] {
+            const char* v = std::getenv("STRATA_BATCH_READS_CHUNK");
+            return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0;
+        }();
         auto adm_multi_run = [&](const std::string& first, int& n_adm) -> bool {
             read_share_set(false);
             struct Block {
@@ -14687,14 +14704,16 @@ int main(int argc, char** argv) {
             } drain{sp};
             // the loan: lent once for every piece of this run (a relayout waits for no queued read), refilled at the end
             const int64_t piece = std::max<int64_t>(1, adm_loan(o.prefill_chunk));
-            if (!pf_parts.empty() && !adm_lend_covers(piece)) {
+            // STRATA_BATCH_READS_CHUNK=N: a loan of N tokens' chunk for the shared chunks (a read's piece stays `piece`)
+            const int64_t br_lend = br_max > 0 && br_chunk > piece ? std::min(br_chunk, o.prefill_chunk) : 0;
+            if (!pf_parts.empty() && !adm_lend_covers(br_lend > 0 ? br_lend : piece)) {
                 const auto tf = Clock::now();
                 std::string e;
                 if (!pipe_drain()) return false;
                 if (!adapt_tick(true)) { std::printf("ERR an adaptive refill failed\n"); return false; }
                 // (STRATA_READ_YIELD: the whole chunk's loan, so a request served while reads are held needs no other;
                 // STRATA_SLOT_ADMIT_CHUNK caps it: the slots decoding beside the read keep the rest of the cache)
-                if (!lend(piece, e, cy_on && adm_chunk_cap == 0 ? o.prefill_chunk : 0)) { std::printf("ERR lending the prompt path its slots failed: %s\n", e.c_str()); return false; }
+                if (!lend(br_lend > 0 ? br_lend : piece, e, br_lend > 0 ? br_lend : cy_on && adm_chunk_cap == 0 ? o.prefill_chunk : 0)) { std::printf("ERR lending the prompt path its slots failed: %s\n", e.c_str()); return false; }
                 adm_fence_ms += std::chrono::duration<double, std::milli>(Clock::now() - tf).count();
                 if (cy_on && cy_held_n > 0)
                     std::fprintf(stderr, "strata batch: STRATA_READ_YIELD: the loan was lent again under held reads\n");
@@ -14938,8 +14957,44 @@ int main(int argc, char** argv) {
             auto cy_done = [](const AdmJob& j) {
                 return !j.setup_ok || j.at >= j.n - 1 || j.stop.load() || j.failed.load();
             };
+            // STRATA_BATCH_READS: a piece for every read with none waiting at stage 0 (up to the batch's size), the one
+            // starved longest first, then the least left; the prompt path reads them in shared chunks
+            auto br_feed = [&] {
+                if (br_max <= 0) return;
+                std::vector<std::shared_ptr<strata::prefill::PromptJob>> batch;
+                std::vector<int> fed;
+                while (!yielding) {
+                    const auto now = Clock::now();
+                    int waiting = (int) fed.size();
+                    AdmJob* best = nullptr;
+                    AdmJob* starved = nullptr;
+                    for (auto& jj : live) {
+                        AdmJob& j = *jj;
+                        if (!j.queued || cy_done(j) || std::find(fed.begin(), fed.end(), j.r.slot) != fed.end()) continue;
+                        if (sp.jobs_queued_for(bslot_ss[0][(size_t) j.r.slot].get()) > 0) { ++waiting; continue; }
+                        if (cy_starve_s > 0.0 && std::chrono::duration<double>(now - j.t_fed).count() >= cy_starve_s &&
+                            (starved == nullptr || j.t_fed < starved->t_fed))
+                            starved = &j;
+                        if (best == nullptr || j.n - j.at < best->n - best->at) best = &j;
+                    }
+                    AdmJob* j = starved != nullptr ? starved : best;
+                    if (j == nullptr || waiting >= br_max) break;
+                    const int64_t a = j->at;
+                    int64_t z = std::min(j->n - 1, a + P);
+                    const bool ck = j->turn_at > a;
+                    if (ck && z > j->turn_at) z = j->turn_at;
+                    j->inflight.fetch_add(1);
+                    batch.push_back(make_piece(*j, a, z, ck));
+                    fed.push_back(j->r.slot);
+                    j->at = z;
+                    j->t_fed = now;
+                    ++cy_fed;
+                }
+                if (!batch.empty()) sp.enqueue(std::move(batch));   // (together: the worker can read them in one chunk)
+            };
             // the next piece: of the read with the least left, unless one has waited STRATA_READ_YIELD_STARVE_S for one
             auto cy_feed = [&] {
+                br_feed();
                 while (!yielding && sp.jobs_pending() < cy_ahead) {
                     const auto now = Clock::now();
                     AdmJob* best = nullptr;
@@ -17706,7 +17761,11 @@ int main(int argc, char** argv) {
                 std::fill(done_ms.begin(), done_ms.end(), -1.0);
                 for (int b = 0; b < N; ++b) if (!zero_slot(b)) { err = "PFMULTI: zeroing a slot failed"; return false; }
                 const auto t_multi = Clock::now();
-                for (int b = 0; b < N; ++b) sp.enqueue(make_job(b, t_multi));
+                {
+                    std::vector<std::shared_ptr<strata::prefill::PromptJob>> all;
+                    for (int b = 0; b < N; ++b) all.push_back(make_job(b, t_multi));
+                    sp.enqueue(std::move(all));
+                }
                 sp.drain_jobs();
                 const double multi_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_multi).count();
                 for (int b = 0; b < N; ++b) if (!hash_slot(b, h_multi[(size_t) b], err)) return false;
@@ -17720,6 +17779,63 @@ int main(int argc, char** argv) {
                                      "queued together %.0f ms (done at %s); %d of %d slots hold the same state%s%s\n",
                              N, (long long) len, seq_ms, list(seq_done).c_str(), multi_ms, list(done_ms).c_str(), same, N,
                              failed.empty() ? "" : "; FAILED:", failed.c_str());
+                // STRATA_BATCH_READS: the queued prompts went in shared chunks.  Each slot read alone in the pieces the
+                // batch gave it (one after the other, drained) must hold the batched slot's bits: the shared work is
+                // row-independent and each segment's sequence work is its own.  The batched slots must also match each other.
+                if (strata::prefill::Prefill::batch_reads_max() > 0 && N >= 2) {
+                    std::vector<int64_t> cuts{0};
+                    const int64_t budget = sp.batch_budget();
+                    for (int64_t at = 0; at < len && budget > 0;) {
+                        const int nb = std::min(N, strata::prefill::Prefill::batch_reads_max());
+                        const int64_t g = strata::prefill::Prefill::batch_shares(std::vector<int64_t>((size_t) nb, len - at), budget)[0];
+                        at += std::max<int64_t>(1, g);
+                        cuts.push_back(std::min(at, len));
+                    }
+                    int peers = 0;
+                    for (int b = 0; b < N; ++b) peers += h_multi[(size_t) b] == h_multi[0];
+                    std::vector<uint64_t> h_sl((size_t) N);
+                    errs.assign((size_t) N, std::string());
+                    for (int b = 0; b < N; ++b) if (!zero_slot(b)) { err = "PFMULTI: zeroing a slot failed"; return false; }
+                    const auto t_sl = Clock::now();
+                    for (int b = 0; b < N; ++b) {
+                        for (size_t i = 0; i + 1 < cuts.size(); ++i) {
+                            auto j = make_job(b, t_sl);
+                            j->tokens.assign(toks->begin() + cuts[i], toks->begin() + cuts[i + 1]);
+                            j->pos0 = cuts[i];
+                            j->whole = true;
+                            sp.enqueue(j);
+                            sp.drain_jobs();
+                        }
+                    }
+                    const double sl_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_sl).count();
+                    int same_sl = 0;
+                    for (int b = 0; b < N; ++b) {
+                        if (!hash_slot(b, h_sl[(size_t) b], err)) return false;
+                        same_sl += h_sl[(size_t) b] == h_multi[(size_t) b];
+                        if (!errs[(size_t) b].empty()) failed += " slot " + std::to_string(b) + " (pieces): " + errs[(size_t) b];
+                    }
+                    // slot 0's prompt batched beside OTHER prompts (the same length, the tokens reversed): its bits must
+                    // not depend on what its companions hold (their rows only share the token-independent work)
+                    for (int b = 0; b < N; ++b) if (!zero_slot(b)) { err = "PFMULTI: zeroing a slot failed"; return false; }
+                    {
+                        std::vector<std::shared_ptr<strata::prefill::PromptJob>> all;
+                        for (int b = 0; b < N; ++b) {
+                            auto j = make_job(b, Clock::now());
+                            if (b > 0) std::reverse(j->tokens.begin(), j->tokens.end());
+                            all.push_back(j);
+                        }
+                        sp.enqueue(std::move(all));
+                    }
+                    sp.drain_jobs();
+                    uint64_t h_mix = 0;
+                    if (!hash_slot(0, h_mix, err)) return false;
+                    std::fprintf(stderr, "strata serve: PFMULTI STRATA_BATCH_READS: %zu pieces a prompt (chunk %lld); batched "
+                                         "slots identical to each other %d of %d; slot 0 beside other prompts %s; to the "
+                                         "same pieces read alone %d of %d (alone %.0f ms); to one by one %s%s%s\n",
+                                 cuts.size() - 1, (long long) budget, peers, N, h_mix == h_multi[0] ? "identical" : "DIFFERENT",
+                                 same_sl, N, sl_ms, h_multi[0] == h_seq[0] ? "identical" : "different",
+                                 failed.empty() ? "" : "; FAILED:", failed.c_str());
+                }
                 for (int b = 0; b < N; ++b) (void) zero_slot(b);
                 return true;
             };

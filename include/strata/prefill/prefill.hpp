@@ -16,6 +16,7 @@
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
 
+#include <deque>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -62,6 +63,17 @@ struct PromptJob {
     const float* const* embd_rows = nullptr;
     /// Once: from the last stage's thread when it has read the last chunk, or from the stage that failed.
     std::function<void(bool ok, const std::string& err)> on_done;
+
+    /// STRATA_BATCH_READS: a batched chunk carries pieces of several queued prompts (each of its own sessions); this
+    /// job's tokens are theirs in order, and `segs` says whose.  Only the queue's worker builds one.
+    struct Seg {
+        std::shared_ptr<PromptJob> job;
+        int64_t off = 0, n = 0;   ///< tokens [off, off + n) of job->tokens
+        bool last = false;        ///< the job's last tokens: it finishes with this chunk
+    };
+    std::vector<Seg> segs;
+    int64_t taken = 0;   ///< tokens the worker gave stage 0 so far (a prompt a batch sliced stays queued for the rest)
+    bool whole = false;  ///< read in one chunk (at most the buffers' tokens), as a batch reads its segments
 
     bool failed() const { return failed_.load(); }
     bool done() const { return done_.load(); }
@@ -211,12 +223,33 @@ public:
     /// Not beside `run` (drain_jobs first).
     /// `front`: before the prompts not started yet (a shorter one first; the one being read goes on).
     void enqueue(std::shared_ptr<PromptJob> job, bool front = false);
+    /// Several at once, in order (the worker sees them together: STRATA_BATCH_READS can read them in one chunk).
+    void enqueue(std::vector<std::shared_ptr<PromptJob>> jobs, bool front = false);
     /// The queued prompts stage 0 has not started that `pred` picks, taken out of the queue (their on_done never runs).
+    /// One a batched chunk read part of (STRATA_BATCH_READS) has started: it stays.
     std::vector<std::shared_ptr<PromptJob>> withdraw(const std::function<bool(const PromptJob&)>& pred);
     /// Waits until every queued prompt has gone through every stage (each one's on_done has run).
     void drain_jobs();
     /// Prompts queued or being read on the first stage.
     size_t jobs_pending() const;
+    /// Prompts queued (not being read) whose first stage's session is `s0`.
+    size_t jobs_queued_for(const core::SessionState* s0) const;
+    /// STRATA_BATCH_READS=1: the worker reads up to STRATA_BATCH_READS_MAX (4) queued prompts of different sessions
+    /// in one chunk; 0 when off.  Each gets an even share of the chunk (what one leaves goes to the others).
+    static int batch_reads_max();
+    /// The batch of a chunk: tokens per prompt for budget `budget` and what each has left (water-filling, in order).
+    static std::vector<int64_t> batch_shares(const std::vector<int64_t>& left, int64_t budget);
+    /// The tokens a batched chunk holds: the smallest chunk any stage's buffers hold.
+    int64_t batch_budget() const;
+    /// Which queued prompts a batched chunk takes (their indices in `q`, in order) and how many tokens each (`got`);
+    /// empty when fewer than two can go.  The first queued prompt of each session (a later piece waits for it).
+    struct BatchPlan {
+        std::vector<size_t> at;
+        std::vector<int64_t> got;
+    };
+    static BatchPlan plan_batch(const std::deque<std::shared_ptr<PromptJob>>& q, int max_segs, int64_t budget);
+    /// A queued prompt that can share a chunk: its own sessions, no picture rows, not failed or stopped, tokens left.
+    static bool batchable(const PromptJob& j);
 
     /// multi-GPU: the experts the peer GPU holds are computed THERE for every prompt chunk (up to `cap_rows` routed
     /// rows per layer; the rest of the peer's experts are read by this GPU over P2P).  Allocates the peer's buffers for
@@ -318,6 +351,7 @@ private:
                   const std::shared_ptr<PromptJob>& job = nullptr, size_t depth = 0, bool job_last = false);
     struct JobQueue;
     std::unique_ptr<JobQueue> jobs_;
+    std::shared_ptr<PromptJob> take_batch(std::deque<std::shared_ptr<PromptJob>>& q);
     bool drain_pipeline(std::string& err);
 
     int64_t stage_lb_ = 0, stage_le_ = -1;
