@@ -208,6 +208,81 @@ int sweep(bool exact, cudaStream_t s, Totals& t) {
     return bad;
 }
 
+// STRATA_SM75_Q8G: the Turing Q8_0 row kernel against the default multi-column kernel, the same T-column call on the
+// same bytes, at the engine's shapes (plus a partial row group and a row shorter than one pass), every rows-a-warp choice
+struct Q8gShape { int n_in, n_out; };
+const Q8gShape Q8G_SHAPES[] = {
+    {2560, 10240}, {2560, 6144}, {6144, 2560}, {2560, 12288}, {320, 10240}, {640, 2560},
+    {2560, 512}, {10240, 320}, {2560, 640}, {2560, 2051}, {96, 2050},
+};
+
+int q8g_sweep(cudaStream_t s) {
+    namespace K = strata::kernels;
+    std::printf("\n=== STRATA_SM75_Q8G kernel vs the default Q8_0 kernel ===\n");
+    std::printf("%-14s %3s %4s %10s %10s %10s\n", "n_in x n_out", "T", "rows", "outputs", "bits diff", "nonfinite");
+    int bad = 0, ran = 0;
+    for (const Q8gShape& sh : Q8G_SHAPES) {
+        const int nb = sh.n_in / 32, Tmax = 8;
+        const std::size_t wbytes = (std::size_t) nb * sh.n_out * 34;
+        std::mt19937 rng(77u + (unsigned) sh.n_in * 3u + (unsigned) sh.n_out);
+        std::vector<uint8_t> w(wbytes);
+        for (auto& b : w) b = (uint8_t) (rng() & 0xff);
+        for (std::size_t k = 0; k < (std::size_t) nb * sh.n_out; ++k) {
+            const uint16_t h = sane_half(rng);
+            std::memcpy(&w[k * 34], &h, 2);
+        }
+        std::vector<float> x((std::size_t) Tmax * sh.n_in);
+        std::normal_distribution<float> nd(0.f, 1.f);
+        for (auto& v : x) v = nd(rng);
+        void *dw = nullptr, *xq = nullptr;
+        float *dx = nullptr, *ya = nullptr, *yb = nullptr;
+        const std::size_t ybytes = (std::size_t) Tmax * sh.n_out * 4;
+        if (!ck(cudaMalloc(&dw, wbytes), "malloc w") || !ck(cudaMalloc(&xq, K::native_q8_1_bytes(sh.n_in, Tmax)), "malloc xq") ||
+            !ck(cudaMalloc(&dx, x.size() * 4), "malloc x") || !ck(cudaMalloc(&ya, ybytes), "malloc ya") ||
+            !ck(cudaMalloc(&yb, ybytes), "malloc yb"))
+            return 1;
+        ck(cudaMemcpy(dw, w.data(), wbytes, cudaMemcpyHostToDevice), "copy w");
+        ck(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "copy x");
+        K::quantize_q8_1_rows(dx, Tmax, sh.n_in, xq, s);
+        for (int T = 2; T <= Tmax; ++T)
+            for (int rows : {1, 2, 4}) {
+                K::native_q8_0_turing_tune(0, 0, -1);
+                cudaMemset(ya, 0xff, ybytes);
+                cudaMemset(yb, 0xff, ybytes);
+                K::native_mmvq(8, dw, xq, ya, sh.n_in, sh.n_out, T, s);
+                K::native_q8_0_turing_tune(1, rows, 0);
+                const bool takes = K::native_q8_0_turing_takes(sh.n_in, sh.n_out, T);
+                K::native_mmvq(8, dw, xq, yb, sh.n_in, sh.n_out, T, s);
+                K::native_q8_0_turing_tune(-1, 0, -1);
+                if (!ck(cudaStreamSynchronize(s), "q8g mmvq")) return 1;
+                if (!takes) {
+                    if (rows == 1) std::printf("%5d x %-6d %3d    -  (shared memory: the default kernel)\n", sh.n_in, sh.n_out, T);
+                    continue;
+                }
+                ++ran;
+                std::vector<uint32_t> a((std::size_t) T * sh.n_out), b(a.size());
+                ck(cudaMemcpy(a.data(), ya, a.size() * 4, cudaMemcpyDeviceToHost), "read a");
+                ck(cudaMemcpy(b.data(), yb, b.size() * 4, cudaMemcpyDeviceToHost), "read b");
+                long long diff = 0, nf = 0;
+                for (std::size_t i = 0; i < a.size(); ++i) {
+                    float fa, fb;
+                    std::memcpy(&fa, &a[i], 4);
+                    std::memcpy(&fb, &b[i], 4);
+                    if (!std::isfinite(fa) || !std::isfinite(fb)) ++nf;
+                    if (a[i] != b[i]) ++diff;
+                }
+                const bool ok = diff == 0 && nf == 0;
+                std::printf("%5d x %-6d %3d %4d %10zu %10lld %10lld  %s\n", sh.n_in, sh.n_out, T, rows, a.size(), diff, nf,
+                            ok ? "ok" : "FAIL");
+                if (!ok) ++bad;
+            }
+        cudaFree(dw); cudaFree(xq); cudaFree(dx); cudaFree(ya); cudaFree(yb);
+    }
+    if (ran == 0) { std::printf("STRATA_SM75_Q8G: the kernel never ran\n"); ++bad; }
+    std::printf("STRATA_SM75_Q8G: %d calls compared, %d differ or are non-finite\n", ran, bad);
+    return bad;
+}
+
 }  // namespace
 
 int main() {
@@ -218,6 +293,7 @@ int main() {
     const int bad = sweep(true, s, on);
     const int bad_off = sweep(false, s, off);
     strata::kernels::native_mmvq_set_multi_exact(true);   // back to the default
+    const int bad_q8g = q8g_sweep(s);
 
     std::printf("\nmulti_exact on:   %lld outputs compared, %lld differ bitwise, %lld non-finite\n",
                 on.checked, on.diff, on.nonfinite);
@@ -227,6 +303,11 @@ int main() {
     if (on.nonfinite != 0 || off.nonfinite != 0) {
         std::printf("\nmmvq_multi_parity: FAILED. %lld non-finite outputs from finite scales and activations: the "
                     "bit comparison is only meaningful on finite outputs.\n", on.nonfinite + off.nonfinite);
+        return 1;
+    }
+    if (bad_q8g != 0) {
+        std::printf("\nmmvq_multi_parity: FAILED. The STRATA_SM75_Q8G kernel differs from the default Q8_0 kernel in %d "
+                    "call(s), or never ran.\n", bad_q8g);
         return 1;
     }
     if (bad != 0 || bad_off != 0) {
