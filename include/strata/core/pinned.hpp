@@ -86,11 +86,21 @@ struct PinnedArena {
     /// Registers the deferred slices in order, publishing how many are done in `ready`, and INT_MAX once it
     /// returns (a slice CUDA refuses ends the registration, and the rest is kept resident by the working-set lock).
     void register_slices(std::atomic<int>& ready);
+    /// STRATA_PARALLEL_LOAD (Linux): reserve only; the caller fills the arena (its threads fault the pages in, on
+    /// their own nodes), then register_filled() registers it as the first constructor would (the same cap, the same
+    /// sliced and locked fallbacks).  cudaHostRegister holds the driver while it faults pages in on one thread.
+    struct FillFirst {};
+    PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, FillFirst, uint64_t max_pinned_bytes = 0);
+    void register_filled();
     std::vector<uint64_t> bounds_;
     std::vector<uint64_t> slice_starts;
     void* mapping_base = nullptr;     ///< actual mapping start; differs from base when a shared-file header exists
     uint64_t mapping_bytes = 0;       ///< bytes to release from mapping_base
     ~PinnedArena();
+private:
+    void register_now(const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes);
+    uint64_t fill_first_cap_ = 0;
+public:
     PinnedArena(const PinnedArena&) = delete;
     PinnedArena& operator=(const PinnedArena&) = delete;
 
