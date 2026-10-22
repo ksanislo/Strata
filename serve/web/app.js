@@ -269,10 +269,12 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, agg, 
   const BADGES = [["idle", "", "Idle"], ["reading", "st-badge--reading", "Reading"],
                   ["generating", "st-badge--generating", "Generating"], ["queued", "st-badge--queued", "Queued"],
                   ["error", "st-badge--error", "Error"]];
-  const block = (title, s, detail, pct) =>
+  const block = (title, s, detail, pct, ctxTok) =>
     `<div class="conv-state"><div class="state-card__head"><span>${esc(title)}</span><span class="badges">` +
     BADGES.map(([k, cls, t]) => `<span class="st-badge ${cls}${k === s ? " on" : ""}">${t}</span>`).join("") +
-    `</span></div><div class="state-card__row"><span class="muted">${detail}</span></div>` +
+    `</span></div><div class="state-card__row"><span class="muted">${detail}</span>` +
+    (ctxTok && eng.max_context ? `<span class="muted">context ${kfmt(ctxTok)} / ${ctxfmt(eng.max_context)} · ` +
+                                 `${Math.round((100 * ctxTok) / eng.max_context)}%</span>` : "") + `</div>` +
     `<div class="st-progress"${s === "reading" ? ' data-tone="info"' : ""}><div class="st-progress__bar" style="width:${pct || 0}%"></div></div></div>`;
   const STATE = {decoding: "generating", reading: "reading", queued: "queued", waiting: "queued"};
   const one = (c, title) => {
@@ -285,13 +287,15 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, agg, 
     } else if (s === "generating") {
       pct = c.max_tokens ? Math.min(100, (100 * (c.generated || 0)) / c.max_tokens) : 0;
       detail = `${fmt(c.generated)}${c.max_tokens ? ` / ${kfmt(c.max_tokens)}` : ""} tokens · ${fmt(c.tok_s, 1)} tok/s` +
-               ` · context ${kfmt(c.context_tokens)}${c.ttft_s != null ? ` · TTFT ${fmt(c.ttft_s, 1)} s` : ""}`;
+               `${c.ttft_s != null ? ` · TTFT ${fmt(c.ttft_s, 1)} s` : ""}`;
     } else if (s === "idle") {
-      detail = c.held_tokens ? `Idle · holds a conversation of ${kfmt(c.held_tokens)} tokens` : "Idle";
+      detail = c.held_tokens ? "Idle · keeps its conversation" : "Idle";
     } else {
       detail = `Waiting${c.queued_s != null ? ` ${fmt(c.queued_s, 1)} s` : ""} · ${kfmt(c.prompt_tokens)} prompt tokens`;
     }
-    return block(title, s, detail, pct);
+    // the conversation's own context: what it reads up to, what it holds while generating, or what an idle slot keeps
+    const ctxTok = s === "reading" || s === "queued" ? c.prompt_tokens : s === "generating" ? c.context_tokens : c.held_tokens;
+    return block(title, s, detail, pct, ctxTok);
   };
   // every configured slot, in order and numbered from 1, so a conversation keeps its place. A request the engine
   // runs on its single-conversation path (everything else idle) has no slot number: it shows in the first idle slot,
@@ -363,16 +367,29 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, agg, 
   }
   spark("sp-disk", h.disk_read_mb);
 
-  // context fill: the running request, else the last one
-  const ctx = eng.max_context || 0;
-  let used = 0;
-  if (live.state !== "idle") used = (live.prompt_tokens || 0) + (live.generated || 0);
-  else if (last) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
-  const frac = ctx ? Math.min(1, used / ctx) : 0;
+  // context memory: what every slot's conversation takes of the cards' slot budget (the engine's KMEM lines); without
+  // that (an engine that does not report it), the running request's context as before
+  const sm = eng.slot_memory;
+  let frac = 0, sub = "–";
+  if (sm && sm.length) {
+    const total = sm.reduce((t, c) => t + c.total, 0), used = sm.reduce((t, c) => t + c.total - c.free, 0);
+    frac = total ? Math.min(1, used / total) : 0;
+    const hot = sm.reduce((a, c) => (c.total && (c.total - c.free) / c.total > (a.total ? (a.total - a.free) / a.total : -1) ? c : a), sm[0]);
+    sub = `${gb(used)} / ${gb(total)} GB` + (sm.length > 1 && hot.total ? ` · GPU ${hot.device} ${Math.round((100 * (hot.total - hot.free)) / hot.total)}%` : "");
+    $("ctx-title").textContent = "Context memory";
+  } else {
+    const ctx = eng.max_context || 0;
+    let used = 0;
+    if (live.state !== "idle") used = (live.prompt_tokens || 0) + (live.generated || 0);
+    else if (last) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
+    frac = ctx ? Math.min(1, used / ctx) : 0;
+    sub = ctx ? `${kfmt(used)} / ${ctxfmt(ctx)}` : "–";
+    $("ctx-title").textContent = "Context fill";
+  }
   $("ctx-fill").setAttribute("stroke-dasharray", `${(235.6 * frac).toFixed(1)} 314.2`);
   $("ctx-fill").style.opacity = 235.6 * frac >= 3 ? "1" : "0";         // a near-zero arc would draw just its round cap
   $("ctx-pct").textContent = `${Math.round(frac * 100)}%`;
-  $("ctx-sub").textContent = ctx ? `${kfmt(used)} / ${ctxfmt(ctx)}` : "–";
+  $("ctx-sub").textContent = sub;
   const cacheBytes = (eng.expert_cache_mib || 0) * 1048576;
   $("slots-text").textContent = eng.expert_slots ? `${fmt(eng.expert_slots)} · ${gb(cacheBytes)} GB` : "–";
   $("slots-bar").style.width = hw.gpu_mem_total ? `${Math.min(100, (100 * cacheBytes) / hw.gpu_mem_total)}%` : "0%";
