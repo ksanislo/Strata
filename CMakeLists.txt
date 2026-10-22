@@ -341,7 +341,7 @@ target_link_libraries(strata-plan PRIVATE strata_plan)
 # ---- strata_core (GPU runtime) ---------------------------------------------
 # Only built when a GPU backend is on, so the Phase 1 targets keep working without a toolkit.
 if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
-  add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp src/core/weights.cpp
+  add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/platform/numa.cpp src/platform/numa_cpus.cpp src/core/graph.cpp src/core/weights.cpp
                                src/core/layout.cpp)
   target_include_directories(strata_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   # the DFlash2 drafter (src/core/dflash2.cpp, src/kernels/cuda/dflash2.cu) exists in the CUDA and HIP builds; the Metal and SYCL builds compile without it
@@ -774,6 +774,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # C++ runtime sit beside the exe (tools/hip/package_windows.py) and stay normal imports.
     target_link_libraries(strata PRIVATE delayimp)
     target_link_options(strata PRIVATE "LINKER:/DELAYLOAD:hipblas.dll" "LINKER:/DELAYLOAD:libhipblaslt.dll" "LINKER:/DELAYLOAD:rocblas.dll")
+  endif()
+  if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
+    # STRATA_PARALLEL_LOAD's GGUF reader against the reference one (CPU only: synthetic shards, no device call)
+    add_executable(parallel_load_test src/core/parallel_load_test.cpp)
+    target_include_directories(parallel_load_test PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(parallel_load_test PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
   endif()
 
   # NEW-MODELS-PLAN.md T1: Qwen3.6-35B-A3B's reference path (one GPU, the model resident, plain kernels), checked
@@ -1563,6 +1569,14 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME spec_start_test COMMAND spec_start_test)
 endif()
 if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
+  # STRATA_NUMA_PLACE's helpers (CPU only): the layer -> node map, the spans, a bound mapping read back
+  add_executable(platform_numa_test src/platform/numa_test.cpp src/platform/numa.cpp)
+  target_include_directories(platform_numa_test PRIVATE include)
+  add_test(NAME platform_numa_test COMMAND platform_numa_test)
+  # STRATA_PARALLEL_LOAD: a node's CPUs from sysfs, a thread pinned to them (CPU only)
+  add_executable(numa_cpus_test src/platform/numa_cpus_test.cpp src/platform/numa_cpus.cpp)
+  target_include_directories(numa_cpus_test PRIVATE include)
+  add_test(NAME numa_cpus_test COMMAND numa_cpus_test)
   add_executable(message_boundary_test src/program/message_boundary_test.cpp)
   target_include_directories(message_boundary_test PRIVATE include)
   add_test(NAME message_boundary_test COMMAND message_boundary_test)
