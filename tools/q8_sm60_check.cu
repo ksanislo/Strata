@@ -66,7 +66,8 @@ static bool parity(int n_in, int n_out, int ncols) {
 
 int main() {
     cudaDeviceProp p; CK(cudaGetDeviceProperties(&p, 0));
-    printf("%s, %d SMs, %d MHz\n", p.name, p.multiProcessorCount, p.clockRate / 1000);
+    int khz = 0; CK(cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, 0));   // CUDA 13 dropped cudaDeviceProp::clockRate
+    printf("%s, %d SMs, %d MHz\n", p.name, p.multiProcessorCount, khz / 1000);
     struct S { const char* name; int n_in, n_out; } shapes[] = {
         {"gdn attn_qkv", 2560, 10240}, {"gdn attn_gate", 2560, 6144}, {"ssm_out / attn_output", 6144, 2560},
         {"qsa attn_q", 2560, 12288}, {"qsa attn_k / v", 2560, 512}, {"shexp gate / up", 2560, 640},
