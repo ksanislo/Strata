@@ -716,7 +716,7 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_cols_pipe_fast_kernel(float* 
 // order: the same bits (src/prefill/gdn_rec_parity.cu checks them and times the variants: 1.41x on a 4080 Super).
 // sm_80+ cards that hold its 64 blocks at once (gdn_keyhead_ok); STRATA_GDN_KEYHEAD=0: gdn_rec_cols_pipe_kernel.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
-#define STRATA_GDN_CP_ASYNC 0   // Turing builds: plain copies (never launched there, see gdn_keyhead_ok)
+#define STRATA_GDN_CP_ASYNC 0   // Turing builds: plain copies (launched there only with STRATA_GDN_KEYHEAD=1)
 #else
 #define STRATA_GDN_CP_ASYNC 1
 #endif
@@ -845,21 +845,26 @@ __global__ void __launch_bounds__(CB * RG) gdn_rec_kh_kernel(float* __restrict__
 // 64 SMs and more, 1.02-1.04x / 1.03-1.06x at 48 to 63 (two blocks against four: a draw, slower on neither),
 // 1.28-1.31x / 1.28-1.30x at 39 to 47, 1.53-1.57x / 1.54-1.55x at 32 to 38.  Per call, from the current device (a
 // layer split can mix cards).
+// STRATA_GDN_KEYHEAD=1 also takes it on sm_75 (plain copies instead of cp.async; same bits, A/B until measured).
 bool gdn_keyhead_ok() {
-    static const bool off = [] { const char* v = std::getenv("STRATA_GDN_KEYHEAD"); return v != nullptr && std::atoi(v) == 0; }();
-    if (off) return false;
+    static const int env = [] { const char* v = std::getenv("STRATA_GDN_KEYHEAD"); return v != nullptr ? std::atoi(v) : -1; }();
+    if (env == 0) return false;
+    const int min_major = env == 1 ? 7 : 8;
     static int known[64] = {};   // per device: 0 not asked yet, 1 yes, 2 no
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
     if (known[dev] == 0) {
         int major = 0, sms = 0, per_sm = 0;
         const bool yes = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
-                         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && major >= 8 &&
+                         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && major >= min_major &&
                          cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gdn_rec_kh_kernel, CB * RG, 0) ==
                              cudaSuccess &&
                          (int64_t) per_sm * sms >= (int64_t) HK * NCB;
         if (!yes) cudaGetLastError();
         known[dev] = yes ? 1 : 2;
+        if (env == 1 && major < 8)   // the opt-in's verdict per card, for the A/B's log
+            std::fprintf(stderr, "strata: CUDA%d GDN prompt recurrence per key head (STRATA_GDN_KEYHEAD=1): %s "
+                                 "(%d blocks/SM x %d SMs)\n", dev, yes ? "on" : "off", per_sm, sms);
     }
     return known[dev] == 1;
 }
