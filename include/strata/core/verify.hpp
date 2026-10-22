@@ -604,6 +604,7 @@ private:
     VerifyHits hits_;
     const NativeHead* head_ = nullptr;
     int max_t_ = 0;
+    int64_t cb_ = 0;                       ///< a slot's batch commit record (init_slots)
     float* ple_key_ = nullptr;   ///< STRATA_PLE_BATCH: the window rows' PLE key / value projections
     float* ple_val_ = nullptr;
     int last_t_ = 0;
