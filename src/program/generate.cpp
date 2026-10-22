@@ -14735,23 +14735,45 @@ int main(int argc, char** argv) {
             // STRATA_BATCH_READS_DECODE_WINDOWS: the queue's gate (set once, while the queue is idle) and what it reads;
             // off again before the drain above (destroyed first), so a drain never waits on a gate
             if (br_dec_windows > 0 && !sp.between_chunks)
-                sp.between_chunks = [](double chunk_ms) {
-                    if (!br_gate_live.load(std::memory_order_acquire) || br_groups.load() == 0) return;
-                    const auto t0 = Clock::now();
-                    const int64_t w0 = br_wins.load();
-                    const double min_ms = br_dec_share / (1.0 - br_dec_share) * chunk_ms;
-                    for (;;) {
-                        const double el = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-                        const int groups = br_groups.load();
-                        if (!br_gate_live.load(std::memory_order_acquire) || groups == 0 || el >= br_dec_max_ms ||
-                            (br_wins.load() - w0 >= (int64_t) br_dec_windows * groups && el >= min_ms)) {
-                            br_holds.fetch_add(1);
-                            br_hold_ms.store(br_hold_ms.load() + el);
+                for (int k = 0; k < n_pipe; ++k) {   // every stage, at its own chunk boundary, for the windows on its card
+                    strata::core::Verifier* vk = &stage_verifier(k);
+                    stage_prefill((size_t) k).between_chunks = [vk, k](double chunk_ms) {
+                        const bool live_now = br_gate_live.load(std::memory_order_acquire);
+                        const int g0 = br_groups.load();
+                        if (!live_now || g0 == 0) {
+                            // (a window ran on this card lately, yet no hold: say why, at most every 30 s)
+                            static std::atomic<int64_t> said{0};
+                            const int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                Clock::now().time_since_epoch()).count();
+                            if ((vk->batch_busy() || Clock::now() - vk->batch_last_activity() < std::chrono::seconds(1)) &&
+                                now_s - said.load() >= 30) {
+                                said.store(now_s);
+                                std::fprintf(stderr, "strata batch: STRATA_BATCH_READS_DECODE_WINDOWS: stage %d did not hold "
+                                                     "beside a window (%s)\n", k + 1,
+                                             !live_now ? "no read run under way" : "no decoding group seen");
+                            }
                             return;
                         }
-                        std::this_thread::sleep_for(std::chrono::microseconds(500));
-                    }
-                };
+                        const auto t0 = Clock::now();
+                        const int64_t l0 = vk->batch_launches();
+                        const double min_ms = br_dec_share / (1.0 - br_dec_share) * chunk_ms;
+                        double el = 0.0;
+                        int groups = g0;
+                        for (;;) {
+                            el = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                            groups = br_groups.load();
+                            if (!br_gate_live.load(std::memory_order_acquire) || groups == 0 || el >= br_dec_max_ms ||
+                                (vk->batch_launches() - l0 >= (int64_t) br_dec_windows * groups && el >= min_ms))
+                                break;
+                            std::this_thread::sleep_for(std::chrono::microseconds(500));
+                        }
+                        br_holds.fetch_add(1);
+                        std::fprintf(stderr, "strata batch: STRATA_BATCH_READS_DECODE_WINDOWS: stage %d held a chunk %.0f ms "
+                                             "(%d decoding groups, %lld windows launched on its card, last chunk %.0f ms%s)\n",
+                                     k + 1, el, g0, (long long) (vk->batch_launches() - l0), chunk_ms,
+                                     el >= br_dec_max_ms ? ", capped" : "");
+                    };
+                }
             // the gate's view of the slots and the short reads not fed yet, from this (the pumping) thread
             auto br_tick = [&] {
                 if (br_max <= 0) return;
@@ -14787,8 +14809,8 @@ int main(int argc, char** argv) {
                 ~HoldNote() {
                     const int64_t h = br_holds.load() - h0;
                     if (h > 0)
-                        std::fprintf(stderr, "strata batch: STRATA_BATCH_READS_DECODE_WINDOWS: %lld chunks held for the "
-                                             "decoding slots, %.1f s in all\n", (long long) h, (br_hold_ms.load() - m0) / 1000.0);
+                        std::fprintf(stderr, "strata batch: STRATA_BATCH_READS_DECODE_WINDOWS: %lld chunk holds over the "
+                                             "stages in this run\n", (long long) h);
                 }
             } hold_note{holds0, hold_ms0};
             // the loan: lent once for every piece of this run (a relayout waits for no queued read), refilled at the end

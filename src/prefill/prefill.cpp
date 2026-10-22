@@ -2716,6 +2716,8 @@ struct PeTimer {
 };
 }  // namespace
 
+bool urgent_chunk(const PromptJob& j);   // (below: STRATA_BATCH_READS_FAST)
+
 bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err,
                        const std::shared_ptr<PromptJob>& job, size_t depth, bool job_last) {
     err.clear();
@@ -5156,7 +5158,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             const bool last_here = job_last && c0 + T >= n;
             auto step = [this, tokens, c0, T, p0, job, depth, last_here]() -> bool {
                 if (job && job->failed()) return true;
+                // STRATA_BATCH_READS_DECODE_WINDOWS: the next stage's gap for the windows on its card, before this chunk
+                // (on the hand-off's thread: nothing of the prompt path held; a chunk with an urgent read goes on)
+                if (job && next_->between_chunks && next_->last_chunk_ms_ >= 0.0 && !urgent_chunk(*job))
+                    next_->between_chunks(next_->last_chunk_ms_);
+                const auto t_next = Clock::now();
                 bool r = next_->run_impl(tokens + c0, T, p0, next_err_, job, depth + 1, last_here);
+                next_->last_chunk_ms_ = ms_since(t_next);
                 if (!r && job) {
                     job->finish(false, next_err_);
                     next_err_.clear();
@@ -5487,6 +5495,14 @@ std::vector<int64_t> Prefill::batch_shares(const std::vector<int64_t>& left, int
             budget -= g;
         }
     }
+}
+
+// a queued prompt or batch that holds an urgent (STRATA_BATCH_READS_FAST) read
+bool urgent_chunk(const PromptJob& j) {
+    if (j.urgent) return true;
+    for (const PromptJob::Seg& sg : j.segs)
+        if (sg.job->urgent) return true;
+    return false;
 }
 
 int64_t Prefill::batch_budget() const {
