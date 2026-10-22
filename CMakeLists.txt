@@ -746,6 +746,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(parallel_load_test src/core/parallel_load_test.cpp)
     target_include_directories(parallel_load_test PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(parallel_load_test PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+    # STRATA_BATCH_READS: which queued prompts share a chunk and their shares (CPU only)
+    add_executable(batch_reads_test tests/prefill/batch_reads_test.cpp)
+    target_include_directories(batch_reads_test PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(batch_reads_test PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+    add_test(NAME batch_reads_test COMMAND batch_reads_test)
+    set_tests_properties(batch_reads_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=")
   endif()
 
   # NEW-MODELS-PLAN.md T1: Qwen3.6-35B-A3B's reference path (one GPU, the model resident, plain kernels), checked
