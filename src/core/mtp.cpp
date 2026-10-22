@@ -147,9 +147,9 @@ MtpDrafter::~MtpDrafter() {
     if (cring_) cudaFree(cring_);
     if (dinv_) cudaFree(dinv_);
     if (cscratch_) cudaFree(cscratch_);
-    if (h_cparams_) cudaFreeHost(h_cparams_);
-    if (h_chist_) cudaFreeHost(h_chist_);
-    if (h_q_) cudaFreeHost(h_q_);
+    if (h_cparams_) strata::core::host_free_guarded(h_cparams_);
+    if (h_chist_) strata::core::host_free_guarded(h_chist_);
+    if (h_q_) strata::core::host_free_guarded(h_q_);
     if (cs_) cudaStreamDestroy(cs_);
     if (side_) cudaStreamDestroy(side_);
     if (sh_fork_) cudaEventDestroy(sh_fork_);
@@ -164,7 +164,7 @@ MtpDrafter::~MtpDrafter() {
     if (ev_chain_) cudaEventDestroy(ev_chain_);
     for (cudaEvent_t e : ev_step_) if (e) cudaEventDestroy(e);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, h_force_};
-    for (void* h : hosts) if (h) cudaFreeHost(h);
+    for (void* h : hosts) if (h) strata::core::host_free_guarded(h);
 }
 
 const float* MtpDrafter::f32(const char* name) const {
