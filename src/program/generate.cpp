@@ -79,6 +79,7 @@
 #include "strata/prefill/share_rules.hpp"
 #include "strata/platform/host_limits.hpp"
 #include "strata/program/split_ring.hpp"
+#include "strata/program/short_reads.hpp"
 #include "strata/program/prefill_plan.hpp"
 #include "strata/program/draft_kv_plan.hpp"
 #include "strata/program/message_boundary.hpp"
@@ -8409,7 +8410,22 @@ int main(int argc, char** argv) {
                                  "nothing to take, so it is not armed by default (STRATA_PREFILL_CPU_SHARE=auto forces it)\n",
                          (long long) xcache.slots(), (long long) (g.n_layers * g.n_expert));
         if (share_pool && stages.empty() && !multi_gpu && share_has_work && !share_default_ok()) share_has_work = false;   // H11
-        strata::prefill::Prefill::arm_cpu_share(share_pool, share_pool && stages.empty() && !multi_gpu && share_has_work);
+        // STRATA_SHORT_READS: a layer split's stages take the idle pool too, for staged chunks up to 3072 tokens
+        namespace short_reads = strata::program::short_reads;
+        const bool short_reads_on = short_reads::env_on(std::getenv("STRATA_SHORT_READS"));
+        bool split_share = false;
+        if (short_reads_on && multi_gpu) {
+            int64_t held = xcache.slots();
+            for (auto& st : stages) held += st->cache.slots();
+            split_share = short_reads::split_share_default(
+                              true, true, share_pool, std::getenv("STRATA_PREFILL_CPU_SHARE") != nullptr,
+                              strata::prefill::share_rules::default_share_has_work(held, g.n_layers * g.n_expert), true) &&
+                          share_default_ok();
+            if (split_share)
+                strata::prefill::Prefill::set_share_default_max(short_reads::share_max(std::getenv("STRATA_PREFILL_CPU_SHARE_MAX")));
+        }
+        strata::prefill::Prefill::arm_cpu_share(share_pool,
+                                                (share_pool && stages.empty() && !multi_gpu && share_has_work) || split_share);
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
         int32_t lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
@@ -9658,6 +9674,7 @@ int main(int argc, char** argv) {
         struct ReqTimes {
             int ckpts = 0;
             double sync_ms = 0.0, save_ms = 0.0, evict_ms = 0.0, read_ms = 0.0, windows_ms = 0.0;
+            double before_ms = 0.0, lend_ms = 0.0, refill_ms = 0.0;   // STRATA_TRACE's request line
         } req_times;
         auto gpu_sync_ok = [&]() -> bool {
             const cudaError_t e = cudaDeviceSynchronize();
@@ -10135,6 +10152,44 @@ int main(int argc, char** argv) {
             }
             return r;
         };
+        // STRATA_SHORT_READS: the prompt path's lent slots copied back on a stream per participant while the reply
+        // decodes (refill_lazy in the request); an expert is resident again only once its participant's copies landed
+        struct LazyRefill {
+            size_t part = 0;
+            std::vector<std::pair<int32_t, int32_t>> lent;
+        };
+        std::vector<LazyRefill> lazy_fly;
+        std::vector<cudaStream_t> lazy_stream;
+        std::vector<cudaEvent_t> lazy_ev;
+        int64_t lazy_windows = 0;   // the windows that ran before the last copies landed (the trace)
+        double lazy_wait_ms = 0.0;  // ...and the time a wait for them took
+        auto lazy_land = [&](bool wait, std::string& e) -> bool {
+            if (lazy_fly.empty()) return true;
+            const auto tw = Clock::now();
+            bool landed = false;
+            for (auto it = lazy_fly.begin(); it != lazy_fly.end();) {
+                const cudaError_t q = wait ? cudaEventSynchronize(lazy_ev[it->part]) : cudaEventQuery(lazy_ev[it->part]);
+                if (q == cudaErrorNotReady) { ++it; continue; }
+                if (q != cudaSuccess) {
+                    e = std::string("the lazy refill failed: ") + cudaGetErrorString(q);
+                    return false;
+                }
+                for (const auto& [i, slot] : it->lent) {
+                    host_res[(size_t) i] = slot;
+#if defined(_WIN32)
+                    srcp->release(i / g.n_expert, i % g.n_expert);
+#endif
+                }
+                landed = true;
+                it = lazy_fly.erase(it);
+            }
+            if (wait) lazy_wait_ms += std::chrono::duration<double, std::milli>(Clock::now() - tw).count();
+            if (landed && res_upload() != cudaSuccess) {
+                e = "the lazy refill: uploading the residency table failed";
+                return false;
+            }
+            return true;
+        };
         auto apply_pending = [&](bool wait) {
             if (peer.valid()) peer.apply_pending(wait);
             if (pending.empty()) return;
@@ -10270,6 +10325,7 @@ int main(int argc, char** argv) {
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
+            if (!lazy_fly.empty()) return true;  // lent slots still landing: their experts are not candidates
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
             struct Swap { float gain; int32_t layer, in, out; };
             std::vector<Swap> swaps;
@@ -12646,10 +12702,75 @@ int main(int argc, char** argv) {
                     if (!p.lent.empty() && !refill_one(p, e)) return false;
             }
             if (n_parts > 0) res_upload();
+            req_times.refill_ms += std::chrono::duration<double, std::milli>(Clock::now() - t_rf).count();
             if (trace && n_parts > 0) {
                 std::fprintf(stderr, "strata trace: refilled %lld slots on %lld stage(s) in %.1f ms\n",
                              (long long) n_lent, (long long) n_parts,
                              std::chrono::duration<double, std::milli>(Clock::now() - t_rf).count());
+                std::fflush(stderr);
+            }
+            return true;
+        };
+        // STRATA_SHORT_READS: the copies back queued on a stream per participant, not waited for (lazy_land)
+        const char* lazy_why = nullptr;
+        if (short_reads_on) {
+            short_reads::LazySetup ls;
+            ls.batch = o.batch > 0;
+            ls.pipe = pipe;
+            ls.kv_grow = kvg.on || o.vram_elastic;
+            ls.peer = peer.valid();
+            ls.helpers = remote_caches || (bool) remote_opt;
+            ls.head_alias = o.prefill_head_alias;
+            ls.adapt_async = (bool) ajob;
+            ls.evict_sync = drive.d.evict_sync;
+            ls.ram_adapt = std::getenv("STRATA_RAM_ADAPT") != nullptr && std::atoi(std::getenv("STRATA_RAM_ADAPT")) > 0;
+            ls.foresight = (bool) fs_swap;
+            lazy_why = short_reads::lazy_off(ls);
+        }
+        const bool lazy_ok = short_reads_on && lazy_why == nullptr;
+        auto refill_lazy = [&](std::string& e) -> bool {
+            if (!lazy_ok) return refill(e);
+            const auto t_rf = Clock::now();
+            if (lazy_stream.size() < pf_parts.size()) {
+                lazy_stream.resize(pf_parts.size(), nullptr);
+                lazy_ev.resize(pf_parts.size(), nullptr);
+            }
+            int64_t n_lent = 0;
+            for (size_t k = 0; k < pf_parts.size(); ++k) {
+                PfPart& p = pf_parts[k];
+                if (p.lent.empty()) continue;
+                const strata::core::OnDevice on(p.dev);
+                if (lazy_stream[k] == nullptr &&
+                    (cudaStreamCreateWithFlags(&lazy_stream[k], cudaStreamNonBlocking) != cudaSuccess ||
+                     cudaEventCreateWithFlags(&lazy_ev[k], cudaEventDisableTiming) != cudaSuccess)) {
+                    e = "the lazy refill: no stream";
+                    return false;
+                }
+                for (const auto& [i, slot] : p.lent) {
+                    strata::core::BlobPart parts[3];
+                    const int np = refill_parts ? srcp->blob_parts(i / g.n_expert, i % g.n_expert, parts) : 0;
+                    if (np > 0) {
+                        if (!p.cache->fill_slot_on_parts(slot, parts, np, e, lazy_stream[k])) return false;
+                        continue;
+                    }
+                    const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
+                    const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                    if (b == nullptr || !p.cache->fill_slot_on(slot, b, e, nb, lazy_stream[k])) return false;
+                    srcp->note_async_read(b, lazy_stream[k]);   // #1237
+                }
+                if (cudaEventRecord(lazy_ev[k], lazy_stream[k]) != cudaSuccess) {
+                    e = "the lazy refill: event";
+                    return false;
+                }
+                n_lent += (int64_t) p.lent.size();
+                lazy_fly.push_back({k, std::move(p.lent)});
+                p.lent.clear();
+                p.lent_chunk = 0;
+            }
+            req_times.refill_ms += std::chrono::duration<double, std::milli>(Clock::now() - t_rf).count();
+            if (trace && n_lent > 0) {
+                std::fprintf(stderr, "strata trace: refill of %lld slots queued in %.1f ms (lands while decoding)\n",
+                             (long long) n_lent, std::chrono::duration<double, std::milli>(Clock::now() - t_rf).count());
                 std::fflush(stderr);
             }
             return true;
@@ -12670,6 +12791,12 @@ int main(int argc, char** argv) {
             seg_lend = 0;
             if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
             const auto t_ln = Clock::now();
+            struct LendTime {
+                double& acc;
+                Clock::time_point t;
+                ~LendTime() { acc += std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+            } lend_time{req_times.lend_ms, t_ln};
+            if (!lazy_land(true, e)) return false;   // a slot still landing is not lent again
             const int64_t want_seg = lend_want(tokens);
             // `exact`: a planned segment read on - the loan it was read with (what is left would size another)
             const int64_t want = exact > 0 ? std::min(exact, o.prefill_chunk) : want_seg;
@@ -13978,6 +14105,13 @@ int main(int argc, char** argv) {
             cur = ids;
             const Clock::time_point r0 = Clock::now();
             const int64_t streamed0 = sp.chain_experts_streamed();   // the DONE line's experts_streamed= is the difference
+            const int64_t cpu0 = sp.chain_experts_cpu();
+            if (!lazy_land(true, err)) {
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
+            }
+            lazy_windows = 0;
+            lazy_wait_ms = 0.0;
             // ---- where this request starts reading: the live session, or a checkpoint, whose tokens AND pictures are
             // exactly the start of this prompt - at most n - 1 of them, the last token is always the first window
             auto starts_with = [&](const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs) -> bool {
@@ -15282,6 +15416,7 @@ int main(int argc, char** argv) {
             if (pipe) ver_b.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             bool cancelled = false;
             tr("prompt start", n - 1);
+            req_times.before_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
             // The prompt is read in two parts when it has a turn boundary past `resume`: up to the last <|im_start|>
             // (the conversation so far), a checkpoint there, then the new turn's header.  The next request of the same
             // chat renders the same history - but not always the same header or the thinking of this reply - so that
@@ -15513,7 +15648,7 @@ int main(int argc, char** argv) {
                 if (to <= at) continue;
                 err.clear();
                 const bool win = windows_ok(at, to);
-                if (win && !refill(err)) {
+                if (win && !refill_lazy(err)) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }
@@ -15583,7 +15718,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
                                  (long long) message_at, (long long) (turn_at - message_at));
             }
-            if (!refill(err)) {
+            if (!(cancelled ? refill(err) : refill_lazy(err))) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                 return 1;
             }
@@ -16508,6 +16643,13 @@ int main(int argc, char** argv) {
                     std::printf("ERR an adaptive refill failed\n");
                     return 1;
                 }
+                if (!lazy_fly.empty()) {   // STRATA_SHORT_READS: the lent slots that have landed are resident from here on
+                    if (!lazy_land(false, err)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                    if (!lazy_fly.empty()) ++lazy_windows;
+                }
                 dt_adapt_wait += std::chrono::duration<double, std::milli>(Clock::now() - taw0).count();
                 if (hist_n > 0) {
                     // the tails the penalties count over, ONE PER ROW: the tokens the state has consumed, the
@@ -16933,6 +17075,30 @@ int main(int argc, char** argv) {
                 admit_slot = -1;
             }
             if (drive.routing != nullptr) std::fflush(drive.routing);   // the routing trace survives a crash and is watchable mid-session
+            const bool lazy_was = !lazy_fly.empty();
+            if (!lazy_land(true, err)) {   // between requests the cache is whole again
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
+            }
+            if (trace && o.batch <= 0) {   // STRATA_TRACE: where a request's prompt time went (ms)
+                const double ck = req_times.sync_ms + req_times.save_ms + req_times.evict_ms;
+                std::fprintf(stderr, "strata trace: request: prompt %.1f = before the read %.1f + lend %.1f + batched %.1f + "
+                                     "windows %.1f + %d checkpoint(s) %.1f + refill %.1f + rest %.1f; the prompt path "
+                                     "streamed %lld experts, the CPU took %lld%s",
+                             prompt_ms, req_times.before_ms, req_times.lend_ms, req_times.read_ms, req_times.windows_ms,
+                             req_times.ckpts, ck, req_times.refill_ms,
+                             short_reads::rest_ms(prompt_ms, req_times.before_ms, req_times.lend_ms, req_times.read_ms,
+                                                  req_times.windows_ms, ck, req_times.refill_ms),
+                             (long long) (sp.chain_experts_streamed() - streamed0), (long long) (sp.chain_experts_cpu() - cpu0),
+                             lazy_ok ? "; lazy refill" : lazy_why != nullptr ? "; lazy refill off: " : "");
+                if (lazy_ok)
+                    std::fprintf(stderr, ": %lld window(s) ran before it landed%s, then a %.1f ms wait", (long long) lazy_windows,
+                                 lazy_was ? " (not all)" : "", lazy_wait_ms);
+                else if (lazy_why != nullptr)
+                    std::fprintf(stderr, "%s", lazy_why);
+                std::fprintf(stderr, "\n");
+                std::fflush(stderr);
+            }
             // "12288 of 98179" when cancelled mid-read (#471), the rate from what was read
             char read_txt[64];
             if (cancelled)
