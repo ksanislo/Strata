@@ -207,3 +207,5 @@ main { flex: 1; min-height: 0; display: flex; }
 .conv-states { display: flex; flex-direction: column; gap: 10px; margin-top: 8px; }
 .conv-state { border-top: 1px solid var(--st-border, rgba(127,127,127,.25)); padding-top: 8px; }
 .conv-state:first-child { border-top: 0; padding-top: 0; }
+.conv-ctx { display: flex; align-items: center; gap: var(--st-s-2, 8px); margin-top: 6px; font-size: var(--st-fs-sm); }
+.conv-ctx .st-progress { flex: 1; min-width: 60px; height: 4px; }

@@ -263,10 +263,18 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, agg, 
   const block = (title, s, detail, pct, ctxTok) =>
     `<div class="conv-state"><div class="state-card__head"><span>${esc(title)}</span><span class="badges">` +
     BADGES.map(([k, cls, t]) => `<span class="st-badge ${cls}${k === s ? " on" : ""}">${t}</span>`).join("") +
-    `</span></div><div class="state-card__row"><span class="muted">${detail}</span>` +
-    (ctxTok && eng.max_context ? `<span class="muted">context ${kfmt(ctxTok)} / ${ctxfmt(eng.max_context)} · ` +
-                                 `${Math.round((100 * ctxTok) / eng.max_context)}%</span>` : "") + `</div>` +
-    `<div class="st-progress"${s === "reading" ? ' data-tone="info"' : ""}><div class="st-progress__bar" style="width:${pct || 0}%"></div></div></div>`;
+    `</span></div><div class="state-card__row"><span class="muted">${detail}</span></div>` +
+    `<div class="st-progress"${s === "reading" ? ' data-tone="info"' : ""}><div class="st-progress__bar" style="width:${pct || 0}%"></div></div>` +
+    ctxRow(ctxTok) + `</div>`;
+  // the slot's context against the limit: a thin bar (amber past 75%, red past 90%) and its figures
+  const ctxRow = (tok) => {
+    if (!tok || !eng.max_context) return "";
+    const p = Math.min(100, (100 * tok) / eng.max_context);
+    const tone = p > 90 ? ' data-tone="danger"' : p > 75 ? ' data-tone="warn"' : "";
+    return `<div class="conv-ctx"><span class="muted">context</span><div class="st-progress"${tone}>` +
+           `<div class="st-progress__bar" style="width:${p.toFixed(1)}%"></div></div>` +
+           `<span class="muted">${kfmt(tok)} / ${ctxfmt(eng.max_context)} · ${Math.round(p)}%</span></div>`;
+  };
   const STATE = {decoding: "generating", reading: "reading", queued: "queued", waiting: "queued"};
   const one = (c, title) => {
     const s = STATE[c.state] || c.state;
@@ -358,28 +366,34 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, agg, 
   }
   spark("sp-disk", h.disk_read_mb);
 
-  // context memory: what every slot's conversation takes of the cards' slot budget (the engine's KMEM lines); without
-  // that (an engine that does not report it), the running request's context as before
+  // context: how close anything is to a limit - the longest conversation against the context limit (any setup), and
+  // with the engine's KMEM lines the cards' context memory against the slots' budget plus what the expert cache can
+  // give.  The arc is the nearer of the two; each slot's own fill is in its Slot block
+  const ctxMax = eng.max_context || 0;
+  const ctxConv = new Map((conv || []).filter((c) => c.slot != null).map((c) => [c.slot, c]));
+  const held = (live.slots || []).map((x) => {
+    const c = ctxConv.get(x.slot);
+    return c ? (c.state === "reading" ? c.prompt_tokens || 0 : c.context_tokens || 0) : x.held_tokens || 0;
+  });
+  if (!held.length) {   // one conversation at a time: the running request, else the last one
+    if (live.state !== "idle") held.push((live.prompt_tokens || 0) + (live.generated || 0));
+    else if (last) held.push((last.prompt_tokens || 0) + (last.output_tokens || 0));
+  }
+  const longest = held.length ? Math.max(...held) : 0, n = held.filter((t) => t > 0).length;
+  let frac = ctxMax ? Math.min(1, longest / ctxMax) : 0;
+  const parts = [ctxMax ? `longest ${kfmt(longest)} / ${ctxfmt(ctxMax)}` : "–"];
+  if (n > 1) parts.push(`${n} conversations`);
   const sm = eng.slot_memory;
-  let frac = 0, sub = "–";
   if (sm && sm.length) {
-    // the limit: the slots' budget plus what the expert cache can still give them (it grows on demand); the card
-    // nearest its own limit decides when a conversation can grow no more
     const lim = (c) => c.total + (c.givable || 0), use = (c) => c.total - c.free;
     const total = sm.reduce((t, c) => t + lim(c), 0), used = sm.reduce((t, c) => t + use(c), 0);
+    // the card nearest its own limit decides when a conversation can grow no more
     const hot = sm.reduce((a, c) => (lim(c) && use(c) / lim(c) > use(a) / (lim(a) || 1) ? c : a), sm[0]);
-    frac = lim(hot) ? Math.min(1, use(hot) / lim(hot)) : 0;
-    sub = `${gb(used)} of ${gb(total)} GB` + (sm.length > 1 ? ` · fullest GPU ${hot.device}` : "");
-    $("ctx-title").textContent = "Context memory";
-  } else {
-    const ctx = eng.max_context || 0;
-    let used = 0;
-    if (live.state !== "idle") used = (live.prompt_tokens || 0) + (live.generated || 0);
-    else if (last) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
-    frac = ctx ? Math.min(1, used / ctx) : 0;
-    sub = ctx ? `${kfmt(used)} / ${ctxfmt(ctx)}` : "–";
-    $("ctx-title").textContent = "Context fill";
+    if (lim(hot)) frac = Math.max(frac, Math.min(1, use(hot) / lim(hot)));
+    parts.push(`${gb(used)} / ${gb(total)} GB`);
   }
+  const sub = parts.join(" · ");
+  $("ctx-title").textContent = "Context";
   $("ctx-fill").setAttribute("stroke-dasharray", `${(235.6 * frac).toFixed(1)} 314.2`);
   $("ctx-fill").style.opacity = 235.6 * frac >= 3 ? "1" : "0";         // a near-zero arc would draw just its round cap
   $("ctx-pct").textContent = `${Math.round(frac * 100)}%`;

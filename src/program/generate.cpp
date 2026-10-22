@@ -12223,6 +12223,7 @@ int main(int argc, char** argv) {
             std::fwrite(ln.data(), 1, ln.size(), stdout);
             std::fflush(stdout);
         };
+        kmem_note();   // (at load: the gauge has the budget before the first window)
         // the free budget chunks card k keeps beyond its decoding slots' next step: what was made at load, or the spare
         auto budget_keep = [&](size_t k, int64_t made) -> int64_t {
             if (!eidle_on) return made;
