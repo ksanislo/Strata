@@ -13197,7 +13197,16 @@ int main(int argc, char** argv) {
             return false;
         };
         // STRATA_SLOT_ADMIT: a group whose window would pad a slot that is being read waits until the read is done
+        // STRATA_PIPED_MTP lays a group's window out over its live slots only (piped_mtp_layout: no pad rows), so a slot
+        // read below an active one is never written by its group's windows: no hold (it held a decoding slot for its
+        // partner's whole read: a 46-token chat's first token 99 s after its read, behind slot 4's 15.8k-token read).
+        // STRATA_PIPED_MTP_GROUP_HOLD=1: hold as before
+        static const bool hold_with_pm = [] {
+            const char* v = std::getenv("STRATA_PIPED_MTP_GROUP_HOLD");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
         auto group_held = [&](int gi) {
+            if (piped_mtp && !hold_with_pm) return false;
             bool act[strata::kernels::kVerifyMaxT] = {}, rd[strata::kernels::kVerifyMaxT] = {};
             for (int t = 0; t < GS; ++t) {
                 act[t] = bs[(size_t) (gi * GS + t)].active;
@@ -14649,8 +14658,9 @@ int main(int argc, char** argv) {
                 int groups = 0, active = 0, last_g = -1;
                 for (size_t b = 0; b < bs.size(); ++b) {
                     if (!bs[b].active) continue;
-                    ++active;
                     const int gi = piped ? (int) b / GS : (int) b;
+                    if (piped && group_held(gi)) continue;   // (a held group cannot decode in a turn: not waited for)
+                    ++active;
                     if (gi != last_g) { ++groups; last_g = gi; }
                 }
                 bool wait = false;
