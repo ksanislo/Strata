@@ -233,6 +233,10 @@ public:
     /// earlier stage is a chunk or more ahead of the last one by the time `on_chunk` runs, so this is where a
     /// mid-prompt checkpoint takes each stage's part.  Runs on that stage's thread, with its device current.
     std::function<bool(int64_t done, std::string& err)> on_stage_chunk;
+    /// STRATA_READ_INTERLEAVE_LAYERS: a queued prompt's (PromptJob) read calls this on its stage's thread before every
+    /// `layer_gap_every`-th layer of a chunk but the first, with its stream (cudaStream_t); it may wait, never compute.
+    std::function<void(int64_t layer, void* stream)> on_layer_gap;
+    int layer_gap_every = 0;
 
     /// Checked before every chunk: true stops the prompt early (`run` returns false with err "cancelled").
     std::function<bool()> should_stop;
