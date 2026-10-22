@@ -11959,8 +11959,22 @@ int main(int argc, char** argv) {
             Clock::time_point adm_t0{};
             double adm_read_ms = 0.0, adm_wait_ms = 0.0;
             int64_t adm_rows = 0, adm_tokens = 0, adm_reused = 0;
+            std::string adm_notes;   ///< where the admission's time went (its line at the first token)
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
+        // an admission beside the slots, at its first token: one line with where its time went
+        auto adm_first = [&](int b) {
+            BSlot& sl = bs[(size_t) b];
+            if (!sl.adm_log) return;
+            sl.adm_log = false;
+            std::fprintf(stderr, "strata batch: slot %d admitted beside the decoding slots: %lld prompt tokens (%lld reused) "
+                                 "read in %.0f ms after %.0f ms queued; the other slots decoded %lld rows during the read; "
+                                 "first token %.0f ms after its BGEN%s%s\n", b, (long long) sl.adm_tokens,
+                         (long long) sl.adm_reused, sl.adm_read_ms, sl.adm_wait_ms, (long long) sl.adm_rows,
+                         std::chrono::duration<double, std::milli>(Clock::now() - sl.adm_t0).count(),
+                         sl.adm_notes.empty() ? "" : "; ", sl.adm_notes.c_str());
+            sl.adm_notes.clear();
+        };
         // timing of the batch windows since the slots were last all idle (one stderr line then)
         double bt_run = 0, bt_commit = 0, bt_emit = 0;
         double bt_wait0 = 0, bt_pool0 = 0;
@@ -12758,6 +12772,7 @@ int main(int argc, char** argv) {
                     const int32_t y = outb[first[t] + j];
                     sl.ids.push_back(tok[first[t] + j]);
                     std::printf("BT %d %d\n", b, (int) y);
+                    adm_first(b);
                     ++sl.produced;
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
@@ -13087,6 +13102,7 @@ int main(int argc, char** argv) {
                     const int32_t y = outb[i + j];
                     sl.ids.push_back(L.tok[i + j]);
                     std::printf("BT %d %d\n", b, (int) y);
+                    adm_first(b);
                     ++sl.produced;
                     ++bt_rows;
                     ++pipe_rows;
@@ -13269,15 +13285,7 @@ int main(int argc, char** argv) {
                     const int32_t y = outb[t];
                     std::printf("BT %d %d\n", gi * GS + t, (int) y);
                     ++sl.produced;
-                    if (sl.adm_log) {   // STRATA_SLOT_ADMIT: the admission's line, at its first token
-                        sl.adm_log = false;
-                        std::fprintf(stderr, "strata batch: slot %d admitted beside the decoding slots: %lld prompt tokens "
-                                             "(%lld reused) read in %.0f ms after %.0f ms queued; the other slots decoded "
-                                             "%lld rows during the read; first token %.0f ms after its BGEN\n",
-                                     gi * GS + t, (long long) sl.adm_tokens, (long long) sl.adm_reused, sl.adm_read_ms,
-                                     sl.adm_wait_ms, (long long) sl.adm_rows,
-                                     std::chrono::duration<double, std::milli>(Clock::now() - sl.adm_t0).count());
-                    }
+                    adm_first(gi * GS + t);   // STRATA_SLOT_ADMIT: the admission's line, at its first token
                     ++bt_rows;
                     ++pipe_rows;
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
@@ -14085,6 +14093,12 @@ int main(int argc, char** argv) {
             int64_t rows0 = 0;
             Clock::time_point t_fed{};   // STRATA_READ_YIELD: when it last got a piece (j.at: where the next one starts)
             bool fed_any = false;        // STRATA_BATCH_READS_FAST_SHRINK: a piece of it went to the prompt path
+            // where its time goes (the slot's admission line): taken from the lines, prepared (and the waits in it),
+            // set up (its thread), first piece fed, read done
+            Clock::time_point t_take{}, t_fed0{};
+            double prep_ms = 0.0;
+            std::string notes;
+            std::atomic<int64_t> setup_us{-1};   // after t_take
         };
         std::vector<std::unique_ptr<AdmJob>> cy_held;   // STRATA_READ_YIELD: reads held at a piece boundary
         // a held read a BSTOP reached: it ends there (nothing of it is in flight), before its slot is admitted again
@@ -14157,7 +14171,17 @@ int main(int argc, char** argv) {
             };
             // --session-dir: the slot's kept conversation is saved before this prompt overwrites it (as copy_to_slot's
             // admissions: not when the prompt continues it or one of its turn checkpoints); the save needs a drain
+            // (the waits in here go into the admission's line)
+            auto note = [&](const char* what, Clock::time_point t0) {
+                const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                if (ms < 50.0) return;
+                char nb[160];
+                std::snprintf(nb, sizeof nb, "%s%s %.0f ms", j.notes.empty() ? "" : ", ", what, ms);
+                j.notes += nb;
+            };
             if (sdir) {
+                const auto t_sd = Clock::now();
+                struct NoteAt { std::function<void()> f; ~NoteAt() { f(); } } sd_note{[&] { note("its old conversation saved", t_sd); }};
                 const std::vector<int32_t> next(j.r.ids.begin(), j.r.ids.end());
                 bool from_this = false;
                 for (const ConvCheckpoint& c : sl.checks) from_this = from_this || (c.imgs.empty() && pre(c.ids));
@@ -14169,6 +14193,9 @@ int main(int argc, char** argv) {
             // STRATA_ELASTIC_SLOTS: the slot backed for the whole prompt before the read writes it; when the budget is short,
             // everything drains and the old admission's fit runs (it starts the slot over: only its checkpoints resume)
             bool fresh = false;
+            {   // (the note covers this block only)
+            const auto t_fit = Clock::now();
+            struct FitNote { std::function<void()> f; ~FitNote() { f(); } } fit_note{[&] { note("room made for the slot (queued reads waited for, groups drained)", t_fit); }};
             if (eslots_on) {
                 const std::function<bool(size_t)> busy = [](size_t) { return false; };
                 if (slot_fit(b, n + 1, false, busy) != 0) {
@@ -14184,6 +14211,7 @@ int main(int argc, char** argv) {
                         fresh = true;
                     }
                 }
+            }
             }
             if (o.prompt_cache > 0 && !nan_flush && !sl.tainted && !sl.img && sl.cvec == cvec_cached) {
                 if (sl.cached && !fresh && pre(sl.ids)) j.resume = (int64_t) sl.ids.size();
@@ -14201,8 +14229,12 @@ int main(int argc, char** argv) {
             sl.partial = false;
             sl.reading = true;
             // a hole below an active slot of its group: a window of that group in flight may have it as a pad row
+            const auto t_hole = Clock::now();
             if (GS > 1 && pg[(size_t) (b / GS)].inflight && group_held(b / GS) && !pipe_drain()) return AdmEnd::fatal;
+            note("its group drained", t_hole);
             std::string e;
+            const auto t_mtp = Clock::now();
+            struct MtpNote { std::function<void()> f; ~MtpNote() { f(); } } mtp_note{[&] { note("its drafter reserved (queued reads waited for)", t_mtp); }};
             if (batch_mtp && !adm_mtp_ready[(size_t) b]) {   // its graphs captured with nothing in flight (#31), once
                 if (adm_quiet && !adm_quiet()) return AdmEnd::fatal;
                 if (!pipe_drain()) return AdmEnd::fatal;
@@ -14505,28 +14537,28 @@ int main(int argc, char** argv) {
             const char* v = std::getenv("STRATA_BATCH_READS_CHUNK");
             return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0;
         }();
-        // STRATA_BATCH_READS_DECODE_WINDOWS=N (2; 0 off): while a slot decodes, the prompt path's queue holds each chunk
-        // (but an urgent one) at stage 0 until every decoding group finished N windows since the last chunk went in
-        // and STRATA_BATCH_READS_DECODE_SHARE (0.3) of the wall time went to the gap; never longer than
-        // STRATA_BATCH_READS_DECODE_MAX_MS (4000). The wait is on the queue's own thread, between chunks, with nothing
-        // held: the windows never wait for it.
+        // STRATA_BATCH_READS_DECODE_WINDOWS=N (2; 0 off): while slots decode beside the reads, decode TURNS. A turn
+        // is due when a slot starts decoding, else once the reads ran (1 - SHARE) / SHARE times the last turn
+        // (STRATA_BATCH_READS_DECODE_SHARE, 0.3). Then every stage stops taking queued chunks at its next boundary;
+        // once no stage reads (a slow stage only delays the start, at most STRATA_BATCH_READS_DECODE_DRAIN_MS, 10000),
+        // the slots decode alone until every decoding group COMPLETED N windows through the last stage (N tokens) and
+        // the turn lasted SHARE / (1 - SHARE) of the reads before it, at most STRATA_BATCH_READS_DECODE_MAX_MS (4000);
+        // then all stages read again. The pumping thread runs the turns (it never waits); a stage waits between its
+        // chunks with nothing of the prompt path held, bounded; a chunk with an urgent (FAST) read never waits.
         static const int br_dec_windows = [] {
             const char* v = std::getenv("STRATA_BATCH_READS_DECODE_WINDOWS");
             return br_max > 0 ? (v != nullptr ? std::max(0, std::atoi(v)) : 2) : 0;
         }();
-        static const double br_dec_share = [] {
-            const char* v = std::getenv("STRATA_BATCH_READS_DECODE_SHARE");
-            return std::min(0.9, std::max(0.0, v != nullptr ? std::atof(v) : 0.3));
-        }();
-        static const double br_dec_max_ms = [] {
-            const char* v = std::getenv("STRATA_BATCH_READS_DECODE_MAX_MS");
-            return std::max(0.0, v != nullptr ? std::atof(v) : 4000.0);
-        }();
+        auto br_env_ms = [](const char* k, double d) {
+            const char* v = std::getenv(k);
+            return std::max(0.0, v != nullptr ? std::atof(v) : d);
+        };
+        static const double br_dec_share = std::min(0.9, br_env_ms("STRATA_BATCH_READS_DECODE_SHARE", 0.3));
+        static const double br_dec_max_ms = br_env_ms("STRATA_BATCH_READS_DECODE_MAX_MS", 4000.0);
+        static const double br_dec_drain_ms = br_env_ms("STRATA_BATCH_READS_DECODE_DRAIN_MS", 10000.0);
         static std::atomic<bool> br_gate_live{false};
-        static std::atomic<int64_t> br_wins{0};
-        static std::atomic<int> br_groups{0};
+        static std::atomic<int> br_turn{0};   // 0 reads, 1 the stages finish their chunks, 2 the slots decode alone
         static std::atomic<int64_t> br_holds{0};
-        static std::atomic<double> br_hold_ms{0.0};
         auto adm_multi_run = [&](const std::string& first, int& n_adm) -> bool {
             read_share_set(false);
             struct Block {
@@ -14580,84 +14612,100 @@ int main(int argc, char** argv) {
             // STRATA_BATCH_READS_DECODE_WINDOWS: the queue's gate (set once, while the queue is idle) and what it reads;
             // off again before the drain above (destroyed first), so a drain never waits on a gate
             if (br_dec_windows > 0 && !sp.between_chunks)
-                for (int k = 0; k < n_pipe; ++k) {   // every stage, at its own chunk boundary, for the windows on its card
-                    strata::core::Verifier* vk = &stage_verifier(k);
-                    stage_prefill((size_t) k).between_chunks = [vk, k](double chunk_ms) {
-                        const bool live_now = br_gate_live.load(std::memory_order_acquire);
-                        const int g0 = br_groups.load();
-                        if (!live_now || g0 == 0) {
-                            // (a window ran on this card lately, yet no hold: say why, at most every 30 s)
-                            static std::atomic<int64_t> said{0};
-                            const int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
-                                Clock::now().time_since_epoch()).count();
-                            if ((vk->batch_busy() || Clock::now() - vk->batch_last_activity() < std::chrono::seconds(1)) &&
-                                now_s - said.load() >= 30) {
-                                said.store(now_s);
-                                std::fprintf(stderr, "strata batch: STRATA_BATCH_READS_DECODE_WINDOWS: stage %d did not hold "
-                                                     "beside a window (%s)\n", k + 1,
-                                             !live_now ? "no read run under way" : "no decoding group seen");
-                            }
-                            return;
-                        }
+                for (int k = 0; k < n_pipe; ++k)   // every stage, between its chunks: wait out a decode turn (bounded)
+                    stage_prefill((size_t) k).between_chunks = [](double) {
+                        if (br_turn.load(std::memory_order_acquire) == 0) return;
                         const auto t0 = Clock::now();
-                        const int64_t l0 = vk->batch_launches();
-                        const double min_ms = br_dec_share / (1.0 - br_dec_share) * chunk_ms;
-                        double el = 0.0;
-                        int groups = g0;
-                        for (;;) {
-                            el = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-                            groups = br_groups.load();
-                            if (!br_gate_live.load(std::memory_order_acquire) || groups == 0 || el >= br_dec_max_ms ||
-                                (vk->batch_launches() - l0 >= (int64_t) br_dec_windows * groups && el >= min_ms))
-                                break;
-                            std::this_thread::sleep_for(std::chrono::microseconds(500));
-                        }
+                        const auto cap = std::chrono::milliseconds((int64_t) (br_dec_drain_ms + br_dec_max_ms + 2000.0));
                         br_holds.fetch_add(1);
-                        std::fprintf(stderr, "strata batch: STRATA_BATCH_READS_DECODE_WINDOWS: stage %d held a chunk %.0f ms "
-                                             "(%d decoding groups, %lld windows launched on its card, last chunk %.0f ms%s)\n",
-                                     k + 1, el, g0, (long long) (vk->batch_launches() - l0), chunk_ms,
-                                     el >= br_dec_max_ms ? ", capped" : "");
+                        while (br_gate_live.load(std::memory_order_acquire) && br_turn.load(std::memory_order_acquire) != 0 &&
+                               Clock::now() - t0 < cap)
+                            std::this_thread::sleep_for(std::chrono::microseconds(500));
                     };
-                }
-            // the gate's view of the slots and the short reads not fed yet, from this (the pumping) thread
+            // the turns (and the short reads not fed yet, STRATA_BATCH_READS_FAST_SHRINK), from this, the pumping thread
+            struct TurnState {
+                Clock::time_point t_reads = Clock::now(), t_req{}, t_dec{};
+                int64_t w0 = 0;
+                int groups = 0, active = 0, turns = 0;
+                double last_dec_ms = 0.0, last_drain_ms = 0.0, reads_ms = 0.0;
+            };
+            static TurnState ts;
+            ts.t_reads = Clock::now();
             auto br_tick = [&] {
                 if (br_max <= 0) return;
-                int groups = 0, last_g = -1;
+                int groups = 0, active = 0, last_g = -1;
                 for (size_t b = 0; b < bs.size(); ++b) {
                     if (!bs[b].active) continue;
+                    ++active;
                     const int gi = piped ? (int) b / GS : (int) b;
                     if (gi != last_g) { ++groups; last_g = gi; }
                 }
-                br_groups.store(groups);
-                br_wins.store(wins_done);
                 bool wait = false;
                 for (const auto& j : live)
                     wait = wait || (br_fast > 0 && !j->fed_any && !j->stop.load() && !j->failed.load() && j->n - 1 - j->resume > 0 &&
                                     j->n - 1 - j->resume <= br_fast);
                 sp.set_urgent_wait(wait);
+                if (br_dec_windows <= 0) return;
+                const auto now = Clock::now();
+                auto ms = [](Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+                const int st = br_turn.load();
+                if (st == 0) {
+                    const bool newcomer = active > ts.active;   // a slot started decoding: its first token comes first
+                    ts.active = std::min(ts.active, active);
+                    const double reads = ms(ts.t_reads, now);
+                    // decode alone >= SHARE of reads + drain + decode: the reads go on (1 - S) / S of the last turn's decode
+                    // less its drain (at least 500 ms), a newcomer at once
+                    const double due = std::max(500.0, (1.0 - br_dec_share) / br_dec_share * ts.last_dec_ms - ts.last_drain_ms);
+                    if (groups > 0 && (newcomer || reads >= due)) {
+                        ts.t_req = now;
+                        ts.reads_ms = reads;
+                        ts.active = active;
+                        br_turn.store(1, std::memory_order_release);
+                    }
+                } else if (st == 1) {
+                    bool reading = false;
+                    for (int k = 0; k < n_pipe; ++k) reading = reading || stage_prefill((size_t) k).reading_job();
+                    if (!reading) {
+                        ts.t_dec = now;
+                        ts.w0 = wins_done;
+                        ts.groups = std::max(1, groups);
+                        br_turn.store(2, std::memory_order_release);
+                    } else if (ms(ts.t_req, now) >= br_dec_drain_ms) {
+                        std::fprintf(stderr, "strata batch: STRATA_BATCH_READS_DECODE_WINDOWS: a decode turn did not start: "
+                                             "a stage still read after %.0f ms\n", ms(ts.t_req, now));
+                        ts.t_reads = now;
+                        br_turn.store(0, std::memory_order_release);
+                    }
+                } else {
+                    const double el = ms(ts.t_dec, now);
+                    const int64_t done = wins_done - ts.w0;
+                    const double budget = br_dec_share / (1.0 - br_dec_share) * (ts.reads_ms + ms(ts.t_req, ts.t_dec));
+                    if (groups == 0 || el >= br_dec_max_ms ||
+                        (done >= (int64_t) br_dec_windows * ts.groups && el >= std::min(budget, br_dec_max_ms))) {
+                        ts.last_dec_ms = el;
+                        ts.last_drain_ms = ms(ts.t_req, ts.t_dec);
+                        ts.t_reads = now;
+                        ts.active = active;
+                        ++ts.turns;
+                        std::fprintf(stderr, "strata batch: STRATA_BATCH_READS_DECODE_WINDOWS: decode turn %d: the stages "
+                                             "stopped reading in %.0f ms, the slots decoded alone %.0f ms: %lld windows "
+                                             "completed for %d groups (%d decoding now), after %.0f ms of reads%s\n",
+                                     ts.turns, ms(ts.t_req, ts.t_dec), el, (long long) done, ts.groups, groups, ts.reads_ms,
+                                     el >= br_dec_max_ms ? " (capped)" : "");
+                        br_turn.store(0, std::memory_order_release);
+                    }
+                }
             };
             struct GateOff {
                 strata::prefill::Prefill& p;
                 ~GateOff() {
                     br_gate_live.store(false, std::memory_order_release);
-                    br_groups.store(0);
+                    br_turn.store(0, std::memory_order_release);
                     p.set_urgent_wait(false);
                 }
             } gate_off{sp};
             br_gate_live.store(br_dec_windows > 0, std::memory_order_release);
-            const int64_t holds0 = br_holds.load();
-            const double hold_ms0 = br_hold_ms.load();
             br_tick_fn = br_tick;
-            struct HoldNote {   // the run's gate: how often it held a chunk and for how long
-                int64_t h0;
-                double m0;
-                ~HoldNote() {
-                    const int64_t h = br_holds.load() - h0;
-                    if (h > 0)
-                        std::fprintf(stderr, "strata batch: STRATA_BATCH_READS_DECODE_WINDOWS: %lld chunk holds over the "
-                                             "stages in this run\n", (long long) h);
-                }
-            } hold_note{holds0, hold_ms0};
             // the loan: lent once for every piece of this run (a relayout waits for no queued read), refilled at the end
             const int64_t piece = std::max<int64_t>(1, adm_loan(o.prefill_chunk));
             // STRATA_BATCH_READS_CHUNK=N: a loan of N tokens' chunk for the shared chunks (a read's piece stays `piece`)
@@ -14693,7 +14741,9 @@ int main(int argc, char** argv) {
                 }
                 j->t_bgen = adm_queued_at[b];
                 j->wait_ms = std::chrono::duration<double, std::milli>(Clock::now() - j->t_bgen).count();
+                j->t_take = Clock::now();
                 const AdmEnd e = adm_prepare(*j);
+                j->prep_ms = std::chrono::duration<double, std::milli>(Clock::now() - j->t_take).count();
                 if (e == AdmEnd::fatal) return false;
                 if (e == AdmEnd::done) return true;
                 strata::core::SessionState& s0 = *bslot_ss[0][b];
@@ -14744,6 +14794,7 @@ int main(int argc, char** argv) {
                     jr.setup_ok = ok;
                     jr.err = e2;
                     jr.ck = nullptr;
+                    jr.setup_us.store(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - jr.t_take).count());
                     jr.set_up.store(true, std::memory_order_release);
                 });
                 live.push_back(std::move(j));
@@ -14755,6 +14806,7 @@ int main(int argc, char** argv) {
                 auto pj = std::make_shared<strata::prefill::PromptJob>();
                 pj->tokens.assign(j.r.ids.begin() + a, j.r.ids.begin() + z);
                 pj->pos0 = a;
+                if (!j.fed_any) j.t_fed0 = Clock::now();
                 j.fed_any = true;
                 // STRATA_BATCH_READS_FAST: a read short enough to go whole is read in the next chunk (a chat question
                 // beside long agent reads waits for one short chunk, not for the queued pieces)
@@ -14895,6 +14947,16 @@ int main(int argc, char** argv) {
                 sl.adm_rows = j.rows;
                 sl.adm_tokens = n;
                 sl.adm_reused = j.resume;
+                {   // where its time went, from its BGEN
+                    auto at = [&](Clock::time_point t) { return std::chrono::duration<double, std::milli>(t - j.t_bgen).count(); };
+                    const int64_t su = j.setup_us.load();
+                    char nb[400];
+                    std::snprintf(nb, sizeof nb, "taken at %.0f ms, prepared in %.0f ms%s%s%s, set up at %.0f ms, first piece fed at "
+                                  "%.0f ms, read done at %.0f ms", at(j.t_take), j.prep_ms, j.notes.empty() ? "" : " (",
+                                  j.notes.c_str(), j.notes.empty() ? "" : ")", su >= 0 ? at(j.t_take) + su / 1000.0 : -1.0,
+                                  j.fed_any ? at(j.t_fed0) : -1.0, at(Clock::now()));
+                    sl.adm_notes = nb;
+                }
                 ver.set_slot_sampling(b, j.r.sp);
                 std::printf("BRA %d 1 prompt=%lld reused=%lld read_ms=%.1f wait_ms=%.1f\n", b, (long long) n,
                             (long long) j.resume, j.read_ms, j.wait_ms);
