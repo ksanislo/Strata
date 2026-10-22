@@ -372,10 +372,13 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, agg, 
   const sm = eng.slot_memory;
   let frac = 0, sub = "–";
   if (sm && sm.length) {
-    const total = sm.reduce((t, c) => t + c.total, 0), used = sm.reduce((t, c) => t + c.total - c.free, 0);
-    frac = total ? Math.min(1, used / total) : 0;
-    const hot = sm.reduce((a, c) => (c.total && (c.total - c.free) / c.total > (a.total ? (a.total - a.free) / a.total : -1) ? c : a), sm[0]);
-    sub = `${gb(used)} / ${gb(total)} GB` + (sm.length > 1 && hot.total ? ` · GPU ${hot.device} ${Math.round((100 * (hot.total - hot.free)) / hot.total)}%` : "");
+    // the limit: the slots' budget plus what the expert cache can still give them (it grows on demand); the card
+    // nearest its own limit decides when a conversation can grow no more
+    const lim = (c) => c.total + (c.givable || 0), use = (c) => c.total - c.free;
+    const total = sm.reduce((t, c) => t + lim(c), 0), used = sm.reduce((t, c) => t + use(c), 0);
+    const hot = sm.reduce((a, c) => (lim(c) && use(c) / lim(c) > use(a) / (lim(a) || 1) ? c : a), sm[0]);
+    frac = lim(hot) ? Math.min(1, use(hot) / lim(hot)) : 0;
+    sub = `${gb(used)} of ${gb(total)} GB` + (sm.length > 1 ? ` · fullest GPU ${hot.device}` : "");
     $("ctx-title").textContent = "Context memory";
   } else {
     const ctx = eng.max_context || 0;
