@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <vector>
 
 namespace strata::program {
 
@@ -82,6 +83,61 @@ inline constexpr double kPipedLeadInWindowMs = 1000.0;
 inline bool piped_read_lead_in(bool enabled, bool beside_slots, double ms_since_prev_end, double budget_ms) {
     return enabled && beside_slots && ms_since_prev_end >= 0.0 &&
            ms_since_prev_end <= kPipedLeadInWindowMs + std::max(0.0, budget_ms);
+}
+
+/// STRATA_SLOT_ADMIT=1: a batch admission reads its prompt straight into its slot's sessions beside the decoding
+/// groups.  What keeps it off (the first reason, for the log line), or nullptr when it runs.
+struct SlotAdmitSetup {
+    bool asked = false;             ///< STRATA_SLOT_ADMIT=1
+    bool piped = false;             ///< the pipelined slot groups (--batch-groups > 1 on a layer split)
+    bool cvec = false;              ///< a control vector is loaded (switched per request, for every slot at once)
+    bool head_alias = false;        ///< --prefill-head-alias (the output head is unloaded around a read)
+    const char* conc_off = nullptr; ///< concurrent_read_off's reason (the read runs on a thread of its own)
+};
+inline const char* slot_admit_off(const SlotAdmitSetup& s) {
+    if (!s.asked) return "not asked (STRATA_SLOT_ADMIT=1)";
+    if (!s.piped) return "not on the pipelined slot groups (--batch-groups > 1 on a layer split)";
+    if (s.cvec) return "a control vector";
+    if (s.head_alias) return "--prefill-head-alias";
+    return s.conc_off;
+}
+
+/// One BGEN with STRATA_SLOT_ADMIT on: read beside the decoding slots (true) or the old way (false).  The old way
+/// stops every slot for the read, so it is taken only when nothing decodes or reads, for pictures, or when another
+/// cache (the main session, a parked conversation, another slot) holds `gain` or more tokens more of the prompt than
+/// the slot itself (the old way copies those; the slot's own read would read them again).  gain <= 0: never for that.
+inline bool slot_admit_direct(bool busy, bool images, int64_t slot_prefix, int64_t other_prefix, int64_t gain) {
+    if (!busy || images) return false;
+    return gain <= 0 || other_prefix - slot_prefix < gain;
+}
+
+/// Where an admission's read stops for the slot's turn checkpoint (as the main path's turn_at): the prompt's last
+/// `turn` token after `resume`, moved back over a short trailing turn of `tail_role` (#458); -1: none.
+template<class Tok>
+inline int64_t admit_turn_cut(const std::vector<Tok>& ids, int64_t resume, int64_t turn, int64_t tail_role) {
+    const int64_t n = (int64_t) ids.size();
+    if (turn < 0) return -1;
+    int64_t at = -1;
+    for (int64_t i = n - 1; i > resume; --i)
+        if ((int64_t) ids[(size_t) i] == turn) { at = i; break; }
+    if (at > 0 && tail_role >= 0)
+        for (int64_t i = at - 1; i > resume; --i)
+            if ((int64_t) ids[(size_t) i] == turn) {
+                if (i + 1 < n && (int64_t) ids[(size_t) i + 1] == tail_role) at = i;
+                break;
+            }
+    return at;
+}
+
+/// A group of `gs` slots must not start a window while a slot reads below one of its active slots: that window's pad
+/// row would write the reading slot's state.
+inline bool group_pads_reading(const bool* active, const bool* reading, int gs) {
+    bool above = false;
+    for (int t = gs - 1; t >= 0; --t) {
+        if (reading[t] && above) return true;
+        above = above || active[t];
+    }
+    return false;
 }
 
 }  // namespace strata::program
