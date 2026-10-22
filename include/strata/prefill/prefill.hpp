@@ -252,12 +252,19 @@ public:
     /// STRATA_BATCH_READS_FAST=<tokens> (512; 0 off): an urgent piece of at most that many tokens goes in the next chunk
     /// whole, ahead of everything not started; each other reader gets STRATA_BATCH_READS_FAST_SHARE (128) at most, the
     /// chunk at most STRATA_BATCH_READS_FAST_CHUNK tokens (default: just below the stream-all size, 1023).
+    /// STRATA_BATCH_READS_FAST_SHRINK (512; 0 off): while a short read is admitted but not queued yet
+    /// (set_urgent_wait), the chunks are at most that many tokens, a lone reader's piece sliced too.
     struct BatchFast {
-        int64_t tokens = 0, share = 128, chunk = 0;
+        int64_t tokens = 0, share = 128, chunk = 0, shrink = 0;
     };
+    void set_urgent_wait(bool on) { urgent_wait_.store(on, std::memory_order_release); }
+    /// The queue's worker, before each chunk but one with an urgent piece, on its own thread with nothing of the prompt
+    /// path held: may wait (the decode share, STRATA_BATCH_READS_DECODE_WINDOWS), never compute. `chunk_ms`: the last
+    /// chunk's stage-0 time. Set while the queue is idle.
+    std::function<void(double chunk_ms)> between_chunks;
     static BatchFast batch_fast();
     static BatchPlan plan_batch(const std::deque<std::shared_ptr<PromptJob>>& q, int max_segs, int64_t budget,
-                                const BatchFast& fast, int64_t fast_cap);
+                                const BatchFast& fast, int64_t fast_cap, bool single_ok = false);
     static BatchPlan plan_batch(const std::deque<std::shared_ptr<PromptJob>>& q, int max_segs, int64_t budget);   ///< FAST off
     /// A queued prompt that can share a chunk: its own sessions, no picture rows, not failed or stopped, tokens left.
     static bool batchable(const PromptJob& j);
@@ -360,6 +367,7 @@ private:
     struct JobQueue;
     std::unique_ptr<JobQueue> jobs_;
     std::shared_ptr<PromptJob> take_batch(std::deque<std::shared_ptr<PromptJob>>& q);
+    std::atomic<bool> urgent_wait_{false};
     bool drain_pipeline(std::string& err);
 
     int64_t stage_lb_ = 0, stage_le_ = -1;
