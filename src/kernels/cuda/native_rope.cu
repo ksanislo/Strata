@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 
 namespace strata::kernels {
@@ -133,9 +134,41 @@ int mrope_dev() {
     if (cudaGetDevice(&d) != cudaSuccess || d < 0 || d >= kMropeDevices) d = 0;
     return d;
 }
+thread_local bool mrope_scoped = false;
+thread_local const int32_t* mrope_scope_tab = nullptr;
+std::mutex slot_rope_mu;
+std::vector<std::shared_ptr<const SlotRope>> slot_ropes;
+std::atomic<bool> slot_rope_on{false};
 }  // namespace
 void mrope_table_set(const int32_t* device_table) { mrope_tab[mrope_dev()].store(device_table, std::memory_order_relaxed); }
-const int32_t* mrope_table() { return mrope_tab[mrope_dev()].load(std::memory_order_relaxed); }
+const int32_t* mrope_table() {
+    return mrope_scoped ? mrope_scope_tab : mrope_tab[mrope_dev()].load(std::memory_order_relaxed);
+}
+MropeScope::MropeScope(const int32_t* table) : prev_(mrope_scope_tab), had_(mrope_scoped) {
+    mrope_scoped = true;
+    mrope_scope_tab = table;
+}
+MropeScope::~MropeScope() {
+    mrope_scoped = had_;
+    mrope_scope_tab = prev_;
+}
+void slot_rope_enable(bool on) { slot_rope_on.store(on, std::memory_order_relaxed); }
+bool slot_rope_enabled() { return slot_rope_on.load(std::memory_order_relaxed); }
+void slot_rope_set(int slot, std::shared_ptr<const SlotRope> r) {
+    if (slot < 0) return;
+    std::lock_guard<std::mutex> lk(slot_rope_mu);
+    if ((size_t) slot >= slot_ropes.size()) slot_ropes.resize((size_t) slot + 1);
+    slot_ropes[(size_t) slot] = std::move(r);
+}
+std::shared_ptr<const SlotRope> slot_rope_get(int slot) {
+    std::lock_guard<std::mutex> lk(slot_rope_mu);
+    return slot >= 0 && (size_t) slot < slot_ropes.size() ? slot_ropes[(size_t) slot] : nullptr;
+}
+void slot_rope_at(int slot, int64_t cell, int32_t out[3]) {
+    const auto r = slot_rope_get(slot);
+    if (r) r->at(cell, out);
+    else out[0] = out[1] = out[2] = (int32_t) cell;
+}
 namespace {
 // #280: the float64 angle table of each device, set at session init (before any graph is captured)
 struct RopeReg {
