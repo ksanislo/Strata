@@ -22,6 +22,7 @@
 #include <future>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace strata::core { class PeerExperts; }
 namespace strata::kernels::cpu { class ExpertPool; }
@@ -210,6 +211,8 @@ public:
     /// Not beside `run` (drain_jobs first).
     /// `front`: before the prompts not started yet (a shorter one first; the one being read goes on).
     void enqueue(std::shared_ptr<PromptJob> job, bool front = false);
+    /// The queued prompts stage 0 has not started that `pred` picks, taken out of the queue (their on_done never runs).
+    std::vector<std::shared_ptr<PromptJob>> withdraw(const std::function<bool(const PromptJob&)>& pred);
     /// Waits until every queued prompt has gone through every stage (each one's on_done has run).
     void drain_jobs();
     /// Prompts queued or being read on the first stage.
