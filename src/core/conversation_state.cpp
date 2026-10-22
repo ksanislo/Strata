@@ -25,6 +25,11 @@ bool fail(std::string& error, const char* message) {
 }
 
 bool sync(std::string& error) {
+    if (strata::core::device_sync_override()) {   // (the narrowed sync: this thread's queued copies are not in it)
+        cudaStream_t s = nullptr;
+        if (conversation_detail::private_stream(s) == cudaSuccess && cudaStreamSynchronize(s) != cudaSuccess)
+            return fail(error, "the copy stream failed");
+    }
     const auto status = strata::core::device_sync();
     if (status == cudaSuccess) return true;
     error = std::string("conversation snapshot synchronize: ") + cudaGetErrorString(status);
