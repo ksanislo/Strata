@@ -6050,6 +6050,11 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
             yield last
 
 
+def cut_call_text(name: str, arguments: str) -> str:
+    """The text of a tool call the output ended inside, as a whole answer shows it instead of the call."""
+    return f'<tool_call>\n{{"name": {json.dumps(name)}, "arguments": {arguments}'
+
+
 def _is_json(text: str) -> bool:
     try:
         json.loads(text)
@@ -6078,7 +6083,11 @@ def openai_collect(chunks) -> dict:
         last = c
     calls = [by_index[i] for i in sorted(by_index)]
     if last["choices"][0]["finish_reason"] != "tool_calls":
-        calls = [c for c in calls if _is_json(c["function"]["arguments"])]   # a call the output ended inside (#211)
+        # a call the output ended inside (#211) is no call: what of it was written stays visible as text (an answer cut
+        # by max_tokens while it wrote a call was empty otherwise)
+        content += [cut_call_text(c["function"]["name"], c["function"]["arguments"])
+                    for c in calls if not _is_json(c["function"]["arguments"])]
+        calls = [c for c in calls if _is_json(c["function"]["arguments"])]
     msg = {"role": "assistant", "content": "".join(content) or None}
     if "".join(reasoning):
         msg["reasoning_content"] = "".join(reasoning)
@@ -6210,10 +6219,11 @@ def anthropic_collect(events) -> dict:
                 b["_json"] = b.get("_json", "") + d["partial_json"]
         elif name == "content_block_stop" and blocks and "_json" in blocks[-1]:
             b = blocks[-1]
+            raw = b.pop("_json")
             try:
-                b["input"] = json.loads(b.pop("_json") or "{}")
-            except ValueError:                     # a call the output ended inside (#211): it has no input to give
-                blocks.pop()
+                b["input"] = json.loads(raw or "{}")
+            except ValueError:                     # a call the output ended inside (#211): it has no input to give,
+                blocks[-1] = {"type": "text", "text": cut_call_text(b.get("name", ""), raw)}   # only its text
         elif name == "message_delta":
             msg["stop_reason"] = e["delta"]["stop_reason"]
             msg["stop_sequence"] = e["delta"].get("stop_sequence")
