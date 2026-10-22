@@ -9820,13 +9820,13 @@ int main(int argc, char** argv) {
             if (!sdir || !live_ok || live.empty() || spill_skip_rewind) return;
             spill_from(ParkFrom{live, live_imgs, checks, cvec_cached, -1});
         };
-        // STRATA_PARK_STAGING_MIB (default 2048, 0 = off; --batch): a slot's park copies through a pinned buffer at
-        // PCIe speed (pageable copies ran at ~1 GB/s: 0.5-1 s for a 30k conversation on the admission path), and a
-        // thread moves them into the parked image behind; the image is stored at the next line or park (park_finish)
+        // STRATA_PARK_STAGING_MIB (opt-in, e.g. 2048; --batch): a slot's park copies through a pinned buffer at PCIe
+        // speed and a thread moves them into the parked image behind; stored at the next line or park (park_finish).
+        // Unfinished: on 2026-10-22 a staged copy differed from its source (STRATA_PARK_STAGING_CHECK) - keep it off
         strata::core::conversation_detail::StagedCopies park_stg;
         if (o.batch > 0) {
             const char* v = std::getenv("STRATA_PARK_STAGING_MIB");
-            const size_t mib = v != nullptr ? (size_t) std::max(0, std::atoi(v)) : 2048;
+            const size_t mib = v != nullptr ? (size_t) std::max(0, std::atoi(v)) : 0;
             void* p = nullptr;
             if (mib > 0 && cudaHostAlloc(&p, mib << 20, cudaHostAllocPortable) == cudaSuccess) {
                 park_stg.base = static_cast<uint8_t*>(p);
@@ -11679,7 +11679,10 @@ int main(int argc, char** argv) {
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
                                        " batch_groups=" + std::to_string(o.batch_groups) +
-                                       (slot_admit ? " slot_admit=1" : "")).c_str() : "");
+                                       (slot_admit ? " slot_admit=1" : "") +
+                                       // STRATA_PIPED_MTP: a window holds live slots only, so an idle slot keeps its
+                                       // conversation for its next turn (the server picks slots by what they hold)
+                                       (piped_mtp ? " slot_keep=1" : "")).c_str() : "");
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
