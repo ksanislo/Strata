@@ -1,3 +1,4 @@
+#include "strata/core/capture_lock.hpp"
 #include "strata/core/logit_bias.hpp"
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
@@ -1784,7 +1785,7 @@ void mem_mark(const char* where) {
     // "sticky" failure (#2013: unspecified launch failure surfacing in a later, unrelated call) is then pinned to
     // the step that ran the faulting work.  Only a diagnostic: it adds a synchronisation per mark.
     if (env[0] == '2') {
-        const cudaError_t sync_e = cudaDeviceSynchronize();
+        const cudaError_t sync_e = strata::core::device_sync();
         const cudaError_t last_e = cudaGetLastError();
         std::fprintf(stderr, "strata trace: device %s after %s (sync: %s, last error: %s)\n",
                      sync_e == cudaSuccess && last_e == cudaSuccess ? "ok" : "ERROR", where, cudaGetErrorString(sync_e),
@@ -2289,11 +2290,11 @@ double probe_pcie_h2d_gbps(std::string* samples = nullptr) {
     // Windows HIP: the events do not bracket the copies there (an RX 6800 read 3,300-26,000 GB/s, so every link kept
     // the x16 share), so each burst is timed on the host between two synchronizes: 256 MiB takes ~10 ms, so the
     // synchronize around it hardly matters
-    bool ok = cudaDeviceSynchronize() == cudaSuccess;
+    bool ok = strata::core::device_sync() == cudaSuccess;
     for (int b = 0; b < kBursts && ok; ++b) {
         const Clock::time_point t0 = Clock::now();
         cudaMemcpyAsync(d, h, kBytes, cudaMemcpyHostToDevice);
-        ok = cudaDeviceSynchronize() == cudaSuccess;
+        ok = strata::core::device_sync() == cudaSuccess;
         ms[b] = (float) std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
     }
 #else
@@ -5391,7 +5392,7 @@ int main(int argc, char** argv) {
         // (#167) generate mode starts from an empty sequence, and nothing else zeroes this state before the prompt
         // path or the verifier reads it (--serve zeroes it per request when nothing is reused)
         strata::core::session_zero(ss, g, nullptr, main_cs);
-        if (cudaDeviceSynchronize() != cudaSuccess) {
+        if (strata::core::device_sync() != cudaSuccess) {
             std::fprintf(stderr, "strata generate: zeroing the session state failed\n");
             return 1;
         }
@@ -5611,7 +5612,7 @@ int main(int argc, char** argv) {
             }
             if (slot_kind != 0)
                 for (auto& u : bslot_ss[k]) strata::core::session_zero(*u, g, nullptr, nullptr);
-            cudaDeviceSynchronize();
+            strata::core::device_sync();
             if (k == 0) { slot_bytes0 = bytes; slot_budget0 = budget; }
             size_t fb = 0, tb = 0;
             cudaMemGetInfo(&fb, &tb);
@@ -6528,7 +6529,7 @@ int main(int argc, char** argv) {
             }
             if (!auto_cache || attempt - failed >= 6) break;
             cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
-            cudaDeviceSynchronize();
+            strata::core::device_sync();
             size_t free_b = 0, total_b = 0;
             free_b = strata::core::device_free_bytes(); (void) total_b;
             const int64_t want = ((int64_t) o.vram_reserve_mib << 20) + pipe_first;
@@ -7207,7 +7208,7 @@ int main(int argc, char** argv) {
                     return false;
                 }
         }
-        return o.stream_token || cudaDeviceSynchronize() == cudaSuccess;
+        return o.stream_token || strata::core::device_sync() == cudaSuccess;
     };
 
     strata::kernels::SamplerParams sp;
@@ -7459,7 +7460,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: session_replay warm: %s\n", err.c_str());
             return 1;
         }
-        if (cudaDeviceSynchronize() != cudaSuccess) {
+        if (strata::core::device_sync() != cudaSuccess) {
             std::fprintf(stderr, "strata generate: session_replay warm faulted\n");
             return 1;
         }
@@ -7471,7 +7472,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
-        if (cudaDeviceSynchronize() != cudaSuccess) {
+        if (strata::core::device_sync() != cudaSuccess) {
             std::fprintf(stderr, "strata generate: session_replay faulted: %s\n", cudaGetErrorString(cudaGetLastError()));
             return 1;
         }
@@ -8119,7 +8120,7 @@ int main(int argc, char** argv) {
         }
         // a device-to-device cudaMemcpy does not wait for the copy: the moves still read the slots given up, and a
         // chunk unmapped under a copy faults it (the error then sticks to whatever runs next)
-        if (gave > 0 && cudaDeviceSynchronize() != cudaSuccess) {
+        if (gave > 0 && strata::core::device_sync() != cudaSuccess) {
             std::fprintf(stderr, "strata: moving experts for the K/V failed: %s\n", cudaGetErrorString(cudaGetLastError()));
             return false;
         }
@@ -8211,7 +8212,7 @@ int main(int argc, char** argv) {
                 break;
             }
         }
-        if (cudaDeviceSynchronize() != cudaSuccess) {
+        if (strata::core::device_sync() != cudaSuccess) {
             std::fprintf(stderr, "strata: refilling the expert cache failed: %s\n", cudaGetErrorString(cudaGetLastError()));
             return false;
         }
@@ -9935,7 +9936,7 @@ int main(int argc, char** argv) {
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                     auto& st = stages[k];
                     const strata::core::OnDevice on(st->dev);
-                    if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
+                    if (strata::core::device_sync() != cudaSuccess) { err = "stage sync failed"; return false; }
                     const strata::core::ConversationView view_k{f.ids, f.imgs, cs.parts[k], f.cvec};
                     strata::core::SavedConversation part;
                     if (!strata::core::conversation_snapshot_save(part, view_k, park_ss(f, k + 1), g, draft_of(k), err,
@@ -10037,7 +10038,7 @@ int main(int argc, char** argv) {
             double before_ms = 0.0, lend_ms = 0.0, refill_ms = 0.0;   // STRATA_TRACE's request line
         } req_times;
         auto gpu_sync_ok = [&]() -> bool {
-            const cudaError_t e = cudaDeviceSynchronize();
+            const cudaError_t e = strata::core::device_sync();
             if (e == cudaSuccess) return true;
             ckpt_why = std::string(": the GPU stopped responding before it (") + cudaGetErrorString(e) +
                        ") - a GPU hang; on Windows the driver is then reset";
@@ -10079,7 +10080,7 @@ int main(int argc, char** argv) {
                     try {
                         const Clock::time_point p0 = Clock::now();
                         const strata::core::OnDevice on(k == 0 ? -1 : stages[k - 1]->dev);
-                        const cudaError_t e = cudaDeviceSynchronize();
+                        const cudaError_t e = strata::core::device_sync();
                         if (e != cudaSuccess) {
                             why[k] = std::string(": the GPU stopped responding before it (") + cudaGetErrorString(e) +
                                      ") - a GPU hang; on Windows the driver is then reset";
@@ -11253,12 +11254,12 @@ int main(int argc, char** argv) {
         // tier's swaps have landed AND the asynchronous round in flight is finished - a swap still copying could write a
         // slot the K/V is lent.  A failed refill is surfaced as ERR at the next tick (a_err).
         auto adapt_quiesce = [&] {
-            cudaDeviceSynchronize();
+            strata::core::device_sync();
             apply_pending(true);
             if (!adapt_tick(true)) {   // a failed round still has copies in flight: they land before any slot moves
                 a_err = true;
                 if (ajob) ajob->wait();
-                cudaDeviceSynchronize();
+                strata::core::device_sync();
             }
         };
         // --pipeline-windows 2: the loop has drained (nothing in flight on either card): what waits for a gap goes now,
@@ -11663,7 +11664,7 @@ int main(int argc, char** argv) {
                 if (!p.lent.empty()) { e = "VRAM: a prompt's loan is still out"; return false; }
             if (!ver.wait_commit(e)) return false;
             adapt_quiesce();                         // the adaptive tier's swaps in flight land first (async too)
-            if (cudaDeviceSynchronize() != cudaSuccess) {
+            if (strata::core::device_sync() != cudaSuccess) {
                 e = std::string("VRAM: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
@@ -11833,7 +11834,7 @@ int main(int argc, char** argv) {
                 bool ok = true;
                 for (size_t k = 0; k < bslot_ss.size(); ++k) {
                     const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
-                    ok = cudaDeviceSynchronize() == cudaSuccess && ok;
+                    ok = strata::core::device_sync() == cudaSuccess && ok;
                 }
                 return ok;
             };
@@ -11978,7 +11979,7 @@ int main(int argc, char** argv) {
             const uint64_t G = r.granularity();
             const strata::core::OnDevice on(v.dev);
             apply_pending(true);   // a swap still copying could write a slot given up here
-            if (cudaDeviceSynchronize() != cudaSuccess) return 0;
+            if (strata::core::device_sync() != cudaSuccess) return 0;
             auto freeable = [&]() -> int64_t {   // mapped chunks wholly inside [lo, top): a chunk a live slot shares stays
                 const int64_t c0 = (int64_t) ((xc.slot_offset(v.lo) + G - 1) / G), c1 = (int64_t) (xc.slot_offset(v.top) / G);
                 int64_t n = 0;
@@ -12035,7 +12036,7 @@ int main(int argc, char** argv) {
                 ++v.evicted;
             }
             // the moves still read the slots given up: they land before a chunk is unmapped
-            if (gave > 0 && cudaDeviceSynchronize() != cudaSuccess) {
+            if (gave > 0 && strata::core::device_sync() != cudaSuccess) {
                 std::fprintf(stderr, "strata: elastic slots: moving experts failed on CUDA%d: %s\n", v.dev,
                              cudaGetErrorString(cudaGetLastError()));
                 return 0;
@@ -12068,7 +12069,7 @@ int main(int argc, char** argv) {
             const uint64_t G = r.granularity();
             const strata::core::OnDevice on(v.dev);
             apply_pending(true);
-            if (cudaDeviceSynchronize() != cudaSuccess) return false;
+            if (strata::core::device_sync() != cudaSuccess) return false;
             const int64_t c0 = (int64_t) (xc.slot_offset(v.lo) / G), c1 = (int64_t) (xc.slot_offset(v.top) / G);
             int64_t holes = 0;
             for (int64_t c = c0; c < c1; ++c) holes += r.mapped(c) ? 0 : 1;
@@ -12105,7 +12106,7 @@ int main(int argc, char** argv) {
                     break;
                 }
             }
-            if (cudaDeviceSynchronize() != cudaSuccess) {
+            if (strata::core::device_sync() != cudaSuccess) {
                 std::fprintf(stderr, "strata: elastic slots: refilling CUDA%d's expert cache failed: %s\n", v.dev,
                              cudaGetErrorString(cudaGetLastError()));
                 return false;
@@ -12248,7 +12249,7 @@ int main(int argc, char** argv) {
             if (!eslots_on) return true;
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 const strata::core::OnDevice on_k(eslot_dev(k));
-                if (cudaDeviceSynchronize() != cudaSuccess) { e = "elastic slots: device sync failed"; return false; }
+                if (strata::core::device_sync() != cudaSuccess) { e = "elastic slots: device sync failed"; return false; }
             }
             bool ok = slot_fit(b, upto + 1, true, all_quiet) == 0;
             for (int pass = 0; !ok && pass < 2; ++pass)
@@ -12264,7 +12265,7 @@ int main(int argc, char** argv) {
                         const strata::core::OnDevice on_k(eslot_dev(k));
                         (void) strata::core::session_slot_fit(u, 1, true);
                         strata::core::session_zero(u, g, nullptr, nullptr);   // its K/V map named the slots given back
-                        if (cudaDeviceSynchronize() != cudaSuccess) { e = "elastic slots: device sync failed"; return false; }
+                        if (strata::core::device_sync() != cudaSuccess) { e = "elastic slots: device sync failed"; return false; }
                     }
                     std::fprintf(stderr, "strata batch: elastic slots: slot %d gives its memory to slot %d and drops the "
                                          "%zu tokens it kept%s\n", j, b, sj.ids.size(), sj.partial ? " (a parked read)" : "");
@@ -12279,7 +12280,7 @@ int main(int argc, char** argv) {
                 if (u.slot_cells < 0) continue;
                 const strata::core::OnDevice on_k(eslot_dev(k));
                 strata::core::session_zero(u, g, nullptr, nullptr);
-                if (cudaDeviceSynchronize() != cudaSuccess) { e = "elastic slots: device sync failed"; return false; }
+                if (strata::core::device_sync() != cudaSuccess) { e = "elastic slots: device sync failed"; return false; }
             }
             if (!ok) {
                 e = "elastic slots: the slot budget (STRATA_ELASTIC_SLOTS_MIB) has no room for " + std::to_string(upto) +
@@ -12330,7 +12331,7 @@ int main(int argc, char** argv) {
                 strata::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
                 strata::core::SessionState& to = *bslot_ss[k][(size_t) b];
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
-                if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
+                if (strata::core::device_sync() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
                 strata::core::ConversationCheckpoint ck;
                 ck.ids = ids;
                 if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
@@ -12340,11 +12341,11 @@ int main(int argc, char** argv) {
                     strata::core::ConversationKv img;
                     if (!strata::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
                         return false;
-                    if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
+                    if (strata::core::device_sync() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
                     if (!strata::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
                         return false;
                 }
-                if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
+                if (strata::core::device_sync() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
             }
             if (batch_mtp) {
                 // Admission first builds the solo draft KV; copy it into the slot before drafting.  Both drafters' K/V
@@ -12356,7 +12357,7 @@ int main(int argc, char** argv) {
                     !strata::core::conversation_kv_save(image, mtp.kv_state(), draft_geometry, upto, false, e) ||
                     !strata::core::conversation_kv_restore(image, slot_mtp[(size_t) b]->kv_state(),
                                                            draft_geometry, upto, false, e) ||
-                    cudaDeviceSynchronize() != cudaSuccess)
+                    strata::core::device_sync() != cudaSuccess)
                     return false;
                 slot_mtp[(size_t) b]->set_prompt_len(upto);
             }
@@ -12375,7 +12376,7 @@ int main(int argc, char** argv) {
                 strata::core::SessionState& from = *bslot_ss[k][(size_t) b];
                 strata::core::SessionState& to = k == 0 ? ss : stages[k - 1]->ss;
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
-                if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
+                if (strata::core::device_sync() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
                 if (at != nullptr) {
                     if (!strata::core::conversation_checkpoint_restore(k == 0 ? *at : at->stage_parts[k - 1], to, g, e))
                         return false;
@@ -12390,11 +12391,11 @@ int main(int argc, char** argv) {
                     strata::core::ConversationKv img;
                     if (!strata::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
                         return false;
-                    if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
+                    if (strata::core::device_sync() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
                     if (!strata::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
                         return false;
                 }
-                if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
+                if (strata::core::device_sync() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
             }
             if (batch_mtp) {
                 // A returning solo request resumes from its slot's draft KV (on the drafter's device, as above).
@@ -12404,7 +12405,7 @@ int main(int argc, char** argv) {
                     !strata::core::conversation_kv_save(image, slot_mtp[(size_t) b]->kv_state(),
                                                         draft_geometry, upto, false, e) ||
                     !strata::core::conversation_kv_restore(image, mtp.kv_state(), draft_geometry, upto, false, e) ||
-                    cudaDeviceSynchronize() != cudaSuccess)
+                    strata::core::device_sync() != cudaSuccess)
                     return false;
                 mtp.set_prompt_len(upto);
             }
@@ -13319,7 +13320,7 @@ int main(int argc, char** argv) {
             std::string e = pipe_inflight() ? "pipelined groups in flight" : "";
             for (size_t k = 0; e.empty() && k < bslot_ss.size(); ++k) {
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
-                if (cudaDeviceSynchronize() != cudaSuccess) e = "device sync failed";
+                if (strata::core::device_sync() != cudaSuccess) e = "device sync failed";
             }
             if (e.empty() && use_mtp) {
                 const strata::core::OnDevice on_mtp(mtp.device());
@@ -14174,7 +14175,7 @@ int main(int argc, char** argv) {
             auto sync_stages = [&]() -> bool {
                 for (size_t k = 0; k < n_st; ++k) {
                     const strata::core::OnDevice on(k == 0 ? adm_main_dev : stages[k - 1]->dev);
-                    if (cudaDeviceSynchronize() != cudaSuccess) return false;
+                    if (strata::core::device_sync() != cudaSuccess) return false;
                 }
                 return true;
             };
@@ -14936,12 +14937,12 @@ int main(int argc, char** argv) {
                 const int64_t cells = (int64_t) mrope_host.size() / 3;
                 for (int64_t c = 0; c < cells; ++c)
                     mrope_host[(size_t) c * 3] = mrope_host[(size_t) c * 3 + 1] = mrope_host[(size_t) c * 3 + 2] = (int32_t) c;
-                bool ok = cudaDeviceSynchronize() == cudaSuccess &&
+                bool ok = strata::core::device_sync() == cudaSuccess &&
                           cudaMemcpy(d_mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
                                      cudaMemcpyHostToDevice) == cudaSuccess;
                 for (auto& st : stages) {
                     const strata::core::OnDevice on(st->dev);
-                    ok = ok && cudaDeviceSynchronize() == cudaSuccess &&
+                    ok = ok && strata::core::device_sync() == cudaSuccess &&
                          cudaMemcpy(st->mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
                                     cudaMemcpyHostToDevice) == cudaSuccess;
                 }
@@ -15132,7 +15133,7 @@ int main(int argc, char** argv) {
                     const uint64_t held = strata::core::session_slot_backed(u);
                     (void) strata::core::session_slot_fit(u, 1, true);
                     strata::core::session_zero(u, g, nullptr, nullptr);   // its K/V map named the page slots given back
-                    if (cudaDeviceSynchronize() != cudaSuccess) {
+                    if (strata::core::device_sync() != cudaSuccess) {
                         std::printf("ERR elastic idle: device sync failed: %s\n", cudaGetErrorString(cudaGetLastError()));
                         return false;
                     }
@@ -15654,7 +15655,7 @@ int main(int argc, char** argv) {
                         restored = strata::core::conversation_snapshot_restore(image.stage_images[k], stages[k]->ss, g,
                                                                                draft_of(k), err) ==
                                        strata::core::ConversationRestore::restored &&
-                                   cudaDeviceSynchronize() == cudaSuccess;
+                                   strata::core::device_sync() == cudaSuccess;
                         if (!restored && err.empty()) err = "stage CUDA" + std::to_string(stages[k]->dev) + " sync";
                     }
                     if (!restored) {
@@ -15866,7 +15867,7 @@ int main(int argc, char** argv) {
                     for (int64_t c = n; ve.empty() && c < cells; ++c) put(c, p + (c - n), p + (c - n), p + (c - n));
                 }
                 tr("positions built", (long long) img_rows.size());
-                cudaDeviceSynchronize();
+                strata::core::device_sync();
                 tr("device idle");
                 // CUDA0's table and, with a layer split, every later stage's (each device reads its own)
                 auto upload_mrope = [&]() -> bool {
@@ -15874,7 +15875,7 @@ int main(int argc, char** argv) {
                                          cudaMemcpyHostToDevice) == cudaSuccess;
                     for (auto& st : stages) {
                         const strata::core::OnDevice on(st->dev);
-                        cudaDeviceSynchronize();
+                        strata::core::device_sync();
                         ok = ok && cudaMemcpy(st->mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
                                               cudaMemcpyHostToDevice) == cudaSuccess;
                     }
@@ -16332,7 +16333,7 @@ int main(int argc, char** argv) {
                                     err.c_str());
                         return 1;
                     }
-                    if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("ERR stage sync\n"); return 1; }
+                    if (strata::core::device_sync() != cudaSuccess) { std::printf("ERR stage sync\n"); return 1; }
                 }
                 if (use_mtp && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr) {
                     uint64_t draft_hash = 0;
@@ -17428,7 +17429,7 @@ int main(int argc, char** argv) {
                     for (size_t k = 0; k < bslot_ss.size(); ++k) {
                         const strata::core::OnDevice on_k(dev_of(k));
                         strata::core::session_zero(*bslot_ss[k][(size_t) b], g, nullptr, nullptr);
-                        if (cudaDeviceSynchronize() != cudaSuccess) return false;
+                        if (strata::core::device_sync() != cudaSuccess) return false;
                     }
                     bslot_ss[0][(size_t) b]->ple_prev[0] = bslot_ss[0][(size_t) b]->ple_prev[1] = -1;
                     BSlot& s = bs[(size_t) b];
@@ -17448,7 +17449,7 @@ int main(int argc, char** argv) {
                     for (size_t k = 0; k < bslot_ss.size(); ++k) {
                         const strata::core::OnDevice on_k(dev_of(k));
                         strata::core::SessionState& s = *bslot_ss[k][(size_t) b];
-                        if (cudaDeviceSynchronize() != cudaSuccess) { e = "device sync"; return false; }
+                        if (strata::core::device_sync() != cudaSuccess) { e = "device sync"; return false; }
                         strata::core::ConversationCheckpoint ck;
                         ck.ids = ids32;
                         if (!strata::core::conversation_checkpoint_save(ck, s, g, e)) return false;
@@ -18718,7 +18719,7 @@ int main(int argc, char** argv) {
             if (state_hash && !cancelled && o.prompt_cache > 0) {   // every finished request, ckpt=0 too (parity gates)
                 // DEBUG: a fingerprint of every part of the session over the positions it holds ([0, L)), and
                 // separately of what lies past them in the last KV page (stale cells, fine unless something reads them)
-                if (cudaDeviceSynchronize() != cudaSuccess) {
+                if (strata::core::device_sync() != cudaSuccess) {
                     std::printf("ERR synchronizing state fingerprint\n");
                     return 1;
                 }
@@ -19264,7 +19265,7 @@ int main(int argc, char** argv) {
                 // the elastic K/V first: its hot experts move into slots of the loan, which are refilled after it
                 kvg_started = true;
                 kvg_start(first);
-                if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
+                if (!kvg_ensure(n_prompt + o.max_new + 64, [] { strata::core::device_sync(); })) return 1;
                 for (size_t i = 0; i < host_res.size(); ++i)
                     if (host_res[i] >= first) {
                         lent.emplace_back((int32_t) i, host_res[i]);
@@ -19303,7 +19304,7 @@ int main(int argc, char** argv) {
         if (!kvg_started) {   // the elastic K/V: every cell this run can reach (no loan)
             kvg_started = true;
             kvg_start(xcache.slots());
-            if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
+            if (!kvg_ensure(n_prompt + o.max_new + 64, [] { strata::core::device_sync(); })) return 1;
         }
         const Clock::time_point tp0 = Clock::now();
         if (!prefill.run(o.tokens.data(), n_batched, 0, err)) {
@@ -19358,7 +19359,7 @@ int main(int argc, char** argv) {
     if (!kvg_started) {   // the elastic K/V of a prompt that was not read in batches
         kvg_started = true;
         kvg_start(xcache.slots());
-        if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
+        if (!kvg_ensure(n_prompt + o.max_new + 64, [] { strata::core::device_sync(); })) return 1;
     }
     for (int64_t pos = pos_start;; ++pos) {
         // plan v0.3 P6: a native pack's last prompt token is the first verify window (T = 1)
@@ -19471,7 +19472,7 @@ int main(int argc, char** argv) {
         // memory access" at a plane offset that has nothing to do with the fault, and the layer that actually
         // faulted had completed its own error checks successfully - because its kernels had not run yet.  A
         // sticky error surfaces at the next SYNCHRONISING call, which is whatever happens to come next.
-        if (!o.stream_token && cudaDeviceSynchronize() != cudaSuccess) {
+        if (!o.stream_token && strata::core::device_sync() != cudaSuccess) {
             std::fprintf(stderr, "strata generate: the device faulted in lm_head at position %lld: %s\n",
                          (long long) pos, cudaGetErrorString(cudaGetLastError()));
             return 1;
@@ -19552,7 +19553,7 @@ int main(int argc, char** argv) {
         }
         {
             // **TWO DEVICE-WIDE SYNCS FOR FOUR BYTES.**  `sample_tokens(nullptr)` ends in
-            // `cudaDeviceSynchronize()` (`sampler.cu:245`) and the blocking 4-byte read below is the second.
+            // `strata::core::device_sync()` (`sampler.cu:245`) and the blocking 4-byte read below is the second.
             const Clock::time_point n = Clock::now();
             ms_sample += std::chrono::duration<double, std::milli>(n - tp).count();
             ++phase_tokens;

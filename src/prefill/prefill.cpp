@@ -1,4 +1,5 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
+#include "strata/core/capture_lock.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/prefill/prefill.hpp"
 #include <atomic>
@@ -2525,12 +2526,12 @@ struct ColdTrace {
     ColdTrace() { const char* e = std::getenv("STRATA_COLD_TRACE"); on = e != nullptr && e[0] == '1'; }
     bool begin() {
         if (!on || n >= 80) return false;
-        cudaDeviceSynchronize();
+        strata::core::device_sync();
         t0 = std::chrono::steady_clock::now();
         return true;
     }
     void end(const char* what, const std::string& name, int64_t T, int64_t N, int64_t K) {
-        cudaDeviceSynchronize();
+        strata::core::device_sync();
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         ++n;
         std::fprintf(stderr, "strata cold-trace: #%d %s %s T=%lld N=%lld K=%lld %.2f ms\n", n, what, name.c_str(), (long long) T,

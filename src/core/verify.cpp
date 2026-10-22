@@ -1,4 +1,5 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
+#include "strata/core/capture_lock.hpp"
 #include "strata/core/batch_rows.hpp"
 #include "strata/core/sm75_series.hpp"
 #include "strata/core/sm120_series.hpp"
@@ -128,7 +129,7 @@ struct RouteResidentCfg {
                 for (const auto& kv : c.blocks) {
                     if (kv.second == nullptr) continue;
                     unsigned long long h[8] = {};
-                    if (cudaSetDevice(kv.first) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess ||
+                    if (cudaSetDevice(kv.first) != cudaSuccess || strata::core::device_sync() != cudaSuccess ||
                         cudaMemcpy(h, kv.second, sizeof(h), cudaMemcpyDeviceToHost) != cudaSuccess) {
                         (void) cudaGetLastError();
                         continue;
@@ -2301,14 +2302,14 @@ bool Verifier::capture(int T, std::string& err) {
         else
             (void) cudaGetLastError();
     }
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+    if (strata::core::begin_capture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin capture failed";
         return false;
     }
     std::string rerr;
     const bool ok = record_window(T, cs_, rerr);
     cudaGraph_t graph = nullptr;
-    const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
+    const cudaError_t ce = strata::core::end_capture(cs_, &graph);
     if (!ok) {
         if (graph) cudaGraphDestroy(graph);
         err = rerr;
@@ -2436,7 +2437,7 @@ bool Verifier::capture_commit(std::string& err) {
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     const int64_t TS = (s.idx_block - 1) * ID;
     const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+    if (strata::core::begin_capture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin commit capture failed";
         return false;
     }
@@ -2540,7 +2541,7 @@ bool Verifier::capture_commit(std::string& err) {
         ok = false;
     }
     cudaGraph_t graph = nullptr;
-    const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
+    const cudaError_t ce = strata::core::end_capture(cs_, &graph);
     if (!ok) {
         if (graph) cudaGraphDestroy(graph);
         return false;
@@ -3335,7 +3336,7 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
 bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err) {
     cudaGraphExec_t& ex = exec_bm_[bkey(rows, S, hbase)];
     if (ex != nullptr) return true;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+    if (strata::core::begin_capture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin batch capture failed";
         return false;
     }
@@ -3347,7 +3348,7 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
     batch_rec_ = false;
     row_base_ = 0;
     cudaGraph_t graph = nullptr;
-    const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
+    const cudaError_t ce = strata::core::end_capture(cs_, &graph);
     if (!ok || ce != cudaSuccess) {
         if (graph) cudaGraphDestroy(graph);
         err = !ok ? rerr : std::string("verify: end batch capture: ") + cudaGetErrorString(ce);
@@ -3386,7 +3387,7 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     const int64_t TS = (s.idx_block - 1) * ID;
     const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+    if (strata::core::begin_capture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin batch commit capture failed";
         return false;
     }
@@ -3473,7 +3474,7 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
         ok = false;
     }
     cudaGraph_t graph = nullptr;
-    const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
+    const cudaError_t ce = strata::core::end_capture(cs_, &graph);
     if (!ok) {
         if (graph) cudaGraphDestroy(graph);
         return false;

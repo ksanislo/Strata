@@ -1,3 +1,4 @@
+#include "strata/core/capture_lock.hpp"
 #include "strata/core/native_dense.hpp"
 #include <cstdlib>
 #include "strata/core/weights.hpp"
@@ -441,7 +442,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 allocated += alloc_bytes(bytes);
                 ++made;
             }
-            if (made && (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess)) {
+            if (made && (cudaGetLastError() != cudaSuccess || strata::core::device_sync() != cudaSuccess)) {
                 err = "native dense (STRATA_HC_Q8): quantizing the projections failed"; return false;
             }
         }
