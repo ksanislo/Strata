@@ -1467,6 +1467,9 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(slot_persist_test src/program/slot_persist_test.cpp)
   target_include_directories(slot_persist_test PRIVATE include)
   add_test(NAME slot_persist_test COMMAND slot_persist_test)
+  add_executable(slot_idle_test src/program/slot_idle_test.cpp)
+  target_include_directories(slot_idle_test PRIVATE include)
+  add_test(NAME slot_idle_test COMMAND slot_idle_test)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
