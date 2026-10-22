@@ -15371,6 +15371,144 @@ int main(int argc, char** argv) {
                 if (mt < 2) return -1;
                 return std::max(a0, n - mt);
             };
+            // STRATA_PREFILL_MULTI=1 with STRATA_PREFILL_MULTI_TEST=N (a test, --batch, a layer split): before the request's
+            // own read, its first `len` tokens are read into the idle slots 0..N-1 through Prefill::enqueue, first one
+            // prompt after the other (each drained), then all N queued at once; one stderr line compares the times and
+            // the slots' states (every prompt must leave the same bits). The slots' cached conversations are dropped.
+            auto prefill_multi_test = [&](int64_t len) -> bool {
+                static const int n_test = [] {
+                    const char* m = std::getenv("STRATA_PREFILL_MULTI");
+                    const char* t = std::getenv("STRATA_PREFILL_MULTI_TEST");
+                    return m != nullptr && std::atoi(m) != 0 && t != nullptr ? std::max(0, std::atoi(t)) : 0;
+                }();
+                const int N = std::min<int>(n_test, (int) bs.size());
+                if (N < 1 || bslot_ss.empty() || len < 1 || !req_imgs.empty()) return true;
+                for (int b = 0; b < N; ++b)
+                    if (bs[(size_t) b].active) {
+                        std::fprintf(stderr, "strata serve: PFMULTI skipped: slot %d is decoding\n", b);
+                        return true;
+                    }
+                // the first stage's PLE for the slots' sessions: the main one's table, weights and consts, each slot's own
+                // history and predecessors, and a scratch of the reads' own (as STRATA_SLOT_ADMIT wires it)
+                static float* pfm_ple_scratch = nullptr;
+                static float* pfm_ple_emb = nullptr;
+                if (ss.ple.ready() && pfm_ple_scratch == nullptr) {
+                    const strata::core::OnDevice on0(0);
+                    if (cudaMalloc((void**) &pfm_ple_scratch, strata::core::ple_run_scratch_bytes()) != cudaSuccess ||
+                        cudaMalloc((void**) &pfm_ple_emb, (size_t) strata::kernels::NG_N_EMBD * 4) != cudaSuccess) {
+                        cudaGetLastError();
+                        err = "PFMULTI: no VRAM for the PLE scratch";
+                        return false;
+                    }
+                }
+                struct PleScope {
+                    std::vector<strata::core::SessionState*> s;
+                    ~PleScope() { for (auto* x : s) x->ple = strata::core::PleRun{}; }
+                } ple_scope;
+                if (ss.ple.ready())
+                    for (int b = 0; b < N; ++b) {
+                        strata::core::SessionState& s0 = *bslot_ss[0][(size_t) b];
+                        s0.ple = ss.ple;
+                        s0.ple.hist = s0.ple_hist;
+                        s0.ple.prev = s0.ple_prev;
+                        s0.ple.token = &s0.ple_token;
+                        s0.ple.scratch = pfm_ple_scratch;
+                        s0.ple.emb_dev = pfm_ple_emb;
+                        ple_scope.s.push_back(&s0);
+                    }
+                const auto toks = std::make_shared<std::vector<int64_t>>(ids.begin(), ids.begin() + len);
+                const std::vector<int32_t> ids32(ids.begin(), ids.begin() + len);
+                auto dev_of = [&](size_t k) { return k == 0 ? 0 : stages[k - 1]->dev; };
+                auto zero_slot = [&](int b) -> bool {
+                    for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                        const strata::core::OnDevice on_k(dev_of(k));
+                        strata::core::session_zero(*bslot_ss[k][(size_t) b], g, nullptr, nullptr);
+                        if (cudaDeviceSynchronize() != cudaSuccess) return false;
+                    }
+                    bslot_ss[0][(size_t) b]->ple_prev[0] = bslot_ss[0][(size_t) b]->ple_prev[1] = -1;
+                    BSlot& s = bs[(size_t) b];
+                    s.ids.clear();
+                    s.cached = false;
+                    s.checks.clear();
+                    s.partial = s.partial_from0 = false;
+                    return true;
+                };
+                auto hash_slot = [&](int b, uint64_t& h, std::string& e) -> bool {
+                    h = 1469598103934665603ull;
+                    auto mix = [&h](const uint8_t* p, size_t n) { for (size_t i = 0; i < n; ++i) h = (h ^ p[i]) * 1099511628211ull; };
+                    auto mixv = [&](const std::vector<uint8_t>& v) { mix(v.data(), v.size()); };
+                    auto mixb = [&](const strata::core::ConversationBuffer& v) {
+                        v.visit(0, v.size(), [&](const uint8_t* p, size_t n, size_t) { mix(p, n); return true; });
+                    };
+                    for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                        const strata::core::OnDevice on_k(dev_of(k));
+                        strata::core::SessionState& s = *bslot_ss[k][(size_t) b];
+                        if (cudaDeviceSynchronize() != cudaSuccess) { e = "device sync"; return false; }
+                        strata::core::ConversationCheckpoint ck;
+                        ck.ids = ids32;
+                        if (!strata::core::conversation_checkpoint_save(ck, s, g, e)) return false;
+                        mixv(ck.gdn); mixv(ck.ple); mixv(ck.tails); mixv(ck.dead); mixv(ck.block_pos);
+                        for (int64_t j = 0; j < s.qsa_alloc; ++j) {
+                            strata::core::ConversationKv img;
+                            if (!strata::core::conversation_kv_save(img, s.qsa_states[s.qsa_ord0 + j], g, len, true, e))
+                                return false;
+                            mixb(img.k); mixb(img.v); mixb(img.k_scale); mixb(img.v_scale); mixb(img.pooled);
+                        }
+                    }
+                    return true;
+                };
+                std::mutex mu;
+                std::vector<double> done_ms((size_t) N, -1.0);
+                std::vector<std::string> errs((size_t) N);
+                auto make_job = [&](int b, Clock::time_point t0) {
+                    auto j = std::make_shared<strata::prefill::PromptJob>();
+                    j->tokens = *toks;
+                    j->pos0 = 0;
+                    for (size_t k = 0; k < bslot_ss.size(); ++k) j->sessions.push_back(bslot_ss[k][(size_t) b].get());
+                    j->on_done = [&, b, t0](bool ok, const std::string& e) {
+                        std::lock_guard<std::mutex> lk(mu);
+                        done_ms[(size_t) b] = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                        if (!ok) errs[(size_t) b] = e;
+                    };
+                    return j;
+                };
+                auto list = [&](const std::vector<double>& v) {
+                    std::string s;
+                    for (double x : v) s += (s.empty() ? "" : ",") + std::to_string((long long) x);
+                    return s;
+                };
+                // one after the other, each drained: the pipeline fills and empties per prompt, as `run` does
+                std::vector<uint64_t> h_seq((size_t) N), h_multi((size_t) N);
+                for (int b = 0; b < N; ++b) if (!zero_slot(b)) { err = "PFMULTI: zeroing a slot failed"; return false; }
+                const auto t_seq = Clock::now();
+                for (int b = 0; b < N; ++b) {
+                    sp.enqueue(make_job(b, t_seq));
+                    sp.drain_jobs();
+                }
+                const double seq_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_seq).count();
+                const std::vector<double> seq_done = done_ms;
+                for (int b = 0; b < N; ++b) if (!hash_slot(b, h_seq[(size_t) b], err)) return false;
+                // all queued at once: stage 0 reads prompt b+1 while the later stages finish prompt b
+                std::fill(done_ms.begin(), done_ms.end(), -1.0);
+                for (int b = 0; b < N; ++b) if (!zero_slot(b)) { err = "PFMULTI: zeroing a slot failed"; return false; }
+                const auto t_multi = Clock::now();
+                for (int b = 0; b < N; ++b) sp.enqueue(make_job(b, t_multi));
+                sp.drain_jobs();
+                const double multi_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_multi).count();
+                for (int b = 0; b < N; ++b) if (!hash_slot(b, h_multi[(size_t) b], err)) return false;
+                int same = 0;
+                std::string failed;
+                for (int b = 0; b < N; ++b) {
+                    same += h_multi[(size_t) b] == h_seq[0] && h_seq[(size_t) b] == h_seq[0];
+                    if (!errs[(size_t) b].empty()) failed += " slot " + std::to_string(b) + ": " + errs[(size_t) b];
+                }
+                std::fprintf(stderr, "strata serve: PFMULTI %d prompts of %lld tokens: one by one %.0f ms (done at %s), "
+                                     "queued together %.0f ms (done at %s); %d of %d slots hold the same state%s%s\n",
+                             N, (long long) len, seq_ms, list(seq_done).c_str(), multi_ms, list(done_ms).c_str(), same, N,
+                             failed.empty() ? "" : "; FAILED:", failed.c_str());
+                for (int b = 0; b < N; ++b) (void) zero_slot(b);
+                return true;
+            };
             for (const int64_t to : cuts) {
                 if (to <= at) continue;
                 err.clear();
@@ -15385,6 +15523,10 @@ int main(int argc, char** argv) {
                                               ? resume_plan.lend : 0;
                 if (!win && !lend(to - at, err, plan_lend)) {
                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
+                    return 1;
+                }
+                if (!win && at == 0 && !prefill_multi_test(to)) {
+                    std::printf("ERR the STRATA_PREFILL_MULTI_TEST read failed: %s\n", err.c_str());
                     return 1;
                 }
                 if (win) merge_at = merge_from(at, to);   // (after the refill: the loans are back)
