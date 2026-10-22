@@ -345,6 +345,37 @@ inline int bf16x2_mode(bool f16_io) {
     return f16_io ? 0 : v;
 }
 inline bool bf16x2(bool f16_io) { return bf16x2_mode(f16_io) != 0; }
+// STRATA_BF16_TC_SKIP=indexer,router,ssm,hc,ple (STRATA_BF16_TC_SKIP_INDEXER=1 adds indexer): these BF16 projections
+// keep cuBLAS's BF16 GEMM under STRATA_BF16_TC, so the selections they feed see the default path's sums
+enum : unsigned { kTcIndexer = 1, kTcRouter = 2, kTcSsm = 4, kTcHc = 8, kTcPle = 16 };
+unsigned bf16_tc_skip() {
+    static const unsigned m = [] {
+        unsigned r = 0;
+        const char* e = std::getenv("STRATA_BF16_TC_SKIP");
+        const std::string v = e ? e : "";
+        for (const auto& [word, bit] : {std::pair<const char*, unsigned>{"indexer", kTcIndexer}, {"router", kTcRouter},
+                                         {"ssm", kTcSsm}, {"hc", kTcHc}, {"ple", kTcPle}})
+            if (v.find(word) != std::string::npos) r |= bit;
+        if (const char* i = std::getenv("STRATA_BF16_TC_SKIP_INDEXER"); i && std::atoi(i) != 0) r |= kTcIndexer;
+        if (r != 0)
+            std::fprintf(stderr, "strata: STRATA_BF16_TC_SKIP: %s%s%s%s%skeep cuBLAS's BF16 GEMM\n", r & kTcIndexer ? "indexer " : "",
+                         r & kTcRouter ? "router " : "", r & kTcSsm ? "ssm " : "", r & kTcHc ? "hc " : "", r & kTcPle ? "ple " : "");
+        return r;
+    }();
+    return m;
+}
+unsigned bf16_tc_class(const std::string& name) {
+    if (name.find("indexer.") != std::string::npos) return kTcIndexer;
+    if (name.find("ffn_gate_inp.weight") != std::string::npos) return kTcRouter;
+    if (name.find("ssm_alpha") != std::string::npos || name.find("ssm_beta") != std::string::npos) return kTcSsm;
+    if (name.find("hc_") != std::string::npos) return kTcHc;
+    return 0;
+}
+struct TcHold {   // holds gm on cuBLAS's BF16 GEMM for its lifetime when `cls` is skipped
+    Gemm& gm; bool on;
+    TcHold(Gemm& g, unsigned cls) : gm(g), on((bf16_tc_skip() & cls) != 0) { if (on) gm.hold_bf16_tc(true); }
+    ~TcHold() { if (on) gm.hold_bf16_tc(false); }
+};
 // STRATA_HANDOFF_PIPE=P (opt-in, 2..16; unset/0/1 = the one copy): a layer split hands a chunk's rows on in P row pieces.
 // The stage records an event when its chunk's work is done and one after each piece's copy into the pinned hand-off
 // buffer, waits on the host only for the first (what on_stage_chunk's checkpoint parts and the error check need), and
@@ -1188,6 +1219,31 @@ bool pf_wmma() {
     return on;
 #endif
 }
+// STRATA_MMQ_KQ_LAYERS=a-b,c,... (with STRATA_MMQ_KQ=1): only these layers' K-quant experts (Q4_K / Q5_K / Q6_K /
+// Q5_1) go through int8 MMQ; the other layers keep the FP16 dequant path. Unset: every layer.
+bool mmq_kq_layer(int64_t l, int gt, int dt) {
+    static const std::vector<char> on = [] {
+        std::vector<char> r;
+        const char* e = std::getenv("STRATA_MMQ_KQ_LAYERS");
+        if (e == nullptr || e[0] == '\0') return r;
+        r.assign(256, 0);
+        const std::string v = e;
+        for (size_t i = 0; i < v.size();) {
+            size_t j = v.find(',', i);
+            if (j == std::string::npos) j = v.size();
+            const std::string t = v.substr(i, j - i);
+            const size_t d = t.find('-');
+            const int a = std::atoi(t.c_str()), b = d == std::string::npos ? a : std::atoi(t.c_str() + d + 1);
+            for (int k = std::max(a, 0); k <= b && k < 256; ++k) r[(size_t) k] = 1;
+            i = j + 1;
+        }
+        std::fprintf(stderr, "strata: STRATA_MMQ_KQ_LAYERS=%s: the K-quant experts of the other layers keep the FP16 path\n", e);
+        return r;
+    }();
+    const auto kq = [](int t) { return t == 12 || t == 13 || t == 14 || t == 7; };   // GGML_TYPE_Q4_K, Q5_K, Q6_K, Q5_1
+    if (on.empty() || (!kq(gt) && !kq(dt))) return true;
+    return l >= 0 && l < (int64_t) on.size() && on[(size_t) l];
+}
 const MmqPlan& mmq_plan() {
     static const MmqPlan plan = [] {
         MmqPlan p;
@@ -1217,6 +1273,7 @@ const MmqPlan& mmq_plan() {
                 if (on && lay.native && fused::native_supported(gt, dt)) { p.fo[(size_t) l] = 1; p.any = true; }
                 continue;
             }
+            if (!mmq_kq_layer(l, gt, dt)) { p.fallback = true; continue; }
             p.layer[(size_t) l] = 1;
             p.any = true;
             p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(gt, 1280, N));
@@ -1560,7 +1617,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         // the hyper-connection's xn16 straight as the FP16 the tensor-core GEMM reads (its two readers then skip the
         // conversion pass; the same values): STRATA_XN_F16=0 keeps the BF16 image
         static const bool xn_env = [] { const char* e = std::getenv("STRATA_XN_F16"); return e == nullptr || e[0] != '0'; }();
-        m.xn_f16 = xn_env && !m.f16_io && m.gemm.bf16_converts_x();
+        m.xn_f16 = xn_env && !m.f16_io && m.gemm.bf16_converts_x() && !(bf16_tc_skip() & kTcHc);
     }
     if (!carve(T, &o)) {
         size_t fb = 0, tb = 0;
@@ -1867,9 +1924,12 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         strata::kernels::add_streams_broadcast(h2, e2, Rm, Nn, (int) g.hc, (int) nb, m.cs);
         // the attention hyper-connection's read (its mixed input only: this pass writes nothing back)
         gr_norm_rs(Rm, w_hn, EPS, grs, xn16, nb, m.cs);
-        m.gemm.bf16(xn16, w_dn, lo, nb, LR, HCN);
-        gr_silu(lo, lo16, nb, m.cs);
-        m.gemm.bf16(lo16, w_up, gated, nb, HCN, LR);
+        {
+            const TcHold hc_hold(m.gemm, kTcHc);
+            m.gemm.bf16(xn16, w_dn, lo, nb, LR, HCN);
+            gr_silu(lo, lo16, nb, m.cs);
+            m.gemm.bf16(lo16, w_up, gated, nb, HCN, LR);
+        }
         gr_mix_r(Rm, grs, w_hn, gated, mixed, nullptr, nb, m.cs, mixed_h);
         // K and V into the drafter's cache, as the prompt path's QSA layers append theirs
         proj(mixed, mixed_h, w_k, Kc, nb, KV, Nn, 0);
@@ -2520,6 +2580,7 @@ bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y
 bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
                std::string& err, int64_t ldy = 0, const uint16_t* X_lo = nullptr, int64_t ldx = 0,
                void* stream = nullptr, bool x_f16 = false) {
+    const TcHold hold(gm, bf16_tc_class(name));
     if (w->kind != core::WeightKind::Bf16InF32 || !w->data) { err = "prefill: " + name + " is not a resident BF16 tensor"; return false; }
     const uint16_t* wb = (const uint16_t*) w->data;
     if (w->q8_scale != nullptr) {
@@ -3177,6 +3238,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     uint16_t* e16 = (uint16_t*) carve_f((size_t) nb * N / 2);
                     uint16_t* e16_lo = bf16x2(m.f16_io) ? (uint16_t*) carve_f((size_t) nb * N / 2) : nullptr;
                     const float* emb = m.ple_emb + s0 * N;
+                    const TcHold ple_hold(m.gemm, kTcPle);
                     if (pw.key_bf16 != nullptr) {
                         to_bf16(emb, e16, nb * N, m.cs, e16_lo);
                         m.gemm.bf16(e16, pw.key_bf16, key, nb, HD, N);
@@ -3517,16 +3579,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                           ? std::atoll(std::getenv("STRATA_QSA_DUMP_LAST")) : 4096;
                         static const int only = std::getenv("STRATA_QSA_DUMP_LAYER") ? std::atoi(std::getenv("STRATA_QSA_DUMP_LAYER")) : -1;
                         if (p0 + T > pos0 + n - last && (only < 0 || only == (int) qsa_index)) {
-                            std::vector<int32_t> h((size_t) (T * m.cap));
-                            cudaMemcpyAsync(h.data(), m.sel_ids, h.size() * 4, cudaMemcpyDeviceToHost, m.cs);
+                            // STRATA_QSA_DUMP_TRIM=1: only the rows inside the last positions (pos0 / T of the header follow)
+                            static const bool trim = std::getenv("STRATA_QSA_DUMP_TRIM") != nullptr;
+                            const int64_t r0 = trim ? std::max<int64_t>(0, pos0 + n - last - p0) : 0, nr = T - r0;
+                            std::vector<int32_t> h((size_t) (nr * m.cap));
+                            cudaMemcpyAsync(h.data(), m.sel_ids + r0 * m.cap, h.size() * 4, cudaMemcpyDeviceToHost, m.cs);
                             cudaStreamSynchronize(m.cs);
+                            static std::mutex dump_mu;   // a layer split's stages read their chunks on their own threads
+                            const std::lock_guard<std::mutex> lk(dump_mu);
                             if (std::FILE* f = std::fopen(dump, "ab")) {
-                                const int32_t hdr[4] = {(int32_t) qsa_index, (int32_t) p0, (int32_t) T, (int32_t) m.cap};
+                                const int32_t hdr[4] = {(int32_t) qsa_index, (int32_t) (p0 + r0), (int32_t) nr, (int32_t) m.cap};
                                 std::fwrite(hdr, 4, 4, f);
                                 std::fwrite(h.data(), 4, h.size(), f);
                                 if (std::getenv("STRATA_QSA_DUMP_STEPS")) {
-                                    std::vector<int32_t> sv((size_t) (T * strata::kernels::kStepCount));
-                                    cudaMemcpy(sv.data(), m.steps_dev, sv.size() * 4, cudaMemcpyDeviceToHost);
+                                    std::vector<int32_t> sv((size_t) (nr * strata::kernels::kStepCount));
+                                    cudaMemcpy(sv.data(), m.steps_dev + r0 * strata::kernels::kStepCount, sv.size() * 4,
+                                               cudaMemcpyDeviceToHost);
                                     std::fwrite(sv.data(), 4, sv.size(), f);
                                 }
                                 std::fclose(f);
@@ -3604,6 +3672,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const int32_t pos = (int32_t) posl[l & 63];
                             posl[l & 63] += T;
                             cudaStreamSynchronize((cudaStream_t) m.cs);
+                            static std::mutex feat_mu;   // one file for every stage's thread: whole records
+                            const std::lock_guard<std::mutex> lk(feat_mu);
                             if (ff != nullptr) {
                                 std::vector<int32_t> hid((size_t) T * K); std::vector<float> hw((size_t) T * K);
                                 cudaMemcpy(hid.data(), m.ids, hid.size() * 4, cudaMemcpyDeviceToHost);
@@ -3619,6 +3689,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     cudaMemcpy(hx.data(), m.mixed_bf, hx.size() * 2, cudaMemcpyDeviceToHost);
                                     std::fwrite(hx.data(), 2, hx.size(), ff);
                                 }
+                                std::fflush(ff);
                             }
                             auto it = ovr.find({(int32_t) l, pos});
                             if (it != ovr.end() && (int64_t) it->second.ids.size() == T * K) {
@@ -5083,6 +5154,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             std::fprintf(stderr, "strata f16 range: %lld tokens: activation images max |x| %.1f (%llu beyond 65504 or NaN), "
                                  "BF16 weights max |w| %.3f (%llu), FP16 GEMM outputs max |y| %.1f (%llu not finite)\n",
                          (long long) n, xm, xo, wy[0], wyo[0], wy[1], wyo[1]);
+#if !defined(__HIPCC__)
+        // CUDA: what STRATA_BF16_TC's conversions met on every card (a layer split's stages are on their own devices)
+        int nd = 0, cur = 0;
+        if (f16_range && cudaGetDevice(&cur) == cudaSuccess && cudaGetDeviceCount(&nd) == cudaSuccess) {
+            float mx[2] = {0.0f, 0.0f};
+            unsigned long long cl[2] = {0, 0}, sub[2] = {0, 0}, tot[2] = {0, 0};
+            for (int d = 0; d < nd; ++d) {
+                float a[2]; unsigned long long b[2], c[2], t[2];
+                if (cudaSetDevice(d) != cudaSuccess || !gemm_tc_range_read(a, b, c, t, true)) continue;
+                for (int k = 0; k < 2; ++k) { mx[k] = std::max(mx[k], a[k]); cl[k] += b[k]; sub[k] += c[k]; tot[k] += t[k]; }
+            }
+            cudaSetDevice(cur);
+            if (tot[0] + tot[1] > 0)
+                std::fprintf(stderr, "strata f16 range (BF16_TC): %lld tokens: weights max |w| %.3f, %llu clamped, %llu of %llu "
+                                     "subnormal in FP16; activations max |x| %.1f, %llu clamped, %llu of %llu subnormal in FP16\n",
+                             (long long) n, mx[0], cl[0], sub[0], tot[0], mx[1], cl[1], sub[1], tot[1]);
+        }
+#endif
     }
     if (pt.on) {
         pt.fold();
