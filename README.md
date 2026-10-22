@@ -11,6 +11,10 @@
 
 <p align="center">Support for NVIDIA, AMD, Intel · Windows, Linux, Mac · free and open source</p>
 
+> **This fork (ksanislo/Strata):** upstream Strata plus several conversations at once on a multi-card layer split
+> (8 slots, a fast lane for short chats, batched prompt reads) and Turing / Tesla T4 tuning. All of it is off unless
+> switched on in the run config: see [docs/MULTI_CONVERSATION_T4.md](docs/MULTI_CONVERSATION_T4.md).
+
 <p align="center">
   <a href="https://github.com/Niko1221/Strata/releases/latest"><img src="https://img.shields.io/github/v/release/Niko1221/Strata?include_prereleases&label=release" alt="Latest release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/Niko1221/Strata" alt="MIT license"></a>
