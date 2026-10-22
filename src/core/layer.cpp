@@ -4,6 +4,7 @@
 #include "strata/core/on_device.hpp"
 #include "strata/core/slot_sizing.hpp"
 #include "strata/core/pin_budget.hpp"
+#include "strata/platform/numa.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/bf16_bits.hpp"
@@ -604,6 +605,8 @@ uint8_t* kv_host_alloc(uint64_t bytes) {
     auto register_anon = [](uint64_t n) -> uint8_t* {
         void* m = mmap(nullptr, (size_t) n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (m == MAP_FAILED) return nullptr;
+        if (const int node = strata::core::numa_place_current_node(); node >= 0)   // STRATA_NUMA_PLACE: the stage's node
+            (void) strata::platform::numa_bind(m, n, node, strata::platform::numa_place_mode() == 2);
         if (cudaHostRegister(m, (size_t) n, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
             (void) cudaGetLastError();
             munmap(m, (size_t) n);
