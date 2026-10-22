@@ -4,6 +4,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -15,6 +16,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace cpu = strata::kernels::cpu;
@@ -367,6 +369,48 @@ int main(int argc, char** argv) {
         }
     }
 #endif
+    {   // STRATA_STAGE_SERVE: two pools on explicit cores, each run from its own thread at once, match one pool
+        const int n = 7;
+        auto make = [&](std::vector<cpu::ExpertJobMulti>& jobs, std::vector<float>& out) {
+            jobs.assign(n, {});
+            out.assign((size_t) n * cpu::MAXT * cpu::H, 0.0f);
+            for (int e = 0; e < n; ++e) {
+                jobs[e].blob = blob.data();
+                jobs[e].nt = e % 2 == 0 ? 1 : cpu::MAXT;
+                for (int t = 0; t < jobs[e].nt; ++t) {
+                    jobs[e].nact[t] = act[t].data();
+                    jobs[e].out[t] = out.data() + ((size_t) e * cpu::MAXT + t) * cpu::H;
+                }
+            }
+        };
+        std::vector<cpu::ExpertJobMulti> rj, ja, jb;
+        std::vector<float> ref, oa, ob;
+        make(rj, ref);
+        { cpu::ExpertPool baseline(3, false); baseline.run_split_multi_native(f, rj.data(), n); }
+        make(ja, oa);
+        make(jb, ob);
+        const std::vector<int> all = cpu::physical_cores(false);
+        const size_t half = all.size() / 2;
+        const std::vector<int> ca(all.begin(), all.begin() + (std::ptrdiff_t) half), cb(all.begin() + (std::ptrdiff_t) half, all.end());
+        std::atomic<int> bad{0};
+        auto one = [&](const std::vector<int>& cores, std::vector<cpu::ExpertJobMulti>& jobs, std::vector<float>& out) {
+            cpu::ExpertPool pool(cores, /*host_works=*/true, 0);
+            for (int r = 0; r < 200; ++r) {
+                std::fill(out.begin(), out.end(), 0.0f);
+                pool.run_split_multi_native(f, jobs.data(), n);
+                if (std::memcmp(ref.data(), out.data(), out.size() * sizeof(float)) != 0) { ++bad; return; }
+            }
+        };
+        std::thread ta([&] { one(ca, ja, oa); });
+        std::thread tb([&] { one(cb, jb, ob); });
+        ta.join();
+        tb.join();
+        if (bad.load() != 0) {
+            std::fprintf(stderr, "mismatch: two stage pools at once (%zu + %zu cores)\n", ca.size(), cb.size());
+            return 1;
+        }
+        checks += 400;
+    }
     std::printf("pool tasks: %d bitwise comparisons passed, %d of them in NUMA-split mode (%d with modes 0-4 "
                 "interleaved)\n", checks + split_checks + mixed_checks, split_checks + mixed_checks, mixed_checks);
     return 0;
