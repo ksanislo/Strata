@@ -1326,6 +1326,31 @@ class UnfinishedToolCall(unittest.TestCase):
             httpd.server_close()
         return out
 
+    def test_a_cut_call_stays_visible_as_text(self):
+        """The soak's "empty" answers: max_tokens cut a call the model was writing, and the whole (non-streamed) answer
+        had no content and no call.  The part written is its text now."""
+        tok = ByteTokenizer()
+        for path, text_of in (("/v1/chat/completions", lambda r: r["choices"][0]["message"]["content"]),
+                              ("/v1/messages", lambda r: "".join(b.get("text", "") for b in r["content"]))):
+            svc = Service(MockEngine(tok, self.CUT, max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+            httpd = serve(svc, port=0)
+            try:
+                body = {"model": "x", "max_tokens": 500, "messages": [{"role": "user", "content": "save my notes"}],
+                        "tools": [{"type": "function", "function": {"name": "write", "parameters": {
+                            "type": "object", "properties": self.PROPS}}}] if "chat" in path else
+                        [{"name": "write", "input_schema": {"type": "object", "properties": self.PROPS}}]}
+                req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}{path}",
+                                             data=json.dumps(body).encode(), headers={
+                                                 "Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    text = text_of(json.loads(r.read().decode()))
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+            with self.subTest(path=path):
+                self.assertIn('"name": "write"', text or "")
+                self.assertIn("first half of the fi", text or "")
+
     def test_a_cut_call(self):
         cut = '{"path":"notes.txt","content":"first half of the fi'
         self.assertEqual(self.answers(self.CUT), {
