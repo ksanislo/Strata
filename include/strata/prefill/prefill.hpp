@@ -258,10 +258,11 @@ public:
         int64_t tokens = 0, share = 128, chunk = 0, shrink = 0;
     };
     void set_urgent_wait(bool on) { urgent_wait_.store(on, std::memory_order_release); }
-    /// The queue's worker, before each chunk but one with an urgent piece, on its own thread with nothing of the prompt
-    /// path held: may wait (the decode share, STRATA_BATCH_READS_DECODE_WINDOWS), never compute. `chunk_ms`: the last
-    /// chunk's stage-0 time. Set while the queue is idle.
+    /// Each stage before each queued chunk but one with an urgent read (stage 0: the queue's worker; a later stage: its
+    /// hand-off thread), with nothing of the prompt path held: may wait (the decode share,
+    /// STRATA_BATCH_READS_DECODE_WINDOWS), never compute. `chunk_ms`: that stage's last chunk time. Set while idle.
     std::function<void(double chunk_ms)> between_chunks;
+    double last_chunk_ms_ = -1.0;   ///< (a later stage: its last queued chunk's time, set on its hand-off thread)
     static BatchFast batch_fast();
     static BatchPlan plan_batch(const std::deque<std::shared_ptr<PromptJob>>& q, int max_segs, int64_t budget,
                                 const BatchFast& fast, int64_t fast_cap, bool single_ok = false);
