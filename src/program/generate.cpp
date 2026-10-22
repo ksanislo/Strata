@@ -17587,6 +17587,62 @@ int main(int argc, char** argv) {
                     }
                     return true;
                 };
+                // STRATA_BATCH_READS: a slot's state as numbers, so a difference reads as rounding (small) or a leak
+                // (of the order of the values): GDN states and pooled indexer keys (FP32), K/V codes (INT8)
+                struct Snap { std::vector<float> f; std::vector<int8_t> q; };
+                auto snap_slot = [&](int b, Snap& o, std::string& e) -> bool {
+                    o = Snap{};
+                    auto addf = [&](const uint8_t* p, size_t n) {
+                        const size_t k = o.f.size();
+                        o.f.resize(k + n / 4);
+                        std::memcpy(o.f.data() + k, p, (n / 4) * 4);
+                    };
+                    auto addq = [&](const uint8_t* p, size_t n) {
+                        const size_t k = o.q.size();
+                        o.q.resize(k + n);
+                        std::memcpy(o.q.data() + k, p, n);
+                    };
+                    for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                        const strata::core::OnDevice on_k(dev_of(k));
+                        strata::core::SessionState& x = *bslot_ss[k][(size_t) b];
+                        if (strata::core::device_sync() != cudaSuccess) { e = "device sync"; return false; }
+                        strata::core::ConversationCheckpoint ck;
+                        ck.ids = ids32;
+                        if (!strata::core::conversation_checkpoint_save(ck, x, g, e)) return false;
+                        addf(ck.gdn.data(), ck.gdn.size());
+                        for (int64_t j = 0; j < x.qsa_alloc; ++j) {
+                            strata::core::ConversationKv img;
+                            if (!strata::core::conversation_kv_save(img, x.qsa_states[x.qsa_ord0 + j], g, len, true, e))
+                                return false;
+                            img.pooled.visit(0, img.pooled.size(), [&](const uint8_t* p, size_t n, size_t) { addf(p, n); return true; });
+                            img.k.visit(0, img.k.size(), [&](const uint8_t* p, size_t n, size_t) { addq(p, n); return true; });
+                            img.v.visit(0, img.v.size(), [&](const uint8_t* p, size_t n, size_t) { addq(p, n); return true; });
+                        }
+                    }
+                    return true;
+                };
+                auto snap_diff = [](const Snap& a, const Snap& b) {
+                    if (a.f.size() != b.f.size() || a.q.size() != b.q.size()) return std::string("sizes differ");
+                    double d2 = 0, a2 = 0, dm = 0, am = 0;
+                    for (size_t i = 0; i < a.f.size(); ++i) {
+                        if (!std::isfinite(a.f[i]) || !std::isfinite(b.f[i])) continue;
+                        const double d = (double) a.f[i] - b.f[i];
+                        d2 += d * d; a2 += (double) a.f[i] * a.f[i];
+                        dm = std::max(dm, std::fabs(d)); am = std::max(am, std::fabs((double) a.f[i]));
+                    }
+                    int64_t qd = 0, qs = 0;
+                    for (size_t i = 0; i < a.q.size(); ++i) {
+                        const int d = std::abs((int) a.q[i] - (int) b.q[i]);
+                        qd += d != 0; qs += d;
+                    }
+                    char buf[200];
+                    std::snprintf(buf, sizeof buf, "FP32 rel RMS %.2e, max |d| %.2e of max |x| %.2e; K/V codes %.3f%% differ, "
+                                  "mean |d| %.2f", a2 > 0 ? std::sqrt(d2 / a2) : 0.0, dm, am,
+                                  a.q.empty() ? 0.0 : 100.0 * (double) qd / (double) a.q.size(), qd ? (double) qs / (double) qd : 0.0);
+                    return std::string(buf);
+                };
+                const bool br_diag = strata::prefill::Prefill::batch_reads_max() > 0 && N >= 2;
+                Snap sn_seq0, sn_seq1;
                 std::mutex mu;
                 std::vector<double> done_ms((size_t) N, -1.0);
                 std::vector<std::string> errs((size_t) N);
@@ -17618,6 +17674,7 @@ int main(int argc, char** argv) {
                 const double seq_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_seq).count();
                 const std::vector<double> seq_done = done_ms;
                 for (int b = 0; b < N; ++b) if (!hash_slot(b, h_seq[(size_t) b], err)) return false;
+                if (br_diag && (!snap_slot(0, sn_seq0, err) || !snap_slot(1, sn_seq1, err))) return false;
                 // all queued at once: stage 0 reads prompt b+1 while the later stages finish prompt b
                 std::fill(done_ms.begin(), done_ms.end(), -1.0);
                 for (int b = 0; b < N; ++b) if (!zero_slot(b)) { err = "PFMULTI: zeroing a slot failed"; return false; }
@@ -17630,6 +17687,8 @@ int main(int argc, char** argv) {
                 sp.drain_jobs();
                 const double multi_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_multi).count();
                 for (int b = 0; b < N; ++b) if (!hash_slot(b, h_multi[(size_t) b], err)) return false;
+                std::vector<Snap> sn_multi((size_t) (br_diag ? N : 0));
+                for (int b = 0; br_diag && b < N; ++b) if (!snap_slot(b, sn_multi[(size_t) b], err)) return false;
                 int same = 0;
                 std::string failed;
                 for (int b = 0; b < N; ++b) {
@@ -17675,6 +17734,8 @@ int main(int argc, char** argv) {
                         same_sl += h_sl[(size_t) b] == h_multi[(size_t) b];
                         if (!errs[(size_t) b].empty()) failed += " slot " + std::to_string(b) + " (pieces): " + errs[(size_t) b];
                     }
+                    Snap sn_pieces0;
+                    if (!snap_slot(0, sn_pieces0, err)) return false;
                     // slot 0's prompt batched beside OTHER prompts (the same length, the tokens reversed): its bits must
                     // not depend on what its companions hold (their rows only share the token-independent work)
                     for (int b = 0; b < N; ++b) if (!zero_slot(b)) { err = "PFMULTI: zeroing a slot failed"; return false; }
@@ -17690,6 +17751,21 @@ int main(int argc, char** argv) {
                     sp.drain_jobs();
                     uint64_t h_mix = 0;
                     if (!hash_slot(0, h_mix, err)) return false;
+                    Snap sn_mix;
+                    if (!snap_slot(0, sn_mix, err)) return false;
+                    // the yardsticks: the same prompt read alone twice (two slots one by one: must be 0), and read
+                    // alone in other chunks (one by one vs the batch's pieces alone): what rounding alone moves
+                    std::fprintf(stderr, "strata serve: PFMULTI STRATA_BATCH_READS diff: one by one slot 1 vs 0: %s\n",
+                                 snap_diff(sn_seq0, sn_seq1).c_str());
+                    for (int b = 1; b < N; ++b)
+                        std::fprintf(stderr, "strata serve: PFMULTI STRATA_BATCH_READS diff: batched slot %d vs 0: %s\n", b,
+                                     snap_diff(sn_multi[0], sn_multi[(size_t) b]).c_str());
+                    std::fprintf(stderr, "strata serve: PFMULTI STRATA_BATCH_READS diff: slot 0 beside other prompts vs beside "
+                                         "copies: %s\n", snap_diff(sn_multi[0], sn_mix).c_str());
+                    std::fprintf(stderr, "strata serve: PFMULTI STRATA_BATCH_READS diff: batched slot 0 vs one by one: %s\n",
+                                 snap_diff(sn_seq0, sn_multi[0]).c_str());
+                    std::fprintf(stderr, "strata serve: PFMULTI STRATA_BATCH_READS diff: (rounding yardstick) the batch's pieces "
+                                         "read alone vs one by one, slot 0: %s\n", snap_diff(sn_seq0, sn_pieces0).c_str());
                     std::fprintf(stderr, "strata serve: PFMULTI STRATA_BATCH_READS: %zu pieces a prompt (chunk %lld); batched "
                                          "slots identical to each other %d of %d; slot 0 beside other prompts %s; to the "
                                          "same pieces read alone %d of %d (alone %.0f ms); to one by one %s%s%s\n",
