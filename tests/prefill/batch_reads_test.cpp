@@ -83,6 +83,44 @@ int main() {
         expect(p3.at == std::vector<size_t>({0, 2}), "a cancelled prompt is left to end the usual way");
         expect(Prefill::plan_batch(q, 1, 2048).at.empty(), "off below two");
     }
+    {   // STRATA_BATCH_READS_FAST: a short urgent read anywhere in the queue goes in the next chunk whole; the others a
+        // small share each, the chunk under the cap; a lone urgent read behind other pieces goes alone, first
+        Prefill::BatchFast f;
+        f.tokens = 512;
+        f.share = 128;
+        std::deque<std::shared_ptr<PromptJob>> q;
+        q.push_back(job(&sa, 2048, 1000));
+        q.push_back(job(&sb, 2048));
+        q.push_back(job(&sa, 2048));
+        q.push_back(job(&sc, 2048));
+        q.push_back(job(&sd, 30));
+        q.back()->urgent = true;
+        const Prefill::BatchPlan p = Prefill::plan_batch(q, 8, 2048, f, 1023);
+        expect(p.fast && p.at == std::vector<size_t>({0, 1, 3, 4}) && p.got == v({128, 128, 128, 30}),
+               "fast: the short read whole, every other reader 128");
+        const Prefill::BatchPlan p2 = Prefill::plan_batch(q, 8, 2048, f, 300);
+        expect(p2.fast && p2.got == v({90, 90, 90, 30}), "fast: the others share what the cap leaves");
+        const Prefill::BatchPlan p3 = Prefill::plan_batch(q, 2, 2048, f, 1023);
+        expect(p3.fast && p3.at == std::vector<size_t>({0, 4}) && p3.got == v({128, 30}), "fast: at most max_segs");
+        q.back()->urgent = false;
+        const Prefill::BatchPlan p4 = Prefill::plan_batch(q, 8, 2048, f, 1023);
+        expect(!p4.fast && p4.at.size() == 4, "nothing urgent: the usual shares");
+        std::deque<std::shared_ptr<PromptJob>> lone;
+        lone.push_back(job(&sa, 2048));
+        lone.push_back(job(&sa, 2048));
+        lone.push_back(job(&sb, 40));
+        lone.back()->urgent = true;
+        const Prefill::BatchPlan p5 = Prefill::plan_batch(lone, 8, 2048, f, 1023);
+        expect(p5.fast && p5.at == std::vector<size_t>({0, 2}) && p5.got == v({128, 40}), "fast beside one reader");
+        std::deque<std::shared_ptr<PromptJob>> only;
+        only.push_back(job(nullptr, 2048));
+        only.push_back(job(&sb, 40));
+        only.back()->urgent = true;
+        const Prefill::BatchPlan p6 = Prefill::plan_batch(only, 8, 2048, f, 1023);
+        expect(p6.fast && p6.at == std::vector<size_t>({1}) && p6.got == v({40}), "fast alone, ahead of the queue");
+        f.tokens = 0;
+        expect(!Prefill::plan_batch(only, 8, 2048, f, 1023).fast, "FAST=0: off");
+    }
     if (fails == 0) std::printf("batch_reads_test: ok\n");
     return fails == 0 ? 0 : 1;
 }
