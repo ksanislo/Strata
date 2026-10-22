@@ -11896,7 +11896,10 @@ int main(int argc, char** argv) {
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
                                        " batch_groups=" + std::to_string(o.batch_groups) +
-                                       (slot_admit ? " slot_admit=1" : "")).c_str() : "");
+                                       (slot_admit ? " slot_admit=1" : "") +
+                                       // STRATA_PIPED_MTP: a window holds live slots only, so an idle slot keeps its
+                                       // conversation for its next turn (the server picks slots by what they hold)
+                                       (piped_mtp ? " slot_keep=1" : "")).c_str() : "");
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
