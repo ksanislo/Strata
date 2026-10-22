@@ -12134,10 +12134,11 @@ int main(int argc, char** argv) {
             }
             if (v == kmem_last) return;
             kmem_last = v;
-            std::printf("KMEM %zu", bslot_ss.size());
+            std::string ln = "KMEM " + std::to_string(bslot_ss.size());   // one write: other threads print lines too
             for (size_t k = 0; k < bslot_ss.size(); ++k)
-                std::printf(" %d %llu %llu", eslot_dev(k), (unsigned long long) v[2 * k], (unsigned long long) v[2 * k + 1]);
-            std::printf("\n");
+                ln += " " + std::to_string(eslot_dev(k)) + " " + std::to_string(v[2 * k]) + " " + std::to_string(v[2 * k + 1]);
+            ln += "\n";
+            std::fwrite(ln.data(), 1, ln.size(), stdout);
             std::fflush(stdout);
         };
         // ---- STRATA_ELASTIC_SLOTS_GIVE: per card, the expert cache gives the slot budget whole chunks from the slots
