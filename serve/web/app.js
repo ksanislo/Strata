@@ -367,39 +367,34 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, agg, 
   }
   spark("sp-disk", h.disk_read_mb);
 
-  // context memory: what every slot's conversation takes of the cards' slot budget (the engine's KMEM lines); without
-  // that, the slots' context in tokens, and with no slots the running request's context as before
+  // context: how close anything is to a limit - the longest conversation against the context limit (any setup), and
+  // with the engine's KMEM lines the cards' context memory against the slots' budget plus what the expert cache can
+  // give.  The arc is the nearer of the two; each slot's own fill is in its Slot block
+  const ctxMax = eng.max_context || 0;
+  const ctxConv = new Map((conv || []).filter((c) => c.slot != null).map((c) => [c.slot, c]));
+  const held = (live.slots || []).map((x) => {
+    const c = ctxConv.get(x.slot);
+    return c ? (c.state === "reading" ? c.prompt_tokens || 0 : c.context_tokens || 0) : x.held_tokens || 0;
+  });
+  if (!held.length) {   // one conversation at a time: the running request, else the last one
+    if (live.state !== "idle") held.push((live.prompt_tokens || 0) + (live.generated || 0));
+    else if (last) held.push((last.prompt_tokens || 0) + (last.output_tokens || 0));
+  }
+  const longest = held.length ? Math.max(...held) : 0, n = held.filter((t) => t > 0).length;
+  let frac = ctxMax ? Math.min(1, longest / ctxMax) : 0;
+  const parts = [ctxMax ? `longest ${kfmt(longest)} / ${ctxfmt(ctxMax)}` : "–"];
+  if (n > 1) parts.push(`${n} conversations`);
   const sm = eng.slot_memory;
-  let frac = 0, sub = "–";
   if (sm && sm.length) {
-    // the limit: the slots' budget plus what the expert cache can still give them (it grows on demand); the card
-    // nearest its own limit decides when a conversation can grow no more
     const lim = (c) => c.total + (c.givable || 0), use = (c) => c.total - c.free;
     const total = sm.reduce((t, c) => t + lim(c), 0), used = sm.reduce((t, c) => t + use(c), 0);
+    // the card nearest its own limit decides when a conversation can grow no more
     const hot = sm.reduce((a, c) => (lim(c) && use(c) / lim(c) > use(a) / (lim(a) || 1) ? c : a), sm[0]);
-    frac = lim(hot) ? Math.min(1, use(hot) / lim(hot)) : 0;
-    sub = `${gb(used)} of ${gb(total)} GB` + (sm.length > 1 ? ` · fullest GPU ${hot.device}` : "");
-    $("ctx-title").textContent = "Context memory";
-  } else if ((live.slots || []).length) {
-    // slots, no memory figure yet (an engine without KMEM lines): every slot's context against all the slots' room
-    const bySlot = new Map((conv || []).filter((c) => c.slot != null).map((c) => [c.slot, c]));
-    const used = live.slots.reduce((t, x) => {
-      const c = bySlot.get(x.slot);
-      return t + (c ? (c.state === "reading" ? c.prompt_tokens || 0 : c.context_tokens || 0) : x.held_tokens || 0);
-    }, 0);
-    const room = live.slots.length * (eng.max_context || 0);
-    frac = room ? Math.min(1, used / room) : 0;
-    sub = room ? `${kfmt(used)} / ${ctxfmt(room)} in ${live.slots.length} slots` : "–";
-    $("ctx-title").textContent = "Context in slots";
-  } else {
-    const ctx = eng.max_context || 0;
-    let used = 0;
-    if (live.state !== "idle") used = (live.prompt_tokens || 0) + (live.generated || 0);
-    else if (last) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
-    frac = ctx ? Math.min(1, used / ctx) : 0;
-    sub = ctx ? `${kfmt(used)} / ${ctxfmt(ctx)}` : "–";
-    $("ctx-title").textContent = "Context fill";
+    if (lim(hot)) frac = Math.max(frac, Math.min(1, use(hot) / lim(hot)));
+    parts.push(`${gb(used)} / ${gb(total)} GB`);
   }
+  const sub = parts.join(" · ");
+  $("ctx-title").textContent = "Context";
   $("ctx-fill").setAttribute("stroke-dasharray", `${(235.6 * frac).toFixed(1)} 314.2`);
   $("ctx-fill").style.opacity = 235.6 * frac >= 3 ? "1" : "0";         // a near-zero arc would draw just its round cap
   $("ctx-pct").textContent = `${Math.round(frac * 100)}%`;
