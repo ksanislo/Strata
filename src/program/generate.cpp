@@ -132,6 +132,7 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 
 #include <array>
 #include <chrono>
+#include <csignal>
 #include <algorithm>
 #include <memory>
 #include <iostream>
@@ -15820,6 +15821,11 @@ int main(int argc, char** argv) {
             kmem_note();
             return true;
         };
+        // --serve is driven by its server over stdin (QUIT, or EOF when the server is gone): a SIGTERM / SIGINT sent to
+        // the whole process group (systemd stopping a service, Ctrl+C in a terminal) must not end the engine before
+        // the server's orderly QUIT.  SIGKILL still ends it.
+        std::signal(SIGTERM, SIG_IGN);
+        std::signal(SIGINT, SIG_IGN);
         // an allocation that fails for lack of VRAM (a window graph, the drafter's records) asks for it here: the card's
         // budget spare, and its expert cache when this thread asks and the card is quiet (any other thread: the spare)
         const std::thread::id serve_thread = std::this_thread::get_id();
