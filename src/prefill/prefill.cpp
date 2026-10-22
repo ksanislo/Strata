@@ -5489,23 +5489,77 @@ size_t Prefill::jobs_queued_for(const core::SessionState* s0) const {
     return c;
 }
 
+Prefill::BatchFast Prefill::batch_fast() {
+    static const BatchFast f = [] {
+        auto num = [](const char* k, int64_t d) {
+            const char* v = std::getenv(k);
+            return v != nullptr && v[0] != '\0' ? (int64_t) std::max(0LL, std::atoll(v)) : d;
+        };
+        BatchFast x;
+        x.tokens = batch_reads_max() > 0 ? num("STRATA_BATCH_READS_FAST", 512) : 0;
+        x.share = num("STRATA_BATCH_READS_FAST_SHARE", 128);
+        x.chunk = num("STRATA_BATCH_READS_FAST_CHUNK", 0);
+        return x;
+    }();
+    return f;
+}
+
 Prefill::BatchPlan Prefill::plan_batch(const std::deque<std::shared_ptr<PromptJob>>& q, int max_segs, int64_t budget) {
+    return plan_batch(q, max_segs, budget, BatchFast{}, 0);
+}
+
+Prefill::BatchPlan Prefill::plan_batch(const std::deque<std::shared_ptr<PromptJob>>& q, int max_segs, int64_t budget,
+                                       const BatchFast& fast, int64_t fast_cap) {
     BatchPlan p;
-    if (max_segs < 2 || q.size() < 2 || budget < 2 || !batchable(*q.front())) return p;
-    std::vector<const core::SessionState*> seen;   // a session's later pieces wait for its first one
-    for (size_t i = 0; i < q.size() && (int) p.at.size() < max_segs; ++i) {
+    if (max_segs < 2 || q.empty() || budget < 2) return p;
+    // the first queued piece of every session that can share a chunk (a session's later pieces wait for its first)
+    std::vector<size_t> cand;
+    std::vector<const core::SessionState*> seen;
+    for (size_t i = 0; i < q.size(); ++i) {
         const PromptJob& j = *q[i];
         const core::SessionState* s0 = j.sessions.empty() ? nullptr : j.sessions[0];
         if (s0 != nullptr && std::find(seen.begin(), seen.end(), s0) != seen.end()) continue;
         if (s0 != nullptr) seen.push_back(s0);
-        if (batchable(j)) p.at.push_back(i);
+        if (batchable(j)) cand.push_back(i);
     }
-    if (p.at.size() < 2) {
-        p.at.clear();
-        return p;
+    auto left_of = [&](size_t i) { return (int64_t) q[i]->tokens.size() - q[i]->taken; };
+    // STRATA_BATCH_READS_FAST: a short read waiting for its first tokens goes in the next chunk, whole, wherever it
+    // is queued; the other readers get a small share each so the chunk stays short (below the stream-all size)
+    if (fast.tokens > 0) {
+        std::vector<size_t> urg, oth;
+        for (size_t i : cand) {
+            const bool u = q[i]->urgent && left_of(i) <= fast.tokens;
+            if (u && (int) urg.size() < max_segs) urg.push_back(i);
+            else if (!u) oth.push_back(i);
+        }
+        if (!urg.empty()) {
+            std::vector<int64_t> ul;
+            for (size_t i : urg) ul.push_back(left_of(i));
+            const std::vector<int64_t> ug = batch_shares(ul, budget);
+            int64_t used = 0;
+            for (int64_t g : ug) used += g;
+            const int64_t cap = std::min(budget, std::max(fast_cap, used));
+            const size_t n_o = std::min(oth.size(), (size_t) std::max(0, max_segs - (int) urg.size()));
+            const int64_t share = n_o > 0 ? std::min<int64_t>(fast.share, (cap - used) / (int64_t) n_o) : 0;
+            std::vector<std::pair<size_t, int64_t>> segs;
+            for (size_t k = 0; k < urg.size(); ++k)
+                if (ug[k] > 0) segs.emplace_back(urg[k], ug[k]);
+            for (size_t k = 0; k < n_o && share > 0; ++k) segs.emplace_back(oth[k], std::min(share, left_of(oth[k])));
+            std::sort(segs.begin(), segs.end());   // (queue order)
+            for (const auto& [i, g] : segs) {
+                p.at.push_back(i);
+                p.got.push_back(g);
+            }
+            p.fast = true;
+            return p;
+        }
     }
+    if (q.size() < 2 || !batchable(*q.front())) return p;
+    if (cand.size() > (size_t) max_segs) cand.resize((size_t) max_segs);
+    if (cand.size() < 2) return p;
+    p.at = cand;
     std::vector<int64_t> left;
-    for (size_t i : p.at) left.push_back((int64_t) q[i]->tokens.size() - q[i]->taken);
+    for (size_t i : p.at) left.push_back(left_of(i));
     p.got = batch_shares(left, budget);
     return p;
 }
@@ -5513,7 +5567,9 @@ Prefill::BatchPlan Prefill::plan_batch(const std::deque<std::shared_ptr<PromptJo
 // (queue lock held) STRATA_BATCH_READS: the first queued prompt of up to batch_reads_max() sessions, in queue order, as
 // one chunk of at most the buffers' tokens; null when fewer than two can go (the front one is read the usual way)
 std::shared_ptr<PromptJob> Prefill::take_batch(std::deque<std::shared_ptr<PromptJob>>& q) {
-    const BatchPlan pl = plan_batch(q, batch_reads_max(), batch_budget());
+    const BatchFast fast = batch_fast();
+    const int64_t fast_cap = fast.chunk > 0 ? fast.chunk : std::max<int64_t>(fast.tokens, stream_all_min() - 1);
+    const BatchPlan pl = plan_batch(q, batch_reads_max(), batch_budget(), fast, fast_cap);
     if (pl.at.empty()) return nullptr;
     auto b = std::make_shared<PromptJob>();
     std::vector<size_t> gone;
@@ -5530,15 +5586,15 @@ std::shared_ptr<PromptJob> Prefill::take_batch(std::deque<std::shared_ptr<Prompt
         if (sg.last) gone.push_back(pl.at[k]);
         b->segs.push_back(std::move(sg));
     }
-    if (b->segs.size() < 2) {   // (a budget below the prompts' count: undone, the front one goes alone)
+    if (b->segs.size() < (pl.fast ? 1u : 2u)) {   // (a budget below the prompts' count: undone, the front one goes alone)
         for (auto& sg : b->segs) sg.job->taken -= sg.n;
         return nullptr;
     }
     for (auto it = gone.rbegin(); it != gone.rend(); ++it) q.erase(q.begin() + (std::ptrdiff_t) *it);
     std::string parts;
     for (const auto& sg : b->segs) parts += (parts.empty() ? "" : "+") + std::to_string((long long) sg.n);
-    std::fprintf(stderr, "strata prefill: STRATA_BATCH_READS: one chunk of %zu prompts (%s tokens)\n", b->segs.size(),
-                 parts.c_str());
+    std::fprintf(stderr, "strata prefill: STRATA_BATCH_READS: one %schunk of %zu prompts (%s tokens)\n",
+                 pl.fast ? "fast " : "", b->segs.size(), parts.c_str());
     // a stage that fails the chunk fails every prompt in it; each prompt's own end is reported by the last stage
     b->on_done = [segs = b->segs](bool ok, const std::string& e) {
         if (ok) return;
