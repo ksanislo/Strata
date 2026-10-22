@@ -76,6 +76,7 @@ from serve import owner_guard  # noqa: E402
 from serve import launch_identity  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve.engine_stats import EngineLog, EngineStats  # noqa: E402
+from serve import logctx  # noqa: E402
 from serve import lifeline  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
@@ -508,7 +509,7 @@ def start_failure_hint(log: str | None, offset: int) -> str:
     if DRAFT_HEAD_FAIL not in text:
         return ""
     said = [x.strip()[len("strata mtp: "):] for x in text.splitlines()
-            if x.strip().startswith("strata mtp: ") and ("draft head over" in x or "hint:" in x)]
+            if logctx.unstamp(x).strip().startswith("strata mtp: ") and ("draft head over" in x or "hint:" in x)]
     return ". mtp: " + DRAFT_HEAD_FAIL + ". " + (" ".join(said) if said else "Hint: " + DRAFT_HEAD_HINT)
 
 
@@ -644,7 +645,7 @@ def transient_start_failure(log: str | None, offset: int, elapsed_s: float, rc: 
     except (OSError, ValueError):
         return False
     lines = [x.strip() for x in text.splitlines() if x.strip()]
-    engine_lines = [x for x in lines if not x.startswith("[strata]")]
+    engine_lines = [x for x in lines if not logctx.unstamp(x).startswith("[strata]")]
     if any(m in text for m in TRANSIENT_START_MARKS):
         return all(x.startswith("terminate called") or x.startswith("what()") or
                    any(m in x for m in TRANSIENT_START_MARKS) for x in engine_lines)
@@ -861,6 +862,7 @@ FATAL_PREFIXES = ("ERR verify: timed out at layer ", "ERR verify batch: timed ou
 
 def parse_engine_stage_line(line: str) -> list[dict] | None:
     """Accept only the engine's final, contiguous stage plan (inclusive layer ends)."""
+    line = logctx.unstamp(line)
     prefix = "strata serve: layer split: layers "
     suffix = ", one hand-off per window"
     if not line.startswith(prefix) or not line.rstrip("\r\n").endswith(suffix):
@@ -1076,6 +1078,9 @@ class StrataEngine:
             return
         self.unloaded = False            # `ended` stays True until READY (below): not alive while starting (#344)
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
+        if log and logctx.ENABLED:                       # every line with the time (the engine's through a pipe, below)
+            self.log = logctx.StampedLog(self.log)
+        piped = isinstance(self.log, logctx.StampedLog)
         loading = threading.Event()                     # set once READY: the narrator below stops
         log_start = os.path.getsize(log) if log else 0  # where this start's lines begin (start_failure_hint)
         self.log_start = log_start                      # #596: the Monitor's conversation cache reads from here
@@ -1107,8 +1112,10 @@ class StrataEngine:
         spawned_at = time.monotonic()
         try:
             self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
-                              stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env,
-                              **pin)
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE if piped else self.log, text=True,
+                              encoding="utf-8", errors="replace" if piped else "strict", bufsize=1, env=env, **pin)
+            if piped:
+                threading.Thread(target=logctx.copy_lines, args=(self.proc.stderr, self.log), daemon=True).start()
         except OSError:                                  # nothing started: the narrator stops, the log handle goes back
             loading.set()
             if log:
@@ -1179,7 +1186,7 @@ class StrataEngine:
             note = "" if timed_out else start_exit_note(self.proc.returncode, exe)
             tail = start_log_tail(log, log_start)
             lines = [x for x in tail.split("\n")[2:] if x.strip()]
-            if tail and lines and all(x.strip().startswith("[strata]") for x in lines):
+            if tail and lines and all(logctx.unstamp(x.strip()).startswith("[strata]") for x in lines):
                 tail += "\n  (those are the launcher's own lines: the engine itself wrote nothing)"
             raise EngineDied(why + (f" (see {log})" if log else "") + note +
                              start_failure_hint(log, log_start) + tail)
@@ -1345,6 +1352,9 @@ class StrataEngine:
         msg = session_event_text(f, self.sessions)
         if msg:
             print(f"[strata] sessions: {msg}", flush=True)
+        ev = getattr(self, "events", None)
+        if ev is not None and "sess_event" in f:        # parked, restored, written ... (the event log)
+            ev.write("session", **{k.removeprefix("sess_"): v for k, v in f.items()})
         return True
 
     def death_note(self) -> str:
@@ -1370,7 +1380,8 @@ class StrataEngine:
         if rc is not None and rc >= 0 and self.last_err:  # its own last words on stdout: they say why
             return (f"The engine exited (code {rc}) after it reported: {self.last_err} - please report it at "
                     "github.com/Niko1221/Strata/issues with the log.")
-        last = next((x.strip() for x in reversed(tail.splitlines()) if x.strip().startswith(("strata", "ERR"))), "")
+        last = next((logctx.unstamp(x).strip() for x in reversed(tail.splitlines())
+                     if logctx.unstamp(x).strip().startswith(("strata", "ERR"))), "")
         if rc is not None and rc >= 0 and last:          # it ended by itself: its own last words say why (#215)
             return (f"The engine exited (code {rc}). Its last log line: {last} - if that does not explain it, please "
                     "report it at github.com/Niko1221/Strata/issues with the log.")
@@ -2012,6 +2023,7 @@ class StrataEngine:
                                 if slot is not None:
                                     self.slot_busy[slot] = True
                                     self.slot_claims.add(slot)
+                                    logctx.set_slot(slot)
                                     if admit_wait:
                                         admit_wait = False
                                         self.admitting = max(0, self.admitting - 1)
@@ -3955,6 +3967,10 @@ class Service:
         self.allowed_hosts: list[str] = []
         self.host_names: set[str] = set(LOOPBACK_NAMES)
         self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
+        self.events = None                              # logctx.EventLog ("event_log" in the config)
+        self.conv_ended: dict = {}                      # conversation key -> when its last request ended
+        self.trusted_nets: list = []                    # "trusted_proxies": whose X-Forwarded-For is believed
+        self._asst_ids = False                          # (the assistant turn's opening, tokenized once)
         self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
         # "parallel" (the engine's batch slots): every running request's own status and rate window; self.status
         # then says busy while any runs and shows the newest one
@@ -5237,8 +5253,18 @@ class Service:
         try:
             yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only)
         finally:
+            logctx.end()
             if ka is not None:
                 ka.release()
+
+    def _assistant_ids(self):
+        """The tokens that open an assistant turn (the conversation key ends there), or None."""
+        if self._asst_ids is False:
+            try:
+                self._asst_ids = list(self.tok.encode("<|im_start|>assistant", parse_special=True)) or None
+            except Exception:  # noqa: BLE001 - another tokenizer: the key falls back to the prompt's start
+                self._asst_ids = None
+        return self._asst_ids
 
     def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
              declared_only=False) -> Iterator[tuple[str, object]]:
@@ -5325,6 +5351,13 @@ class Service:
         rate = collections.deque(maxlen=32) if par else self.rate
         request_id = uuid.uuid4().hex[:12]
         setattr(cancel, "_strata_request_id", request_id)
+        conv = logctx.conv_key(ids, self._assistant_ids())
+        logctx.begin(request_id[:4], conv)
+        queued_t = time.time()
+        conv_gap = None
+        if conv is not None:                             # since this conversation's last request ended
+            last_end = self.conv_ended.get(conv)
+            conv_gap = round(queued_t - last_end, 1) if last_end is not None else None
         deadline = time.monotonic() + self.queue_timeout_s if self.queue_timeout_s is not None else None
         if deadline is not None:
             setattr(cancel, "_strata_queue_deadline", deadline)
@@ -5743,6 +5776,24 @@ class Service:
                             ctx_msg = context_text(ctx) if ctx and ctx.get("at", 0) >= st.get("started", now) - 1 else ""
                             print(f"[strata] done: {n} tokens in {el:.0f} s ({rate_txt}) "
                                   f"({finish}, cancel={cancel.is_set()}){hit_msg}{ctx_msg}", flush=True)
+                            if conv is not None:
+                                self.conv_ended[conv] = now
+                                if len(self.conv_ended) > 4096:          # the oldest go
+                                    for k in list(self.conv_ended)[:1024]:
+                                        self.conv_ended.pop(k, None)
+                            if self.events is not None:
+                                row = self.terminal_requests.get(request_id) or {}
+                                adm = row.get("admitted_at")
+                                lc = logctx.current()
+                                self.events.write(
+                                    "request", id=request_id, conv=conv, gap_s=conv_gap, slot=lc.get("slot"),
+                                    client=lc.get("client"), prompt=len(ids),
+                                    reused=ctx.get("reused") if ctx and ctx_msg else None,
+                                    source=ctx.get("source") if ctx and ctx_msg else None, generated=n,
+                                    finish=finish, cancel=cancel.is_set() or None,
+                                    wait_s=round(adm - queued_t, 2) if adm else None,
+                                    ttft_s=round(ft - st.get("started", now), 2) if ft else None,
+                                    total_s=round(now - queued_t, 2), tok_s=round(rate, 1) if rate else None)
                             if finish == "length" and parser.state in ("reasoning", "rcall"):   # #530
                                 print("[strata] the reply reached max tokens while still thinking, so it has no "
                                       "answer: a thinking budget (reasoning_budget_tokens, in the request or in "
@@ -6915,6 +6966,10 @@ def make_handler(svc: Service):
                 self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
 
         def _post(self):
+            logctx.set_client({"ip": logctx.client_ip(self.client_address[0], self.headers.get("X-Forwarded-For"),
+                                                      svc.trusted_nets),
+                               "kind": logctx.client_kind(self.headers.get("User-Agent"), self.headers.get("Referer")),
+                               "key": logctx.key_print(self.headers.get("Authorization") or self.headers.get("x-api-key"))})
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
@@ -8442,6 +8497,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     config_bytes = Path(a.config).read_bytes() if a.config else b""
     cfg = parse_config_text(config_bytes.decode("utf-8-sig"), a.config) if a.config else {}   # Notepad adds a BOM
     split_joined_args(cfg)
+    if cfg.get("log_time") is False:                     # (logctx: the time and the request on every printed line)
+        logctx.ENABLED = False
+    if logctx.ENABLED and not isinstance(sys.stdout, logctx.StampedStream):
+        sys.stdout, sys.stderr = logctx.StampedStream(sys.stdout), logctx.StampedStream(sys.stderr)
     if a.config and a.engine == "strata":
         cfg = apply_saved_tuning(cfg)
     attestation_key = os.environ.pop("STRATA_OWNER_ATTEST_KEY", None)
@@ -8695,6 +8754,14 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     if not svc.api_key and "api_key" in cfg and not no_key_chosen:             # #569: written, but empty: the server has none (a warning, not a stop)
         print("[strata] the api_key in the config is empty: this server has no API key (anyone who can reach it can "
               "use it); set one, or leave api_key out", file=sys.stderr, flush=True)
+    try:
+        svc.trusted_nets = logctx.trusted_nets(cfg.get("trusted_proxies"))
+    except ValueError as e:
+        raise SystemExit(f"[strata] config trusted_proxies: {e}")
+    if cfg.get("event_log"):                            # one JSON line per request and conversation event (logctx)
+        svc.events = logctx.EventLog(cfg["event_log"], svc.model, cfg.get("event_log_days") or 30)
+        svc.engine.events = svc.events
+        print(f"[strata] event log: {cfg['event_log']} (a file a day, kept {svc.events.days} days)", flush=True)
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
     svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
     try:
