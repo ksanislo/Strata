@@ -13457,6 +13457,40 @@ int main(int argc, char** argv) {
         std::vector<std::atomic<bool>*> adm_stop_of(bs.size(), nullptr);   // STRATA_SLOT_ADMIT_MULTI: a slot's queued read
         std::atomic<bool> adm_stop{false};  // BSTOP for it
         bool adm_active = false;            // a run of admissions (reads and the loan between them) is under way
+        // STRATA_READ_YIELD=1 (with STRATA_SLOT_ADMIT_MULTI): the reads beside the slots go in pieces of at most
+        // STRATA_READ_YIELD_CHUNK tokens (2048), the read with the least left first (one not fed for
+        // STRATA_READ_YIELD_STARVE_S, 20, goes first); at a piece boundary they yield to a waiting text request that goes
+        // the old way: held in their slots with the loan kept (no refill, no relayout, no picture meanwhile), then on
+        static const bool cy_on = [] {
+            const char* v = std::getenv("STRATA_READ_YIELD");
+            const char* m = std::getenv("STRATA_SLOT_ADMIT_MULTI");
+            return v != nullptr && std::atoi(v) != 0 && m != nullptr && std::atoi(m) != 0;
+        }();
+        static const int64_t cy_chunk = [] {
+            const char* v = std::getenv("STRATA_READ_YIELD_CHUNK");
+            return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 2048;
+        }();
+        static const double cy_starve_s = [] {
+            const char* v = std::getenv("STRATA_READ_YIELD_STARVE_S");
+            return v != nullptr ? std::max(0.0, std::atof(v)) : 20.0;
+        }();
+        static const size_t cy_ahead = [] {   // pieces given to the prompt path at once (stage 0's one and the next)
+            const char* v = std::getenv("STRATA_READ_YIELD_AHEAD");
+            return v != nullptr ? (size_t) std::max(1, std::atoi(v)) : (size_t) 2;
+        }();
+        static const int cy_max_lines = [] {   // old-way requests served in a row before the held reads go on a piece
+            const char* v = std::getenv("STRATA_READ_YIELD_LINES");
+            return v != nullptr ? std::max(1, std::atoi(v)) : 4;
+        }();
+        size_t cy_held_n = 0;                // reads held at a piece boundary (cy_held, below)
+        bool cy_yielded = false;             // the last run of reads ended by yielding
+        int cy_served = 0;                   // old-way lines served since the held reads last went on
+        // (in_mu held) the line waiting first is a text request the old way (not a picture: the position table stays)
+        auto cy_yield_line = [&]() -> bool {
+            if (in_lines.empty()) return false;
+            const std::string& l = in_lines.front();
+            return l.rfind("\x02" "BGEN ", 0) == 0 || l.rfind("GEN ", 0) == 0;
+        };
         struct AdmReq {
             int slot = -1;
             long long max_new = 0;
@@ -13552,7 +13586,7 @@ int main(int argc, char** argv) {
                         if (c.imgs.empty()) other = std::max(other, pre(c.ids));
                     other = std::max<int64_t>(other, (int64_t) conversations.best(r.ids, {}, cvec_cached).tokens);
                 }
-                direct = strata::program::slot_admit_direct(batch_on() || pipe_inflight() || adm_active, false, own,
+                direct = strata::program::slot_admit_direct(batch_on() || pipe_inflight() || adm_active || cy_held_n > 0, false, own,
                                                              other, adm_gain);
                 if (trace)
                     std::fprintf(stderr, "strata trace: BGEN %d: %s (the slot holds %lld of %lld tokens, another cache "
@@ -13675,6 +13709,30 @@ int main(int argc, char** argv) {
             std::vector<char> part_ok;
             Clock::time_point t_read{};
             int64_t rows0 = 0;
+            Clock::time_point t_fed{};   // STRATA_READ_YIELD: when it last got a piece (j.at: where the next one starts)
+        };
+        std::vector<std::unique_ptr<AdmJob>> cy_held;   // STRATA_READ_YIELD: reads held at a piece boundary
+        // a held read a BSTOP reached: it ends there (nothing of it is in flight), before its slot is admitted again
+        auto cy_drop_stopped = [&] {
+            for (auto it = cy_held.begin(); it != cy_held.end();) {
+                AdmJob& j = **it;
+                if (!j.stop.load()) { ++it; continue; }
+                const int b = j.r.slot;
+                BSlot& sl = bs[(size_t) b];
+                adm_stop_of[(size_t) b] = nullptr;
+                bslot_ss[0][(size_t) b]->ple = strata::core::PleRun{};
+                sl.reading = false;
+                sl.ids.clear();
+                if (ckpt_pool.on())
+                    for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
+                sl.checks.clear();
+                std::fprintf(stderr, "strata batch: slot %d: its held read was cancelled at %lld of %lld tokens\n", b,
+                             (long long) j.at, (long long) j.n);
+                std::printf("BRA %d 0 cancel\n", b);
+                std::fflush(stdout);
+                it = cy_held.erase(it);
+            }
+            cy_held_n = cy_held.size();
         };
         enum class AdmEnd { done, paused, fatal, ready };
         int adm_main_dev = 0;
@@ -14061,8 +14119,13 @@ int main(int argc, char** argv) {
                 std::vector<std::atomic<bool>*>& stops;
                 ~Joins() {
                     for (auto& j : l)
-                        if (j->setup.joinable()) j->setup.join();
-                    for (auto& x : stops) x = nullptr;
+                        if (j && j->setup.joinable()) j->setup.join();
+                    if (cy_on) {   // (a held read keeps its BSTOP)
+                        for (auto& j : l)
+                            if (j) stops[(size_t) j->r.slot] = nullptr;
+                    } else {
+                        for (auto& x : stops) x = nullptr;
+                    }
                 }
             } joins{live, adm_stop_of};
             auto in_flight = [&] {
@@ -14097,10 +14160,13 @@ int main(int argc, char** argv) {
                 std::string e;
                 if (!pipe_drain()) return false;
                 if (!adapt_tick(true)) { std::printf("ERR an adaptive refill failed\n"); return false; }
-                if (!lend(piece, e, 0)) { std::printf("ERR lending the prompt path its slots failed: %s\n", e.c_str()); return false; }
+                // (STRATA_READ_YIELD: the whole chunk's loan, so a request served while reads are held needs no other)
+                if (!lend(piece, e, cy_on ? o.prefill_chunk : 0)) { std::printf("ERR lending the prompt path its slots failed: %s\n", e.c_str()); return false; }
                 adm_fence_ms += std::chrono::duration<double, std::milli>(Clock::now() - tf).count();
+                if (cy_on && cy_held_n > 0)
+                    std::fprintf(stderr, "strata batch: STRATA_READ_YIELD: the loan was lent again under held reads\n");
             }
-            const int64_t P = std::max<int64_t>(1, std::min(sp.chunk(), piece));
+            const int64_t P = std::max<int64_t>(1, std::min(sp.chunk(), cy_on && cy_chunk > 0 ? std::min(piece, cy_chunk) : piece));
             auto take = [&](const std::string& l) -> bool {
                 auto j = std::make_unique<AdmJob>();
                 if (!adm_parse(l, j->r) || j->r.slot < 0 || j->r.slot >= (int) bs.size()) {
@@ -14175,6 +14241,55 @@ int main(int argc, char** argv) {
                 live.push_back(std::move(j));
                 return true;
             };
+            // one piece [a, z) of an admission's read, into its slot's sessions; `ck`: its turn checkpoint is taken at z
+            auto make_piece = [&](AdmJob& j, int64_t a, int64_t z, bool ck) {
+                const int b = j.r.slot;
+                auto pj = std::make_shared<strata::prefill::PromptJob>();
+                pj->tokens.assign(j.r.ids.begin() + a, j.r.ids.begin() + z);
+                pj->pos0 = a;
+                for (size_t k = 0; k < n_st; ++k) pj->sessions.push_back(bslot_ss[k][(size_t) b].get());
+                AdmJob* jp = &j;
+                strata::core::MtpDrafter* dr = batch_mtp ? slot_mtp[(size_t) b].get() : nullptr;
+                const int64_t n = j.n;
+                pj->on_chunk = [jp, dr, b, n](const float* R_rows, int64_t T, int64_t p0, std::string& err) -> bool {
+                    if (dr != nullptr) {
+                        std::vector<int32_t> nxt((size_t) T);
+                        for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) jp->r.ids[(size_t) (p0 + t + 1)];
+                        if (!dr->prefill(R_rows, nxt.data(), T, p0, err)) return false;
+                    }
+                    const int64_t done = p0 + T;
+                    jp->done_at.store(done);
+                    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - jp->t_read).count();
+                    std::printf("BRP %d %lld %lld %.0f %.1f\n", b, (long long) done, (long long) n, ms,
+                                ms > 0.0 ? 1000.0 * (double) (done - jp->resume) / ms : 0.0);
+                    std::fflush(stdout);
+                    strata::core::progress_at("reading a prompt into a batch slot, done up to token", done);
+                    strata::core::progress_beat();
+                    return true;
+                };
+                if (ck && z == j.turn_at)
+                    for (size_t k = 0; k < n_st; ++k)   // stage k's part of the turn checkpoint, as it reaches it
+                        pj->on_stage_chunk.push_back([&, jp, k, b](int64_t done, std::string& err) -> bool {
+                            if (done != jp->turn_at) return true;
+                            ConvCheckpoint& part = jp->parts[k];
+                            part.ids.assign(jp->r.ids.begin(), jp->r.ids.begin() + jp->turn_at);
+                            if (!checkpoint_save(part, *bslot_ss[k][(size_t) b], g)) {
+                                err = "saving the slot's turn checkpoint failed";
+                                return false;
+                            }
+                            jp->part_ok[k] = 1;
+                            return true;
+                        });
+                pj->should_stop = [jp] { return jp->stop.load(std::memory_order_acquire) || jp->failed.load(); };
+                pj->on_done = [jp](bool ok, const std::string& e) {
+                    if (!ok) {
+                        std::lock_guard<std::mutex> lk(jp->mu);
+                        if (!jp->failed.exchange(true)) jp->err = e;
+                    }
+                    jp->inflight.fetch_sub(1);
+                };
+                return pj;
+            };
             // the pieces of a set-up admission into the queue: [at, n-1) in pieces of P tokens, one ending at turn_at
             auto queue_pieces = [&](AdmJob& j) {
                 const int b = j.r.slot;
@@ -14200,53 +14315,7 @@ int main(int argc, char** argv) {
                         break;
                     }
                 std::vector<std::shared_ptr<strata::prefill::PromptJob>> jobs;
-                for (const auto& [a, z] : cuts) {
-                    auto pj = std::make_shared<strata::prefill::PromptJob>();
-                    pj->tokens.assign(j.r.ids.begin() + a, j.r.ids.begin() + z);
-                    pj->pos0 = a;
-                    for (size_t k = 0; k < n_st; ++k) pj->sessions.push_back(bslot_ss[k][(size_t) b].get());
-                    AdmJob* jp = &j;
-                    strata::core::MtpDrafter* dr = batch_mtp ? slot_mtp[(size_t) b].get() : nullptr;
-                    const int64_t n = j.n;
-                    pj->on_chunk = [jp, dr, b, n](const float* R_rows, int64_t T, int64_t p0, std::string& err) -> bool {
-                        if (dr != nullptr) {
-                            std::vector<int32_t> nxt((size_t) T);
-                            for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) jp->r.ids[(size_t) (p0 + t + 1)];
-                            if (!dr->prefill(R_rows, nxt.data(), T, p0, err)) return false;
-                        }
-                        const int64_t done = p0 + T;
-                        jp->done_at.store(done);
-                        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - jp->t_read).count();
-                        std::printf("BRP %d %lld %lld %.0f %.1f\n", b, (long long) done, (long long) n, ms,
-                                    ms > 0.0 ? 1000.0 * (double) (done - jp->resume) / ms : 0.0);
-                        std::fflush(stdout);
-                        strata::core::progress_at("reading a prompt into a batch slot, done up to token", done);
-                        strata::core::progress_beat();
-                        return true;
-                    };
-                    if (ck && z == j.turn_at)
-                        for (size_t k = 0; k < n_st; ++k)   // stage k's part of the turn checkpoint, as it reaches it
-                            pj->on_stage_chunk.push_back([&, jp, k, b](int64_t done, std::string& err) -> bool {
-                                if (done != jp->turn_at) return true;
-                                ConvCheckpoint& part = jp->parts[k];
-                                part.ids.assign(jp->r.ids.begin(), jp->r.ids.begin() + jp->turn_at);
-                                if (!checkpoint_save(part, *bslot_ss[k][(size_t) b], g)) {
-                                    err = "saving the slot's turn checkpoint failed";
-                                    return false;
-                                }
-                                jp->part_ok[k] = 1;
-                                return true;
-                            });
-                    pj->should_stop = [jp] { return jp->stop.load(std::memory_order_acquire) || jp->failed.load(); };
-                    pj->on_done = [jp](bool ok, const std::string& e) {
-                        if (!ok) {
-                            std::lock_guard<std::mutex> lk(jp->mu);
-                            if (!jp->failed.exchange(true)) jp->err = e;
-                        }
-                        jp->inflight.fetch_sub(1);
-                    };
-                    jobs.push_back(std::move(pj));
-                }
+                for (const auto& [a, z] : cuts) jobs.push_back(make_piece(j, a, z, ck));
                 j.inflight.store((int) jobs.size());
                 if (front)
                     for (auto it = jobs.rbegin(); it != jobs.rend(); ++it) sp.enqueue(*it, true);
@@ -14320,39 +14389,139 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 return true;
             };
-            if (!take(first)) return false;
+            if (!first.empty() && !take(first)) return false;
+            // STRATA_READ_YIELD: the reads held at a piece boundary go on from where they stopped (the loan still out)
+            const size_t resumed = cy_held.size();
+            for (auto& j : cy_held) live.push_back(std::move(j));
+            cy_held.clear();
+            cy_held_n = 0;
+            cy_yielded = false;
+            if (resumed > 0)
+                std::fprintf(stderr, "strata batch: STRATA_READ_YIELD: %zu held read%s go%s on\n", resumed,
+                             resumed == 1 ? "" : "s", resumed == 1 ? "es" : "");
+            bool yielding = false;
+            int64_t cy_fed = 0;   // pieces given to the prompt path in this run
+            // a read with nothing more to give the prompt path (all fed, cancelled, failed, or nothing to read)
+            auto cy_done = [](const AdmJob& j) {
+                return !j.setup_ok || j.at >= j.n - 1 || j.stop.load() || j.failed.load();
+            };
+            // the next piece: of the read with the least left, unless one has waited STRATA_READ_YIELD_STARVE_S for one
+            auto cy_feed = [&] {
+                while (!yielding && sp.jobs_pending() < cy_ahead) {
+                    const auto now = Clock::now();
+                    AdmJob* best = nullptr;
+                    AdmJob* starved = nullptr;
+                    for (auto& jj : live) {
+                        AdmJob& j = *jj;
+                        if (!j.queued || cy_done(j)) continue;
+                        if (cy_starve_s > 0.0 && std::chrono::duration<double>(now - j.t_fed).count() >= cy_starve_s &&
+                            (starved == nullptr || j.t_fed < starved->t_fed))
+                            starved = &j;
+                        if (best == nullptr || j.n - j.at < best->n - best->at) best = &j;
+                    }
+                    AdmJob* j = starved != nullptr ? starved : best;
+                    if (j == nullptr) return;
+                    const int64_t a = j->at;
+                    int64_t z = std::min(j->n - 1, a + P);
+                    const bool ck = j->turn_at > a;
+                    if (ck && z > j->turn_at) z = j->turn_at;
+                    j->inflight.fetch_add(1);
+                    sp.enqueue(make_piece(*j, a, z, ck));
+                    j->at = z;
+                    j->t_fed = now;
+                    ++cy_fed;
+                }
+            };
             size_t seen = 0;
             for (;;) {
                 if (!pump_ok) return false;
                 std::vector<std::string> fresh;
-                bool more = false;
+                bool more = false, other = false;
                 {
                     std::unique_lock<std::mutex> lk(in_mu);
                     if (!(batch_on() || pipe_inflight()))
                         in_cv.wait_for(lk, std::chrono::milliseconds(1), [&] { return in_lines.size() != seen; });
                     adm_lines();
-                    while (!in_lines.empty() && !in_lines.front().empty() && in_lines.front()[0] == '\x01') {
+                    while (!yielding && !in_lines.empty() && !in_lines.front().empty() && in_lines.front()[0] == '\x01') {
                         fresh.push_back(in_lines.front().substr(1));
                         in_lines.pop_front();
                     }
+                    other = cy_on && cy_yield_line();
                     seen = in_lines.size();
                 }
                 for (const std::string& l : fresh)
                     if (!take(l)) return false;
+                // yield at the next piece boundary: nothing more fed, the pieces stage 0 has not started taken back
+                // (they never ran), the ones in flight finish; a run that went on from held reads feeds one piece first
+                if (other && !yielding && !live.empty() && (resumed == 0 || cy_fed > 0)) {
+                    yielding = true;
+                    const auto back = sp.withdraw([](const strata::prefill::PromptJob&) { return true; });
+                    for (const auto& pj : back)
+                        for (auto& j : live)
+                            if (!pj->sessions.empty() && pj->sessions[0] == bslot_ss[0][(size_t) j->r.slot].get()) {
+                                j->at = std::min(j->at, pj->pos0);   // (its unstarted pieces are a suffix)
+                                j->inflight.fetch_sub(1);
+                                break;
+                            }
+                    std::fprintf(stderr, "strata batch: STRATA_READ_YIELD: a text request waits: the reads beside the slots "
+                                         "stop at their next piece boundary (%zu piece%s taken back)\n", back.size(),
+                                 back.size() == 1 ? "" : "s");
+                }
                 for (auto& j : live)
                     if (!j->queued && j->set_up.load(std::memory_order_acquire)) {
                         if (j->setup.joinable()) j->setup.join();
-                        if (j->setup_ok && j->at < j->n - 1) queue_pieces(*j);
-                        else j->queued = true;   // (nothing to read, or its set-up failed: finished below)
+                        if (cy_on) {   // (fed a piece at a time by cy_feed)
+                            j->queued = true;
+                            if (j->parts.empty()) {
+                                j->t_read = Clock::now();
+                                j->rows0 = pipe_rows;
+                                j->parts.assign(n_st, ConvCheckpoint{});
+                                j->part_ok.assign(n_st, 0);
+                            }
+                            j->t_fed = Clock::now();
+                        } else if (j->setup_ok && j->at < j->n - 1) {
+                            queue_pieces(*j);
+                        } else {
+                            j->queued = true;   // (nothing to read, or its set-up failed: finished below)
+                        }
                     }
+                if (cy_on) cy_feed();
                 for (auto it = live.begin(); it != live.end();) {
                     AdmJob& j = **it;
-                    if (j.queued && j.inflight.load() == 0) {
+                    if (j.queued && j.inflight.load() == 0 && (!cy_on || cy_done(j))) {
                         if (j.setup.joinable()) j.setup.join();
                         if (!finish(j)) return false;
                         it = live.erase(it);
                     } else {
                         ++it;
+                    }
+                }
+                if (yielding) {   // every piece in flight done and every set-up landed: the rest wait in their slots
+                    bool quiet = true;
+                    for (const auto& j : live)
+                        quiet = quiet && j->inflight.load() == 0 && j->set_up.load(std::memory_order_acquire);
+                    if (quiet) {
+                        for (auto& j : live) {
+                            if (j->setup.joinable()) j->setup.join();
+                            if (cy_done(*j)) {   // (its last piece landed meanwhile)
+                                if (!finish(*j)) return false;
+                            } else {
+                                cy_held.push_back(std::move(j));
+                            }
+                        }
+                        live.clear();
+                        cy_held_n = cy_held.size();
+                        cy_yielded = !cy_held.empty();
+                        if (cy_yielded) {
+                            std::string where;
+                            for (const auto& j : cy_held)
+                                where += " slot " + std::to_string(j->r.slot) + " at " + std::to_string((long long) j->at) +
+                                         "/" + std::to_string((long long) j->n);
+                            std::fprintf(stderr, "strata batch: STRATA_READ_YIELD: %zu read%s held at a piece boundary "
+                                                 "(loan kept):%s\n", cy_held.size(), cy_held.size() == 1 ? "" : "s",
+                                         where.c_str());
+                        }
+                        break;
                     }
                 }
                 if (live.empty()) {
@@ -14555,6 +14724,14 @@ int main(int argc, char** argv) {
             }
             bells.stop();
             bells.stop = nullptr;
+            if (adm_multi && cy_yielded) {   // the held reads keep the loan: refilled when the run that ends them ends
+                std::fprintf(stderr, "strata batch: %d admission%s read beside the slots in %.0f ms (queued, "
+                                     "STRATA_SLOT_ADMIT_MULTI); yielded with %zu held, the loan kept; decoded %lld rows "
+                                     "(%s)\n", n_adm, n_adm == 1 ? "" : "s",
+                             std::chrono::duration<double, std::milli>(Clock::now() - t_run).count(), cy_held_n,
+                             (long long) (pipe_rows - rows_run0), window_note().c_str());
+                return true;
+            }
             const auto tf = Clock::now();
             std::string e;
             if (!pipe_drain()) return false;
@@ -14578,6 +14755,25 @@ int main(int argc, char** argv) {
         for (;;) {
             line_drain_ms = 0.0;
             bool adm_direct = false;   // STRATA_SLOT_ADMIT: this BGEN is read beside the slots (adm_run)
+            // STRATA_READ_YIELD: held reads go on unless a text request the old way waits first (at most
+            // STRATA_READ_YIELD_LINES in a row); a held read a BSTOP reached ends first
+            if (cy_on && !cy_held.empty()) {
+                bool yield_line = false;
+                {
+                    std::lock_guard<std::mutex> lk(in_mu);
+                    adm_lines();
+                    yield_line = cy_yield_line();
+                }
+                cy_drop_stopped();
+                if (!cy_held.empty()) {
+                    if (!yield_line || cy_served >= cy_max_lines) {
+                        cy_served = 0;
+                        if (!adm_run(std::string())) return 1;
+                        continue;
+                    }
+                    ++cy_served;
+                }
+            }
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
                     if (!(piped ? pump(true) : batch_step())) return 1;
@@ -14662,7 +14858,8 @@ int main(int argc, char** argv) {
                 const long b = std::strtol(line.c_str() + (bimg ? 6 : 5), &e1, 10);
                 char* e2 = nullptr;
                 const long long mn = std::strtoll(e1, &e2, 10);
-                if (bs.empty() || b < 0 || b >= (long) bs.size() || bs[(size_t) b].active || mn < 1 || e2 == e1) {
+                if (bs.empty() || b < 0 || b >= (long) bs.size() || bs[(size_t) b].active || mn < 1 || e2 == e1 ||
+                    (cy_on && bs[(size_t) b].reading)) {   // (STRATA_READ_YIELD: a held read's slot)
                     std::printf("ERR BGEN: no such free slot (--batch %d) or a bad max_new\n", o.batch);
                     std::fflush(stdout);
                     continue;
@@ -16879,7 +17076,8 @@ int main(int argc, char** argv) {
                 if (to <= at) continue;
                 err.clear();
                 const bool win = windows_ok(at, to);
-                if (win && !refill_lazy(err)) {
+                // (STRATA_READ_YIELD: reads held at a piece boundary keep the loan; the windows run without those experts)
+                if (win && cy_held.empty() && !refill_lazy(err)) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }
@@ -16949,7 +17147,9 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
                                  (long long) message_at, (long long) (turn_at - message_at));
             }
-            if (!(cancelled ? refill(err) : refill_lazy(err))) {
+            if (!cy_held.empty()) {
+                if (trace) std::fprintf(stderr, "strata trace: STRATA_READ_YIELD: the loan stays out for %zu held reads\n", cy_held.size());
+            } else if (!(cancelled ? refill(err) : refill_lazy(err))) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                 return 1;
             }
