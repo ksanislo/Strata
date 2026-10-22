@@ -1235,6 +1235,9 @@ class StrataEngine:
         # STRATA_SLOT_ADMIT (INFO slot_admit=1): an admission's prompt is read into its slot beside the decoding slots;
         # the engine answers BGEN with `BQ <slot> 1` and the rest comes on the slot's own lines (see generate_batched)
         self.slot_admit = bool(self.batch) and str(self.info.get("slot_admit") or "") == "1"
+        # INFO slot_keep=1 (STRATA_PIPED_MTP: a window holds live slots only): an idle slot keeps its conversation, so
+        # pick_slot chooses by what the slots hold, as without pipelined groups
+        self.slot_keep = bool(self.batch) and str(self.info.get("slot_keep") or "") == "1"
         self.slot_busy = [False] * self.batch
         # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
         # given back; slot_releasing: slots handed to the background BDONE wait.  A busy slot in neither has no owner
@@ -2330,7 +2333,7 @@ class StrataEngine:
         if not free:
             return None
         gs = getattr(self, "slot_gs", 0)
-        if gs > 1:
+        if gs > 1 and not getattr(self, "slot_keep", False):
             # pipelined groups of several slots: the engine keeps no idle slot below a busy one as a conversation cache
             # (its pad row writes the slot), so nothing is worth keeping free for a next turn.  A group's window spans
             # its slots up to its last busy one, so first fill a hole below a busy slot of the same group (it costs no
