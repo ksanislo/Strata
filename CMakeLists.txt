@@ -147,6 +147,11 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(slot_sizing_test src/core/slot_sizing_test.cpp)
   target_include_directories(slot_sizing_test PRIVATE include)
   add_test(NAME slot_sizing_test COMMAND slot_sizing_test)
+  find_package(Threads REQUIRED)
+  add_executable(session_dir_test src/core/session_dir_test.cpp src/core/session_dir.cpp src/core/conversation_file.cpp)
+  target_include_directories(session_dir_test PRIVATE include)
+  target_link_libraries(session_dir_test PRIVATE Threads::Threads)
+  add_test(NAME session_dir_test COMMAND session_dir_test)
 endif()
 
 if(STRATA_HIP_GFX906)
@@ -589,7 +594,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
-    src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
+    src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp src/core/session_dir.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
@@ -1487,6 +1492,10 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(batch_groups_test src/program/batch_groups_test.cpp)
   target_include_directories(batch_groups_test PRIVATE include)
   add_test(NAME batch_groups_test COMMAND batch_groups_test)
+  # which --batch slot conversation --session-dir saves before the slot is overwritten (header-only, CPU)
+  add_executable(slot_persist_test src/program/slot_persist_test.cpp)
+  target_include_directories(slot_persist_test PRIVATE include)
+  add_test(NAME slot_persist_test COMMAND slot_persist_test)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
