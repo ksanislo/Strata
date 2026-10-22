@@ -14340,8 +14340,9 @@ int main(int argc, char** argv) {
                 std::string e;
                 if (!pipe_drain()) return false;
                 if (!adapt_tick(true)) { std::printf("ERR an adaptive refill failed\n"); return false; }
-                // (STRATA_READ_YIELD: the whole chunk's loan, so a request served while reads are held needs no other)
-                if (!lend(piece, e, cy_on ? o.prefill_chunk : 0)) { std::printf("ERR lending the prompt path its slots failed: %s\n", e.c_str()); return false; }
+                // (STRATA_READ_YIELD: the whole chunk's loan, so a request served while reads are held needs no other;
+                // STRATA_SLOT_ADMIT_CHUNK caps it: the slots decoding beside the read keep the rest of the cache)
+                if (!lend(piece, e, cy_on && adm_chunk_cap == 0 ? o.prefill_chunk : 0)) { std::printf("ERR lending the prompt path its slots failed: %s\n", e.c_str()); return false; }
                 adm_fence_ms += std::chrono::duration<double, std::milli>(Clock::now() - tf).count();
                 if (cy_on && cy_held_n > 0)
                     std::fprintf(stderr, "strata batch: STRATA_READ_YIELD: the loan was lent again under held reads\n");
