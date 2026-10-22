@@ -79,6 +79,7 @@ from serve import ready as ready_file  # noqa: E402
 from serve import owner_guard  # noqa: E402
 from serve import launch_identity  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
+from serve.engine_stats import EngineLog, EngineStats  # noqa: E402
 from serve import lifeline  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
@@ -1265,6 +1266,7 @@ class StrataEngine:
         self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
         self.wlock = threading.Lock()                   # stdin writes from several request threads
+        self.estats = EngineStats()                     # /metrics' engine-wide figures, counted by the pump
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
 
@@ -1272,8 +1274,13 @@ class StrataEngine:
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
         slot_q = self.slot_q
         log = self.log
+        es = self.__dict__.get("estats") or self.__dict__.setdefault("estats", EngineStats())
         line = None
         for line in proc.stdout:
+            try:
+                es.on_line(line)
+            except Exception:                           # (figures only: never the pump's end)
+                pass
             if line.startswith("ERR") and hasattr(log, "write"):   # stdout only: the log shows why a request or the engine failed
                 try:
                     log.write(f"[strata] engine said: {line.rstrip()}\n")
@@ -2388,6 +2395,22 @@ class StrataEngine:
                          "generated": r["generated"], "elapsed_s": round(now - r["started"], 1),
                          "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
         return view
+
+    def slot_states(self) -> dict:
+        """/metrics' aggregate: how many slots are idle, reading, decoding, held (claimed with no request running in
+        them: a read that gave way waits there, or a BDONE is awaited) or parked (free, keeping a conversation)."""
+        n = {"idle": 0, "reading": 0, "decoding": 0, "held": 0, "parked": 0}
+        for b in range(self.batch):
+            r = self.slot_live[b] if b < len(self.slot_live) else None
+            if r is not None:
+                n["decoding" if r.get("state") == "decoding" else "reading"] += 1
+            elif b < len(self.slot_busy) and self.slot_busy[b]:
+                n["held"] += 1
+            elif b < len(self.slot_held) and self.slot_held[b]:
+                n["parked"] += 1
+            else:
+                n["idle"] += 1
+        return n
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
@@ -4049,6 +4072,8 @@ class Service:
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
+        self.engine_logs: dict[int, EngineLog] = {}     # /metrics' aggregate: each engine's own stderr figures
+        self.engine_log_lock = threading.Lock()
         self.config_path = None                         # #564: the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
         # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
@@ -4723,8 +4748,10 @@ class Service:
         """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
         if getattr(self, "telemetry", None) is None:
             from serve.telemetry import Telemetry
-            self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(), "tok_s_mean": self._tok_s_mean(),
-                                                    "prefill_tok_s_mean": self._prefill_tok_s_mean()},
+            self.telemetry = Telemetry(extra=lambda: {"tok_s": self._engine_rate("generated_tok_s", self._tok_s),
+                                                    "tok_s_mean": self._tok_s_mean(),
+                                                    "prefill_tok_s_mean": self._engine_rate("prompt_read_tok_s",
+                                                                                            self._prefill_tok_s_mean)},
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
                                        gpu_indices=getattr(self, "gpu_indices", None),
                                        amd=getattr(self, "backend", None) == "hip")
@@ -4732,6 +4759,13 @@ class Service:
                 # #1317: the quick frozen-engine check does not end an engine whose GPU is busy (a long prompt chunk on a
                 # slow card keeps the GPU at work while the host thread sleeps)
                 self.engine.gpu_busy = lambda: (self.telemetry.snapshot()["now"].get("gpu_util") or 0) >= 10
+
+    def _engine_rate(self, key, fallback):
+        """The Monitor's Decode / Prefill history: all slots together over the last 10 s (the engine's own counts)."""
+        es = getattr(self.engine, "estats", None)
+        if es is None or not self.loaded():
+            return fallback()
+        return es.rates()[key]["10s"] or 0.0
 
     def _tok_s(self):
         """tok/s over the last RATE_WINDOW_S seconds.  Returns 0.0 while nothing is generating.  With parallel requests:
@@ -4848,11 +4882,101 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
-        return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
+        aggregate, conversations = self.aggregate_view()
+        return {"engine": engine, "live": live, "aggregate": aggregate, "conversations": conversations,
+                "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now}
+
+    def aggregate_view(self) -> tuple[dict, list]:
+        """GET /metrics' "aggregate" (the whole engine: every slot and request together) and "conversations" (one row
+        per request in flight, queued ones included).  Rates are the engine's own token counts over the last 10 s / 60 s."""
+        now = time.time()
+        eng = self.engine
+        kids = getattr(eng, "engines", None) if hasattr(eng, "replica_view") else None
+        kids = list(kids) if kids else ([eng] if eng is not None else [])
+        loaded = self.loaded() if eng is not None else False
+        rates = {k: {f"{w}s": 0.0 for w in (10, 60)} for k in ("generated_tok_s", "prompt_read_tok_s", "reused_tok_s")}
+        tot = {"generated": 0, "prompt_read": 0, "reused": 0, "reads": 0, "errors": 0}
+        last_err, since = None, None
+        slots = {"idle": 0, "reading": 0, "decoding": 0, "held": 0, "parked": 0}
+        slot_by_id, waiting, admitting, nslots = {}, 0, 0, 0
+        logs = []
+        for i, e in enumerate(kids):
+            es = getattr(e, "estats", None)
+            if es is not None and loaded:
+                for k, v in es.rates().items():
+                    for w, x in v.items():
+                        rates[k][w] = round(rates[k][w] + (x or 0.0), 1)
+                t = es.totals()
+                for k in tot:
+                    tot[k] += t[k]
+                since = t["since"] if since is None else min(since, t["since"])
+                if t["last_err"] and (last_err is None or (t["last_err_at"] or 0) > last_err["at"]):
+                    last_err = {"text": t["last_err"], "at": t["last_err_at"]}
+            n = int(getattr(e, "batch", 0) or 0)
+            if n and hasattr(e, "slot_states"):
+                nslots += n
+                for k, v in e.slot_states().items():
+                    slots[k] += v
+                for b, r in enumerate(list(getattr(e, "slot_live", []) or [])):
+                    if r and r.get("request_id"):
+                        slot_by_id[r["request_id"]] = {**r, "slot": b, "replica": i if len(kids) > 1 else None}
+            waiting += int(getattr(e, "waiting", 0) or 0)
+            admitting += int(getattr(e, "admitting", 0) or 0)
+            with self.engine_log_lock:
+                el = self.engine_logs.setdefault(i, EngineLog())
+                logs.append(el.poll(getattr(e, "log_path", None), getattr(e, "log_start", None)))
+        with self.status_lock:
+            active = [dict(r) for r in self.terminal_requests.values()]
+            live = {st.get("request_id"): (dict(st), list(rt)) for st, rt in self.live_reqs.values()}
+            if not live and self.status.get("busy"):
+                live[self.status.get("request_id")] = (dict(self.status), list(self.rate))
+        progress = getattr(eng, "progress", None)
+        conv = []
+        for row in sorted(active, key=lambda r: r.get("queued_at") or 0):
+            rid = row.get("id")
+            sl = slot_by_id.get(rid)
+            st, rt = live.get(rid, ({}, []))
+            first, started = st.get("first_token"), st.get("started")
+            if sl is not None:
+                state = sl.get("state") or "reading"
+            elif row.get("state") in ("queued", "waiting"):
+                state = row["state"]
+            else:
+                state = "decoding" if first else "reading"
+            prompt = int(row.get("prompt_tokens") or st.get("prompt_tokens") or 0)
+            gen = int(st.get("generated") or (sl or {}).get("generated") or 0)
+            read = None
+            if state == "reading":
+                read = sl.get("prompt_read") if sl is not None else (progress[0] if progress else None)
+            queued_at = row.get("queued_at")
+            conv.append({"id": rid, "slot": sl.get("slot") if sl else None,
+                         "replica": sl.get("replica") if sl else row.get("replica"), "state": state,
+                         "phase": st.get("phase") if st.get("busy") else None,
+                         "prompt_tokens": prompt, "prompt_read": read, "generated": gen,
+                         "context_tokens": prompt + gen, "max_tokens": st.get("max_tokens"),
+                         "queued_s": round((row.get("admitted_at") or now) - queued_at, 1) if queued_at else None,
+                         "age_s": round(now - queued_at, 1) if queued_at else None,
+                         "ttft_s": round(first - started, 2) if first and started else None,
+                         "reading_s": round(now - started, 1) if started and not first else None,
+                         "tok_s": round(self._rate_of(st, rt), 1) if first and st.get("busy") else None})
+        queued = [c for c in conv if c["state"] in ("queued", "waiting")]
+        agg = {"loaded": loaded, "parallel": nslots, "in_flight": len(conv),
+               "generated_tok_s": rates["generated_tok_s"], "prompt_read_tok_s": rates["prompt_read_tok_s"],
+               "reused_tok_s": rates["reused_tok_s"],
+               "slots": slots, "outside_slots": sum(1 for c in conv if c["slot"] is None and c not in queued),
+               "queue": {"waiting": len(queued), "queued": sum(1 for c in queued if c["state"] == "queued"),
+                         "for_slot": sum(1 for c in queued if c["state"] == "waiting"),
+                         "oldest_wait_s": max((c["age_s"] or 0 for c in queued), default=0),
+                         "engine_ctl_waiting": waiting, "engine_slot_waiting": admitting},
+               "totals": {"since": since, **tot}, "last_err": last_err,
+               "engine_log": logs[0] if logs else None}
+        if len(logs) > 1:
+            agg["replica_engine_logs"] = logs
+        return agg, conv
 
     def prometheus(self) -> str:
         """GET /metrics/prometheus: the totals and what is running in Prometheus' text format, under llama-server's
@@ -5448,7 +5572,7 @@ class Service:
                             queued_counted = False
                             self.terminal_requests[request_id].update(state="waiting", admitted_at=time.time())
                             self._terminal_event_locked(request_id, "admitted")
-                        st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
+                        st.update(busy=True, request_id=request_id, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
                                   max_tokens=max_new, reasoning_recoveries=0, thinking_budget=budget)
                         if par:
