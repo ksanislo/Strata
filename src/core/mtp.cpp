@@ -1361,6 +1361,16 @@ void MtpDrafter::kv_restore(int64_t upto) {
     cudaStreamSynchronize(cs_);
 }
 
+// the prompt records' device buffer: a failed allocation asks for VRAM once (vram_relief) and tries again
+static bool records_alloc(int32_t** p, size_t bytes, int dev) {
+    if (cudaMalloc((void**) p, bytes) == cudaSuccess) return true;
+    (void) cudaGetLastError();
+    if (vram_relief(dev, bytes + (2ull << 20)) == 0) return false;
+    if (cudaMalloc((void**) p, bytes) == cudaSuccess) return true;
+    (void) cudaGetLastError();
+    return false;
+}
+
 bool MtpDrafter::prepare_prefill(std::string& err) {
     const OnDevice on_device(device_);
     const int64_t per_row = 1 + 4 + g_->n_head;
@@ -1368,7 +1378,7 @@ bool MtpDrafter::prepare_prefill(std::string& err) {
         if (pf_dev_) cudaFree(pf_dev_);
         pf_dev_ = nullptr;
         pf_cap_ = 0;
-        if (cudaMalloc((void**) &pf_dev_, (size_t) (max_t_ * per_row) * sizeof(int32_t)) != cudaSuccess) {
+        if (!records_alloc(&pf_dev_, (size_t) (max_t_ * per_row) * sizeof(int32_t), device_)) {
             err = "mtp prefill: the input records do not fit";
             return false;
         }
@@ -1411,7 +1421,7 @@ bool MtpDrafter::reserve_prefill(int64_t n, std::string& err) {
     if (pf_dev_) cudaFree(pf_dev_);
     pf_dev_ = nullptr;
     pf_cap_ = 0;
-    if (cudaMalloc((void**) &pf_dev_, (size_t) (n * per_row) * sizeof(int32_t)) != cudaSuccess) {
+    if (!records_alloc(&pf_dev_, (size_t) (n * per_row) * sizeof(int32_t), device_)) {
         err = "mtp prefill: the input records do not fit";
         return false;
     }
@@ -1447,7 +1457,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
             if (pf_dev_) cudaFree(pf_dev_);
             pf_dev_ = nullptr;
             pf_cap_ = 0;
-            if (cudaMalloc((void**) &pf_dev_, (size_t) (n * per_row) * sizeof(int32_t)) != cudaSuccess) {
+            if (!records_alloc(&pf_dev_, (size_t) (n * per_row) * sizeof(int32_t), device_)) {
                 err = "mtp prefill: the input records do not fit";
                 return false;
             }
