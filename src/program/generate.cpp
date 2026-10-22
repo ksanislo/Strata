@@ -12275,27 +12275,6 @@ int main(int argc, char** argv) {
             }
             return r;
         };
-        // per card, the slot budget and its free part on stdout whenever they change (the server's context memory):
-        // KMEM <cards> then <device> <total bytes> <free bytes> per card
-        std::vector<uint64_t> kmem_last;
-        auto kmem_note = [&]() {
-            if (!eslots_on) return;
-            std::vector<uint64_t> v;
-            for (size_t k = 0; k < bslot_ss.size(); ++k) {
-                uint64_t t = 0, f = 0;
-                strata::core::qsa_slot_budget(eslot_dev(k), t, f);
-                v.push_back(t);
-                v.push_back(f);
-            }
-            if (v == kmem_last) return;
-            kmem_last = v;
-            std::string ln = "KMEM " + std::to_string(bslot_ss.size());   // one write: other threads print lines too
-            for (size_t k = 0; k < bslot_ss.size(); ++k)
-                ln += " " + std::to_string(eslot_dev(k)) + " " + std::to_string(v[2 * k]) + " " + std::to_string(v[2 * k + 1]);
-            ln += "\n";
-            std::fwrite(ln.data(), 1, ln.size(), stdout);
-            std::fflush(stdout);
-        };
         // ---- STRATA_ELASTIC_SLOTS_GIVE: per card, the expert cache gives the slot budget whole chunks from the slots
         // just below its prompt loan when the slots need them, and takes them back when the slots let them go (kvg_ensure
         // and kvg_trim, for one stage's cache, its layers and its own residency table).  Only on a quiet card: no window
@@ -12363,6 +12342,31 @@ int main(int argc, char** argv) {
                              (double) (bt + got) / 1048576.0, (double) full / 1048576.0);
             }
         const bool eidle_on = eslots_on && give_on && elastic_idle_env();
+        // per card, the slot budget, its free part and what the expert cache can still give it (STRATA_ELASTIC_SLOTS_GIVE,
+        // down to give_floor) on stdout whenever they change (the server's context memory):
+        // KMEM <cards> then <device> <budget bytes> <free bytes> <givable bytes> per card
+        std::vector<uint64_t> kmem_last;
+        auto kmem_note = [&]() {
+            if (!eslots_on) return;
+            std::vector<uint64_t> v;
+            for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                uint64_t t = 0, f = 0;
+                strata::core::qsa_slot_budget(eslot_dev(k), t, f);
+                v.push_back(t);
+                v.push_back(f);
+                v.push_back(give_on && k < gv.size() && gv[k].lo > give_floor
+                                ? (uint64_t) (gv[k].cache->bytes_of(gv[k].lo) - gv[k].cache->bytes_of(give_floor)) : 0);
+            }
+            if (v == kmem_last) return;
+            kmem_last = v;
+            std::string ln = "KMEM " + std::to_string(bslot_ss.size());   // one write: other threads print lines too
+            for (size_t k = 0; k < bslot_ss.size(); ++k)
+                ln += " " + std::to_string(eslot_dev(k)) + " " + std::to_string(v[3 * k]) + " " + std::to_string(v[3 * k + 1]) +
+                      " " + std::to_string(v[3 * k + 2]);
+            ln += "\n";
+            std::fwrite(ln.data(), 1, ln.size(), stdout);
+            std::fflush(stdout);
+        };
         // the free budget chunks card k keeps beyond its decoding slots' next step: what was made at load, or the spare
         auto budget_keep = [&](size_t k, int64_t made) -> int64_t {
             if (!eidle_on) return made;
