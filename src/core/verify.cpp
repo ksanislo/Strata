@@ -630,7 +630,7 @@ Verifier::~Verifier() {
     for (float* p : dsave_) cudaFree(p);
     for (auto& kv : dcommit_ev_)
         if (kv.second) cudaEventDestroy(kv.second);
-    if (h_commitb_) cudaFreeHost(h_commitb_);
+    if (h_commitb_) strata::core::host_free_guarded(h_commitb_);
     if (qcnt_) cudaFree(qcnt_);
     if (d_spec_) cudaFree(d_spec_);
     if (tap_file_) std::fclose(tap_file_);
@@ -661,7 +661,7 @@ Verifier::~Verifier() {
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_w_, h_seq_, h_flag_, h_ymiss_,
                      h_flagA_, h_plan_, h_flagB_, h_plan_err_, h_nf_, herr_h_, hdrop_h_, h_bal_};
     for (void* h : hosts)
-        if (h) cudaFreeHost(h);
+        if (h) strata::core::host_free_guarded(h);
 }
 
 // STRATA_TAP_FILE: one record per row of the window: int32 position, int32 input token, then n_taps x n_embd floats
