@@ -4784,11 +4784,21 @@ class Service:
         if not s.get("busy") or not s.get("first_token"):
             return 0.0
         now = time.time()
-        newest = rate[-1] if rate else None
-        oldest = next(((t, g) for t, g in rate if now - t <= RATE_WINDOW_S), None)
-        if newest and oldest and newest[0] - oldest[0] >= RATE_MIN_SPAN_S:
-            return max(0.0, (newest[1] - oldest[1]) / (newest[0] - oldest[0]))
-        return s["generated"] / max(RATE_MIN_SPAN_S, now - s["first_token"])
+        # tokens over the last RATE_WINDOW_S up to now: a conversation that stops producing goes to 0 (the samples only
+        # come with tokens, so the newest one alone would keep an old rate)
+        start = now - RATE_WINDOW_S
+        base = None
+        for t, g in rate:
+            if t <= start:
+                base = (t, g)
+            else:
+                break
+        if base is None:
+            base = (s["first_token"], 0) if s["first_token"] > start else (rate[0] if rate else (s["first_token"], 0))
+        span = now - base[0]
+        if span < RATE_MIN_SPAN_S:
+            return s["generated"] / max(RATE_MIN_SPAN_S, now - s["first_token"])
+        return max(0.0, (s["generated"] - base[1]) / span)
 
     def _tok_s_mean(self):
         """The whole-request mean since the first token (the old formula), kept so the two can be compared."""
