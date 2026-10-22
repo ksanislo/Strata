@@ -1,4 +1,5 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
+#include "strata/core/capture_lock.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/on_device.hpp"
@@ -1587,7 +1588,7 @@ void FileExpertSource::close() {
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
         // the buffers' last copies end before they are freed (#1237)
-        if (!stage_ev_.empty()) (void) cudaDeviceSynchronize();
+        if (!stage_ev_.empty()) (void) strata::core::device_sync();
         stage_free_events();
         stage_buf_.clear();
         stage_key_.clear();
@@ -3468,7 +3469,7 @@ bool FileExpertSource::pin_cache_complement(
         err = "FileExpertSource: the GPU expert cache is not fully filled";
         return false;
     }
-    const cudaError_t sync = cudaDeviceSynchronize();
+    const cudaError_t sync = strata::core::device_sync();
     if (sync != cudaSuccess) {
         err = std::string("FileExpertSource: GPU expert cache is not ready: ") + cudaGetErrorString(sync);
         (void) cudaGetLastError();
