@@ -3871,6 +3871,7 @@ bool Verifier::batch_launch_rows(const int* rows, int S, int hbase, const int32_
     b_k_ = 0;
     b_steps_ = le_ - lb_;
     ring_now();
+    b_launches_.fetch_add(1, std::memory_order_release);
     b_running_.store(true, std::memory_order_release);   // last: an external server reads the rest after it
     return true;
 }
