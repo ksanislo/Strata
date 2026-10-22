@@ -192,7 +192,12 @@ function render(m) {
   } else {
     setPill("idle", "Idle");
   }
-  const conv = m.conversations || [], agg = m.aggregate;
+  // a server without "conversations" (started before this page was installed): one row per busy slot from live.slots
+  const conv = m.conversations || (live.slots || []).filter((x) => x.state !== "idle").map((x) => ({
+    slot: x.slot, state: x.state, prompt_tokens: x.prompt_tokens, prompt_read: x.prompt_read, generated: x.generated,
+    context_tokens: (x.prompt_tokens || 0) + (x.generated || 0), age_s: x.elapsed_s, tok_s: x.tok_s}));
+  const agg = m.aggregate;
+  $("engine-old").hidden = !!agg || !live.slots;
   if (conv.length > 1) {
     const n = (s) => conv.filter((c) => c.state === s).length;
     const parts = [[n("decoding"), "decoding"], [n("reading"), "reading"]].filter((x) => x[0]).map((x) => `${x[0]} ${x[1]}`);
