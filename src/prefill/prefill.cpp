@@ -2843,7 +2843,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
     };
     if (hand_in_ == nullptr) stopped_at_ = -1;
+    // a queued prompt's chunk on this stage's card (STRATA_BATCH_READS_DECODE_WINDOWS: a decode turn starts once no
+    // stage has one): set per chunk, cleared while waiting for the next stage and at the end
+    struct BusyOff {
+        std::atomic<bool>& b;
+        ~BusyOff() { b.store(false, std::memory_order_release); }
+    } busy_off{job_busy_};
     for (int64_t c0 = 0; c0 < n; c0 += C) {
+        if (job) job_busy_.store(true, std::memory_order_release);
         if (stop_cb && stop_cb()) { err = "cancelled"; return false; }
         if (job && job->failed()) return true;   // a later stage failed it: on_done has run
         // the first stage: end the run before this chunk (every chunk before it is handed on; the caller's drain
@@ -5076,6 +5083,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             // may already have forwarded its older chunk to later GPUs.
             if (stage_cb && !stage_cb(p0 + T, err)) return false;
             if (bat) seg_report(false);
+            job_busy_.store(false, std::memory_order_release);   // (this card's part of the chunk is done)
             if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
             next_err_.clear();
             next_->hand_in_ = h;
@@ -5165,6 +5173,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             host_sync_ms += std::chrono::duration<double, std::milli>(toc2 - toc).count();
             host_chunk_ms += ms_since(toc2);
         }
+        job_busy_.store(false, std::memory_order_release);
     }
     // Do not drain the successor here. This is the overlap: an intermediate
     // stage can return while later GPUs are still processing the previous chunk.

@@ -263,6 +263,9 @@ public:
     /// STRATA_BATCH_READS_DECODE_WINDOWS), never compute. `chunk_ms`: that stage's last chunk time. Set while idle.
     std::function<void(double chunk_ms)> between_chunks;
     double last_chunk_ms_ = -1.0;   ///< (a later stage: its last queued chunk's time, set on its hand-off thread)
+    /// A queued prompt's chunk is on this stage's card now (any thread may read).
+    bool reading_job() const { return job_busy_.load(std::memory_order_acquire); }
+    std::atomic<bool> job_busy_{false};
     static BatchFast batch_fast();
     static BatchPlan plan_batch(const std::deque<std::shared_ptr<PromptJob>>& q, int max_segs, int64_t budget,
                                 const BatchFast& fast, int64_t fast_cap, bool single_ok = false);
