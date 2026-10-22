@@ -260,10 +260,12 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, agg, 
   const BADGES = [["idle", "", "Idle"], ["reading", "st-badge--reading", "Reading"],
                   ["generating", "st-badge--generating", "Generating"], ["queued", "st-badge--queued", "Queued"],
                   ["error", "st-badge--error", "Error"]];
-  const block = (title, s, detail, pct) =>
+  const block = (title, s, detail, pct, ctxTok) =>
     `<div class="conv-state"><div class="state-card__head"><span>${esc(title)}</span><span class="badges">` +
     BADGES.map(([k, cls, t]) => `<span class="st-badge ${cls}${k === s ? " on" : ""}">${t}</span>`).join("") +
-    `</span></div><div class="state-card__row"><span class="muted">${detail}</span></div>` +
+    `</span></div><div class="state-card__row"><span class="muted">${detail}</span>` +
+    (ctxTok && eng.max_context ? `<span class="muted">context ${kfmt(ctxTok)} / ${ctxfmt(eng.max_context)} · ` +
+                                 `${Math.round((100 * ctxTok) / eng.max_context)}%</span>` : "") + `</div>` +
     `<div class="st-progress"${s === "reading" ? ' data-tone="info"' : ""}><div class="st-progress__bar" style="width:${pct || 0}%"></div></div></div>`;
   const STATE = {decoding: "generating", reading: "reading", queued: "queued", waiting: "queued"};
   const one = (c, title) => {
@@ -276,32 +278,44 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, agg, 
     } else if (s === "generating") {
       pct = c.max_tokens ? Math.min(100, (100 * (c.generated || 0)) / c.max_tokens) : 0;
       detail = `${fmt(c.generated)}${c.max_tokens ? ` / ${kfmt(c.max_tokens)}` : ""} tokens · ${fmt(c.tok_s, 1)} tok/s` +
-               ` · context ${kfmt(c.context_tokens)}${c.ttft_s != null ? ` · TTFT ${fmt(c.ttft_s, 1)} s` : ""}`;
+               `${c.ttft_s != null ? ` · TTFT ${fmt(c.ttft_s, 1)} s` : ""}`;
     } else if (s === "idle") {
-      detail = c.held_tokens ? `Idle · holds a conversation of ${kfmt(c.held_tokens)} tokens` : "Idle";
+      detail = c.held_tokens ? "Idle · keeps its conversation" : "Idle";
     } else {
       detail = `Waiting${c.queued_s != null ? ` ${fmt(c.queued_s, 1)} s` : ""} · ${kfmt(c.prompt_tokens)} prompt tokens`;
     }
-    return block(title, s, detail, pct);
+    // the conversation's own context: what it reads up to, what it holds while generating, or what an idle slot keeps
+    const ctxTok = s === "reading" || s === "queued" ? c.prompt_tokens : s === "generating" ? c.context_tokens : c.held_tokens;
+    return block(title, s, detail, pct, ctxTok);
   };
-  // every configured slot, in order and numbered from 1, so a conversation keeps its place; requests outside the
-  // slots (queued, or on the single-request path) follow
+  // every configured slot, in order and numbered from 1, so a conversation keeps its place. A request the engine
+  // runs on its single-conversation path (everything else idle) has no slot number: it shows in the first idle slot,
+  // where it lands when it ends. Only requests still waiting for the engine follow the slots, as Queued.
+  const solo = (c) => c.slot == null && (c.state === "reading" || c.state === "decoding");
+  if (live.state === "generating" || live.state === "reading")
+    for (const c of conv) if (solo(c) && c.tok_s == null && live.state === "generating") c.tok_s = live.tok_s;
   const bySlot = new Map(conv.filter((c) => c.slot != null).map((c) => [c.slot, c]));
   const slots = (live.slots || []).slice().sort((x, y) => x.slot - y.slot);
+  const loose = conv.filter(solo);
   let html = slots.map((x) => {
-    const c = bySlot.get(x.slot);
+    let c = bySlot.get(x.slot);
+    if (!c && x.state === "idle" && loose.length) c = loose.shift();
     return one(c ? {...c, held_tokens: x.held_tokens} : {...x, context_tokens: (x.prompt_tokens || 0) + (x.generated || 0)},
                `Slot ${x.slot + 1}`);
-  }).join("") + conv.filter((c) => c.slot == null || !slots.length).map((c) =>
-    one(c, c.slot == null ? (c.state === "queued" || c.state === "waiting" ? "Queued" : "Request") : `Slot ${c.slot + 1}`)).join("");
+  }).join("") + loose.concat(conv.filter((c) => c.slot == null && !solo(c))).map((c) =>
+    one(c, solo(c) ? "Request" : "Queued")).join("");
   if (!slots.length && conv.length) html = conv.map((c) => one(c, c.slot == null ? "Request" : `Slot ${c.slot + 1}`)).join("");
   $("conv-states").innerHTML = html;
 
   // the eight cards; Decode and Prefill: every slot together (the engine's own counts over the last 10 s)
   if (agg && agg.loaded) {
+    // the big numbers: every conversation's own current rate added up, live; the averages over time underneath
     const g = agg.generated_tok_s, p = agg.prompt_read_tok_s;
-    setMetric("speed", fmt(g["10s"], 1), "t/s", `Decode, all slots · 60 s ${fmt(g["60s"], 1)}`);
-    setMetric("prefill", fmt(p["10s"]), "t/s", `Prefill, all slots · 60 s ${fmt(p["60s"])}`);
+    const dec = conv.filter((c) => c.state === "decoding"), rd = conv.filter((c) => c.state === "reading");
+    const decNow = dec.reduce((t, c) => t + (c.tok_s || 0), 0);
+    const rdNow = rd.reduce((t, c) => t + (c.prompt_read && c.reading_s ? c.prompt_read / c.reading_s : 0), 0);
+    setMetric("speed", fmt(decNow, 1), "t/s", `Decode, ${dec.length} conversation${dec.length === 1 ? "" : "s"} · avg 60 s ${fmt(g["60s"], 1)}`);
+    setMetric("prefill", fmt(rdNow), "t/s", `Prefill, ${rd.length} reading · avg 60 s ${fmt(p["60s"])}`);
   } else {
     const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
     setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
@@ -344,16 +358,32 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, agg, 
   }
   spark("sp-disk", h.disk_read_mb);
 
-  // context fill: the running request, else the last one
-  const ctx = eng.max_context || 0;
-  let used = 0;
-  if (live.state !== "idle") used = (live.prompt_tokens || 0) + (live.generated || 0);
-  else if (last) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
-  const frac = ctx ? Math.min(1, used / ctx) : 0;
+  // context memory: what every slot's conversation takes of the cards' slot budget (the engine's KMEM lines); without
+  // that (an engine that does not report it), the running request's context as before
+  const sm = eng.slot_memory;
+  let frac = 0, sub = "–";
+  if (sm && sm.length) {
+    // the limit: the slots' budget plus what the expert cache can still give them (it grows on demand); the card
+    // nearest its own limit decides when a conversation can grow no more
+    const lim = (c) => c.total + (c.givable || 0), use = (c) => c.total - c.free;
+    const total = sm.reduce((t, c) => t + lim(c), 0), used = sm.reduce((t, c) => t + use(c), 0);
+    const hot = sm.reduce((a, c) => (lim(c) && use(c) / lim(c) > use(a) / (lim(a) || 1) ? c : a), sm[0]);
+    frac = lim(hot) ? Math.min(1, use(hot) / lim(hot)) : 0;
+    sub = `${gb(used)} of ${gb(total)} GB` + (sm.length > 1 ? ` · fullest GPU ${hot.device}` : "");
+    $("ctx-title").textContent = "Context memory";
+  } else {
+    const ctx = eng.max_context || 0;
+    let used = 0;
+    if (live.state !== "idle") used = (live.prompt_tokens || 0) + (live.generated || 0);
+    else if (last) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
+    frac = ctx ? Math.min(1, used / ctx) : 0;
+    sub = ctx ? `${kfmt(used)} / ${ctxfmt(ctx)}` : "–";
+    $("ctx-title").textContent = "Context fill";
+  }
   $("ctx-fill").setAttribute("stroke-dasharray", `${(235.6 * frac).toFixed(1)} 314.2`);
   $("ctx-fill").style.opacity = 235.6 * frac >= 3 ? "1" : "0";         // a near-zero arc would draw just its round cap
   $("ctx-pct").textContent = `${Math.round(frac * 100)}%`;
-  $("ctx-sub").textContent = ctx ? `${kfmt(used)} / ${ctxfmt(ctx)}` : "–";
+  $("ctx-sub").textContent = sub;
   const cacheBytes = (eng.expert_cache_mib || 0) * 1048576;
   $("slots-text").textContent = eng.expert_slots ? `${fmt(eng.expert_slots)} · ${gb(cacheBytes)} GB` : "–";
   $("slots-bar").style.width = hw.gpu_mem_total ? `${Math.min(100, (100 * cacheBytes) / hw.gpu_mem_total)}%` : "0%";
@@ -961,7 +991,21 @@ function addFiles(files) {
       if (!health.images) { toast("warn", "Pictures are off", "This model was set up for text only."); continue; }
       if (f.size > 20e6) { toast("warn", "Picture too large", `${f.name} is over 20 MB.`); continue; }
       const r = new FileReader();
-      r.onload = () => { attachments.push({kind: "image", name: f.name || "pasted image", url: r.result}); renderAttachments(); };
+      const add = (url) => { attachments.push({kind: "image", name: f.name || "pasted image", url}); renderAttachments(); };
+      r.onload = () => {
+        // a format the server cannot decode (Safari's HEIC photos): the browser decodes it, the server gets a JPEG
+        if (/^image\/(jpeg|png|gif|bmp|webp|avif)$/.test(f.type)) { add(r.result); return; }
+        const img = new Image();
+        img.onload = () => {
+          const c = document.createElement("canvas");
+          c.width = img.naturalWidth;
+          c.height = img.naturalHeight;
+          c.getContext("2d").drawImage(img, 0, 0);
+          add(c.toDataURL("image/jpeg", 0.92));
+        };
+        img.onerror = () => toast("warn", "Picture not readable", `${f.name || "This picture"}: the browser cannot decode ${f.type}.`);
+        img.src = r.result;
+      };
       r.readAsDataURL(f);
       continue;
     }

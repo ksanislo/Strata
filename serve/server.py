@@ -1183,6 +1183,9 @@ class StrataEngine:
         # STRATA_SLOT_ADMIT (INFO slot_admit=1): an admission's prompt is read into its slot beside the decoding slots;
         # the engine answers BGEN with `BQ <slot> 1` and the rest comes on the slot's own lines (see generate_batched)
         self.slot_admit = bool(self.batch) and str(self.info.get("slot_admit") or "") == "1"
+        # INFO slot_keep=1 (STRATA_PIPED_MTP: a window holds live slots only): an idle slot keeps its conversation, so
+        # pick_slot chooses by what the slots hold, as without pipelined groups
+        self.slot_keep = bool(self.batch) and str(self.info.get("slot_keep") or "") == "1"
         self.slot_busy = [False] * self.batch
         # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
         # given back; slot_releasing: slots handed to the background BDONE wait.  A busy slot in neither has no owner
@@ -1254,6 +1257,18 @@ class StrataEngine:
                 sample = parse_stage_in_flight_sample(line)
                 if sample is not None and self.proc is proc:
                     self.terminal_stage_sample = {**sample, "observed_monotonic": time.monotonic()}
+                continue
+            if line.startswith("KMEM "):               # KMEM <cards> (<device> <budget> <free> [<givable>])...: context memory
+                f = line.split()
+                try:
+                    n = int(f[1])
+                    w = (len(f) - 2) // n if n > 0 else 0   # 3 per card, or 4 with what the expert cache can still give
+                    cards = [{"device": int(f[2 + w * i]), "total": int(f[3 + w * i]), "free": int(f[4 + w * i]),
+                              "givable": int(f[5 + w * i]) if w >= 4 else 0} for i in range(n)] if w >= 3 else None
+                except (IndexError, ValueError, ZeroDivisionError):
+                    cards = None
+                if cards and self.proc is proc:
+                    self.info["slot_memory"] = cards
                 continue
             if line.startswith(SLOT_LINES) and slot_q:   # --batch: a batch slot's own lines
                 try:
@@ -2279,7 +2294,7 @@ class StrataEngine:
         if not free:
             return None
         gs = getattr(self, "slot_gs", 0)
-        if gs > 1:
+        if gs > 1 and not getattr(self, "slot_keep", False):
             # pipelined groups of several slots: the engine keeps no idle slot below a busy one as a conversation cache
             # (its pad row writes the slot), so nothing is worth keeping free for a next turn.  A group's window spans
             # its slots up to its last busy one, so first fill a hole below a busy slot of the same group (it costs no
@@ -2916,7 +2931,8 @@ class Vision:
             from PIL import ImageOps
             im = ImageOps.exif_transpose(im)             # the camera's orientation tag, applied (#1229)
         except Exception as e:
-            raise ValueError(f"the image could not be read ({e})") from None
+            kind = data[8:12].decode("latin-1") if data[4:8] == b"ftyp" else data[:8].hex()   # HEIC: ftyp heic/mif1
+            raise ValueError(f"the image could not be read ({e}; {len(data)} bytes, starts {kind!r})") from None
         if im.mode in ("RGBA", "LA", "P") and "transparency" in im.info or im.mode in ("RGBA", "LA"):
             im = im.convert("RGBA")
             bg = Image.new("RGB", im.size, (255, 255, 255))   # transparent areas become white, not black
