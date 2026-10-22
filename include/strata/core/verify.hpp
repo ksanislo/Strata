@@ -224,6 +224,11 @@ public:
     bool commit_slot_prefixes(const int* keep, std::string& err);
     /// --batch-mtp: slot rotation makes many row layouts, so bound the captured batch graph pairs (LRU). 0 = unbounded.
     void set_batch_graph_limit(size_t n) { batch_graph_limit_ = n; }
+    size_t batch_graph_limit() const { return batch_graph_limit_; }
+    /// The VRAM a batch layout's graph pair took when captured (measured, the mean; 0 before the first), and the layouts
+    /// held now: what the server keeps free for the layouts still to come.
+    uint64_t batch_graph_bytes() const { return bgraph_n_ ? bgraph_bytes_ / bgraph_n_ : 0; }
+    size_t batch_layouts() const { return exec_bm_.size(); }
 
     // ---- The stages of a layer split as a PIPELINE.  A batch window over the slot GROUP
     // [base, base + S) is launched on ONE stage with its commit right behind it on the stage's stream (a batch window
@@ -398,6 +403,7 @@ private:
     std::map<std::vector<int>, uint64_t> bm_used_;   ///< last use of each captured layout (LRU)
     uint64_t bm_tick_ = 0;
     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph (0.1.39); N: LRU-evict beyond N layouts
+    uint64_t bgraph_bytes_ = 0, bgraph_n_ = 0, bgraph_evictions_ = 0;   ///< batch_graph_bytes; evictions (and reliefs) so far
     int last_rows_[8] = {};                ///< the slots of the last batch window's rows
     std::vector<int> bkey(const int* rows, int S, int hbase) const {   // #871: the doorbell variant has its own graphs
         std::vector<int> k = batch_key(rows, S, hbase);

@@ -865,6 +865,34 @@ int64_t qsa_slot_budget_take(int dev, int64_t n, std::vector<strata::core::VmmCh
     }
     return k;
 }
+int64_t qsa_slot_budget_release(int dev, int64_t n) {
+    std::vector<strata::core::VmmChunk> out;
+    {
+        std::lock_guard<std::mutex> lk(g_slot_mu);
+        SlotBudget& b = g_slot_budget[dev];
+        for (; (int64_t) out.size() < n && !b.free.empty(); b.free.pop_back()) out.push_back(b.free.back());
+        b.total -= (int64_t) out.size();
+        b.made = std::max<int64_t>(0, b.made - (int64_t) out.size());
+    }
+    for (const strata::core::VmmChunk h : out) strata::core::vmm_chunk_free(h);
+    return (int64_t) out.size();
+}
+namespace {
+std::mutex g_relief_mu;
+VramRelief g_relief;
+}  // namespace
+void set_vram_relief(VramRelief f) {
+    std::lock_guard<std::mutex> lk(g_relief_mu);
+    g_relief = std::move(f);
+}
+uint64_t vram_relief(int dev, uint64_t bytes) {
+    VramRelief f;
+    {
+        std::lock_guard<std::mutex> lk(g_relief_mu);
+        f = g_relief;
+    }
+    return f ? f(dev, bytes) : 0;
+}
 int64_t qsa_slot_budget_chunks(int dev, int64_t* free, int64_t* made) {
     std::lock_guard<std::mutex> lk(g_slot_mu);
     const SlotBudget& b = g_slot_budget[dev];

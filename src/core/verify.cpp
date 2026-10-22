@@ -2296,7 +2296,8 @@ bool Verifier::capture(int T, std::string& err) {
     {   // said before the capture: a process that exits inside it (#1275: Windows, 313 MiB free) leaves this line as the trace
         size_t free_b = 0, total_b = 0;
         if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess)
-            std::fprintf(stderr, "strata verify: capturing the %d-token window (%zu MiB of VRAM free)\n", T, free_b >> 20);
+            std::fprintf(stderr, "strata verify: capturing the %d-token window (CUDA%d: %zu MiB of VRAM free)\n", T, device_,
+                         free_b >> 20);
         else
             (void) cudaGetLastError();
     }
@@ -3354,9 +3355,18 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
     }
     const bool made = instantiate_evicting(ex, graph, bkey(rows, S, hbase), "verify: batch instantiate: ", err);
     cudaGraphDestroy(graph);
-    if (!made) return false;
-    cudaGraphUpload(ex, cs_);
-    cudaStreamSynchronize(cs_);
+    if (!made) {
+        exec_bm_.erase(bkey(rows, S, hbase));   // (no empty entry left to count as a layout held)
+        return false;
+    }
+    const cudaError_t ue = cudaGraphUpload(ex, cs_);
+    if (ue != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
+        (void) cudaGetLastError();
+        cudaGraphExecDestroy(ex);
+        exec_bm_.erase(bkey(rows, S, hbase));
+        err = std::string("verify: batch upload: ") + cudaGetErrorString(ue == cudaSuccess ? cudaErrorMemoryAllocation : ue);
+        return false;
+    }
     std::string list;
     for (int t = 0; t < S; ++t) list += (t ? "," : "") + std::to_string(rows[t]);
     std::fprintf(stderr, "strata verify: captured the batch window over slots %s\n", list.c_str());
@@ -3475,7 +3485,18 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
     }
     const bool made = instantiate_evicting(cex, graph, bkey(rows, S, hbase), "verify: batch commit instantiate: ", err);
     cudaGraphDestroy(graph);
-    return made;
+    if (!made) return false;
+    // uploaded here, as the window's graph: its VRAM is taken now, never at a launch behind a window already running
+    const cudaError_t ue = cudaGraphUpload(cex, cs_);
+    if (ue != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
+        (void) cudaGetLastError();
+        cudaGraphExecDestroy(cex);
+        cex = nullptr;
+        commit_bm_.erase(bkey(rows, S, hbase));
+        err = std::string("verify: batch commit upload: ") + cudaGetErrorString(ue == cudaSuccess ? cudaErrorMemoryAllocation : ue);
+        return false;
+    }
+    return true;
 }
 
 bool Verifier::evict_batch_graph(const std::vector<int>& keep, bool& evicted, std::string& err) {
@@ -3494,6 +3515,7 @@ bool Verifier::evict_batch_graph(const std::vector<int>& keep, bool& evicted, st
         return false;
     }
     const auto old_key = old->first;
+    ++bgraph_evictions_;
     if (old->second) cudaGraphExecDestroy(old->second);
     exec_bm_.erase(old);
     bm_used_.erase(old_key);
@@ -3524,8 +3546,24 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
     if (freed > 0)
         std::fprintf(stderr, "strata verify: no VRAM for a new window graph: freed the graphs of %d older batch slot "
                              "layouts, %zu kept (a larger --vram-reserve-mib keeps more)\n", freed, exec_bm_.size());
+    // still short: the server gives up expert cache or slot budget on this card (vram_relief), a few times
+    uint64_t relieved = 0;
+    for (int tries = 0; ie == cudaErrorMemoryAllocation && tries < 4; ++tries) {
+        (void) cudaGetLastError();
+        const uint64_t got = vram_relief(device_, 64ull << 20);
+        if (got == 0) break;
+        ++bgraph_evictions_;
+        relieved += got;
+        ie = cudaGraphInstantiate(&ex, graph, 0);
+    }
+    if (relieved > 0)
+        std::fprintf(stderr, "strata verify: CUDA%d: %llu MiB given up for a window graph (%s)\n", device_,
+                     (unsigned long long) (relieved >> 20), ie == cudaSuccess ? "it fits now" : "still short");
     if (ie != cudaSuccess) {
-        err = std::string(what) + cudaGetErrorString(ie);
+        size_t fb = 0, tb = 0;
+        if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) (void) cudaGetLastError();
+        err = std::string(what) + cudaGetErrorString(ie) + " (CUDA" + std::to_string(device_) + ", " +
+              std::to_string(fb >> 20) + " MiB free)";
         return false;
     }
     return true;
@@ -3557,7 +3595,16 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
         !evict_batch_graph(key, evicted, err))
         return false;
     bm_used_[key] = ++bm_tick_;
+    const bool fresh = exec_bm_.find(key) == exec_bm_.end();
+    size_t f0 = 0, f1 = 0, tb = 0;
+    const uint64_t ev0 = bgraph_evictions_;
+    if (fresh && cudaMemGetInfo(&f0, &tb) != cudaSuccess) { (void) cudaGetLastError(); f0 = 0; }
     if (!capture_batch(rows, S, hbase, err) || !capture_commit_batch(rows, S, hbase, err)) return false;
+    // what the new layout's graph pair took (only when nothing was freed meanwhile): batch_graph_bytes
+    if (fresh && f0 > 0 && bgraph_evictions_ == ev0 && cudaMemGetInfo(&f1, &tb) == cudaSuccess && f1 < f0) {
+        bgraph_bytes_ += f0 - f1;
+        ++bgraph_n_;
+    }
     const Clock::time_point t0 = Clock::now();
     const QsaShapes s = shapes_of(g);
     for (int t = 0; t < S; ++t) {
