@@ -1,5 +1,6 @@
 
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
+#include "strata/core/capture_lock.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/pin_budget.hpp"
 #include "strata/core/native_dense.hpp"
@@ -702,7 +703,7 @@ int64_t qsa_kv_elastic_need(int64_t cells) {
 bool qsa_kv_elastic_grow(int64_t cells, const std::function<strata::core::VmmChunk()>& take) {
     for (auto& p : g_pools)
         if (!pool_grow(*p, cells, take)) return false;
-    return cudaDeviceSynchronize() == cudaSuccess;
+    return strata::core::device_sync() == cudaSuccess;
 }
 int64_t qsa_kv_elastic_shrink(int64_t cells, const std::function<void(strata::core::VmmChunk)>& give) {
     const uint64_t G = strata::core::vmm_granularity();
@@ -960,7 +961,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     } else {
         strata::kernels::kv_ring_table(st.page_table, pages, p.slots, nullptr);
     }
-    cudaDeviceSynchronize();
+    strata::core::device_sync();
     return c.used;
 }
 
@@ -1086,7 +1087,7 @@ static void st_end(int64_t layer, int slot, void* stream) {
 
 void stage_timing_report(int64_t n_layers) {
     if (!g_st.on) return;
-    cudaDeviceSynchronize();
+    strata::core::device_sync();
     double tot[STAGE_SLOTS] = {};
     for (int s = 0; s < g_st.nslots; ++s) {
         for (int64_t l = 0; l < n_layers && l < 64; ++l) {
