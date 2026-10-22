@@ -120,6 +120,20 @@ int main() {
         expect(p6.fast && p6.at == std::vector<size_t>({1}) && p6.got == v({40}), "fast alone, ahead of the queue");
         f.tokens = 0;
         expect(!Prefill::plan_batch(only, 8, 2048, f, 1023).fast, "FAST=0: off");
+        // STRATA_BATCH_READS_FAST_SHRINK: a short read on its way, nothing urgent queued yet: short chunks, a lone
+        // reader's piece sliced too (a batch of one)
+        f.tokens = 512;
+        std::deque<std::shared_ptr<PromptJob>> one;
+        one.push_back(job(&sa, 2048));
+        one.push_back(job(&sa, 2048));
+        const Prefill::BatchPlan s1 = Prefill::plan_batch(one, 8, 512, f, 1023, true);
+        expect(s1.fast && s1.at == std::vector<size_t>({0}) && s1.got == v({512}), "shrink: a lone reader's 512");
+        expect(Prefill::plan_batch(one, 8, 512, f, 1023, false).at.empty(), "no shrink: a lone reader goes the usual way");
+        std::deque<std::shared_ptr<PromptJob>> two;
+        two.push_back(job(&sa, 2048));
+        two.push_back(job(&sb, 2048));
+        const Prefill::BatchPlan s2 = Prefill::plan_batch(two, 8, 512, f, 1023, true);
+        expect(!s2.fast && s2.got == v({256, 256}), "shrink: two readers share 512");
     }
     if (fails == 0) std::printf("batch_reads_test: ok\n");
     return fails == 0 ? 0 : 1;

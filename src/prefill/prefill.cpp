@@ -5366,8 +5366,20 @@ void Prefill::enqueue(std::vector<std::shared_ptr<PromptJob>> jobs, bool front) 
         jobs_->th = std::thread([this] {
             strata::aux_cpus::pin_current_thread();
             JobQueue& jq = *jobs_;
+            double last_ms = -1.0;   // the stage-0 time of the last chunk (between_chunks sizes the decode share by it)
             for (;;) {
                 std::shared_ptr<PromptJob> j;
+                if (between_chunks && last_ms >= 0.0) {   // (an urgent read goes on at once)
+                    bool urgent = false;
+                    {
+                        std::unique_lock<std::mutex> lk(jq.mu);
+                        jq.cv.wait(lk, [&] { return jq.stop || !jq.q.empty(); });
+                        if (jq.q.empty()) return;
+                        for (const auto& x : jq.q) urgent = urgent || (x->urgent && x->taken == 0);
+                    }
+                    if (!urgent) between_chunks(last_ms);
+                    last_ms = -1.0;
+                }
                 {
                     std::unique_lock<std::mutex> lk(jq.mu);
                     jq.cv.wait(lk, [&] { return jq.stop || !jq.q.empty(); });
@@ -5381,10 +5393,12 @@ void Prefill::enqueue(std::vector<std::shared_ptr<PromptJob>> jobs, bool front) 
                 }
                 std::string e;
                 const int64_t off = j->segs.empty() ? j->taken : 0;   // (the rest of a prompt a batch sliced)
+                const auto t_job = std::chrono::steady_clock::now();
                 if (!j->failed() && !run_impl(j->tokens.data() + off, (int64_t) j->tokens.size() - off, j->pos0 + off, e,
                                               j, 0, true))
                     j->finish(false, e.empty() ? std::string("prefill: the prompt read failed") : e);
                 (void) cudaGetLastError();
+                last_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_job).count();
                 {
                     std::lock_guard<std::mutex> lk(jq.mu);
                     jq.busy = false;
@@ -5451,17 +5465,18 @@ Prefill::BatchFast Prefill::batch_fast() {
         x.tokens = batch_reads_max() > 0 ? num("STRATA_BATCH_READS_FAST", 512) : 0;
         x.share = num("STRATA_BATCH_READS_FAST_SHARE", 128);
         x.chunk = num("STRATA_BATCH_READS_FAST_CHUNK", 0);
+        x.shrink = num("STRATA_BATCH_READS_FAST_SHRINK", 512);
         return x;
     }();
     return f;
 }
 
 Prefill::BatchPlan Prefill::plan_batch(const std::deque<std::shared_ptr<PromptJob>>& q, int max_segs, int64_t budget) {
-    return plan_batch(q, max_segs, budget, BatchFast{}, 0);
+    return plan_batch(q, max_segs, budget, BatchFast{}, 0, false);
 }
 
 Prefill::BatchPlan Prefill::plan_batch(const std::deque<std::shared_ptr<PromptJob>>& q, int max_segs, int64_t budget,
-                                       const BatchFast& fast, int64_t fast_cap) {
+                                       const BatchFast& fast, int64_t fast_cap, bool single_ok) {
     BatchPlan p;
     if (max_segs < 2 || q.empty() || budget < 2) return p;
     // the first queued piece of every session that can share a chunk (a session's later pieces wait for its first)
@@ -5506,9 +5521,10 @@ Prefill::BatchPlan Prefill::plan_batch(const std::deque<std::shared_ptr<PromptJo
             return p;
         }
     }
-    if (q.size() < 2 || !batchable(*q.front())) return p;
+    if (q.empty() || !batchable(*q.front()) || (q.size() < 2 && !single_ok)) return p;
     if (cand.size() > (size_t) max_segs) cand.resize((size_t) max_segs);
-    if (cand.size() < 2) return p;
+    if (cand.size() < (single_ok ? 1u : 2u)) return p;
+    p.fast = single_ok && cand.size() == 1;   // (a lone reader's piece in a short chunk: a batch of one)
     p.at = cand;
     std::vector<int64_t> left;
     for (size_t i : p.at) left.push_back(left_of(i));
@@ -5521,7 +5537,11 @@ Prefill::BatchPlan Prefill::plan_batch(const std::deque<std::shared_ptr<PromptJo
 std::shared_ptr<PromptJob> Prefill::take_batch(std::deque<std::shared_ptr<PromptJob>>& q) {
     const BatchFast fast = batch_fast();
     const int64_t fast_cap = fast.chunk > 0 ? fast.chunk : std::max<int64_t>(fast.tokens, stream_all_min() - 1);
-    const BatchPlan pl = plan_batch(q, batch_reads_max(), batch_budget(), fast, fast_cap);
+    // a short read admitted but not queued yet (its set-up runs): the chunks before it stay short, so the stages ahead
+    // of it drain sooner (STRATA_BATCH_READS_FAST_SHRINK)
+    const bool shrink = fast.tokens > 0 && fast.shrink > 0 && urgent_wait_.load(std::memory_order_acquire);
+    const int64_t budget = shrink ? std::min(batch_budget(), fast.shrink) : batch_budget();
+    const BatchPlan pl = plan_batch(q, batch_reads_max(), budget, fast, fast_cap, shrink);
     if (pl.at.empty()) return nullptr;
     auto b = std::make_shared<PromptJob>();
     std::vector<size_t> gone;
@@ -5544,9 +5564,13 @@ std::shared_ptr<PromptJob> Prefill::take_batch(std::deque<std::shared_ptr<Prompt
     }
     for (auto it = gone.rbegin(); it != gone.rend(); ++it) q.erase(q.begin() + (std::ptrdiff_t) *it);
     std::string parts;
-    for (const auto& sg : b->segs) parts += (parts.empty() ? "" : "+") + std::to_string((long long) sg.n);
+    bool urgent_in = false;
+    for (const auto& sg : b->segs) {
+        parts += (parts.empty() ? "" : "+") + std::to_string((long long) sg.n);
+        urgent_in = urgent_in || sg.job->urgent;
+    }
     std::fprintf(stderr, "strata prefill: STRATA_BATCH_READS: one %schunk of %zu prompts (%s tokens)\n",
-                 pl.fast ? "fast " : "", b->segs.size(), parts.c_str());
+                 urgent_in ? "fast " : shrink ? "short " : "", b->segs.size(), parts.c_str());
     // a stage that fails the chunk fails every prompt in it; each prompt's own end is reported by the last stage
     b->on_done = [segs = b->segs](bool ok, const std::string& e) {
         if (ok) return;
