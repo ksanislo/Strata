@@ -13901,10 +13901,18 @@ int main(int argc, char** argv) {
         auto stage_ss = [&](size_t k) -> strata::core::SessionState& { return k == 0 ? ss : stages[k - 1]->ss; };
         auto stage_stream = [&](size_t k) -> cudaStream_t { return k == 0 ? main_stream : (cudaStream_t) stages[k - 1]->stream; };
         // STRATA_READ_INTERLEAVE_LAYERS=L (0: off): a read beside the slots stops every L layers of a piece while this card
-        // ran a slot window lately (its queued layers finish first) and lets the window in flight run alone (at most
+        // ran a slot window lately, until its queued layers are done, then lets the window in flight run alone (at most
         // STRATA_READ_INTERLEAVE_WAIT_MS, 50), so a window waits for at most L layers of the piece, not the whole piece.
-        // Only the order of independent work on the card changes.
-        struct RiStat { std::atomic<int64_t> gaps{0}, waits{0}, wait_us{0}; };
+        // Only the order of independent work on the card changes.  The hook makes no CUDA call that waits (a thread
+        // waiting in the driver while a window there spins on a host flag can hold up that window's service, #31): the
+        // read's stream rings a doorbell in mapped RAM that the hook polls.  A stop ends within STRATA_READ_INTERLEAVE_DRAIN_MS
+        // (1000) + WAIT_MS, and at once when the window made no progress for STRATA_READ_INTERLEAVE_STALL_MS (5).
+        struct RiStat {
+            std::atomic<int64_t> gaps{0}, waits{0}, wait_us{0};
+            volatile uint32_t* mark = nullptr;   // mapped RAM the read's stream rings at a stop (one read thread a stage)
+            uint32_t* mark_dev = nullptr;
+            uint32_t rung = 0;
+        };
         static const int ri_layers = [] {
             const char* v = std::getenv("STRATA_READ_INTERLEAVE_LAYERS");
             return v != nullptr ? std::max(0, std::atoi(v)) : 0;
@@ -13921,19 +13929,45 @@ int main(int argc, char** argv) {
             };
             const auto wait_cap = std::chrono::microseconds((int64_t) (ms_env("STRATA_READ_INTERLEAVE_WAIT_MS", 50.0) * 1000.0));
             const auto recent = std::chrono::microseconds((int64_t) (ms_env("STRATA_READ_INTERLEAVE_RECENT_MS", 250.0) * 1000.0));
-            for (int k = 0; k < n_pipe; ++k) {
+            const auto stall = std::chrono::microseconds((int64_t) (ms_env("STRATA_READ_INTERLEAVE_STALL_MS", 5.0) * 1000.0));
+            const auto drain_cap = std::chrono::microseconds((int64_t) (ms_env("STRATA_READ_INTERLEAVE_DRAIN_MS", 1000.0) * 1000.0));
+            uint32_t* marks = nullptr;   // (allocated here, before any read: an allocation takes the driver's lock)
+            if (cudaHostAlloc((void**) &marks, 64 * (size_t) n_pipe, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+                (void) cudaGetLastError();
+                marks = nullptr;
+                std::fprintf(stderr, "strata batch: STRATA_READ_INTERLEAVE_LAYERS: no mapped RAM for the stops; off\n");
+            }
+            for (int k = 0; marks != nullptr && k < n_pipe; ++k) {
                 strata::prefill::Prefill& pk = stage_prefill((size_t) k);
                 strata::core::Verifier* vk = &stage_verifier(k);
                 RiStat* st = &(*ri_stat)[(size_t) k];
+                st->mark = marks + 16 * k;
+                *st->mark = 0;
+                {
+                    const strata::core::OnDevice on(vk->device());
+                    if (cudaHostGetDevicePointer((void**) &st->mark_dev, (void*) st->mark, 0) != cudaSuccess) {
+                        (void) cudaGetLastError();
+                        continue;   // (this stage's reads do not stop)
+                    }
+                }
                 pk.layer_gap_every = ri_layers;
-                pk.on_layer_gap = [vk, st, ri_stat, wait_cap, recent](int64_t, void* stream) {
-                    if (!vk->batch_busy() && Clock::now() - vk->batch_last_activity() > recent) return;
+                pk.on_layer_gap = [vk, st, ri_stat, wait_cap, recent, stall, drain_cap](int64_t, void* stream) {
+                    if (stream == nullptr || (!vk->batch_busy() && Clock::now() - vk->batch_last_activity() > recent)) return;
+                    // a window in flight that has not moved for `stall`: it waits on something other than the card
+                    auto stuck = [&] { return vk->batch_busy() && Clock::now() - vk->batch_last_activity() > stall; };
+                    strata::kernels::doorbell_ring(st->mark_dev, stream);
+                    const uint32_t want = ++st->rung;
+                    if (cudaPeekAtLastError() != cudaSuccess) return;   // (the read's next check reports it)
                     st->gaps.fetch_add(1, std::memory_order_relaxed);
-                    cudaStreamSynchronize((cudaStream_t) stream);   // (an error stays for the read's next call to report)
+                    const auto t0 = Clock::now();
+                    while (*st->mark < want) {   // the read's queued layers (host memory, no CUDA call)
+                        if (stuck() || Clock::now() - t0 >= drain_cap) return;
+                        std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    }
                     if (!vk->batch_busy()) return;
                     const int64_t c = vk->batch_launches();
-                    const auto t0 = Clock::now();
-                    while (vk->batch_busy() && vk->batch_launches() == c && Clock::now() - t0 < wait_cap)
+                    const auto t1 = Clock::now();
+                    while (vk->batch_busy() && vk->batch_launches() == c && !stuck() && Clock::now() - t1 < wait_cap)
                         std::this_thread::sleep_for(std::chrono::microseconds(50));
                     st->waits.fetch_add(1, std::memory_order_relaxed);
                     st->wait_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count(),
