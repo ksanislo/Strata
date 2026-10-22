@@ -203,3 +203,7 @@ main { flex: 1; min-height: 0; display: flex; }
 .conv-read { display: flex; align-items: center; gap: 8px; min-width: 140px; }
 .conv-read .st-progress { flex: 1; min-width: 60px; }
 .engine-facts { grid-template-columns: minmax(160px, max-content) 1fr; gap: 6px var(--st-s-6); font-size: var(--st-fs-sm); }
+
+.conv-states { display: flex; flex-direction: column; gap: 10px; margin-top: 8px; }
+.conv-state { border-top: 1px solid var(--st-border, rgba(127,127,127,.25)); padding-top: 8px; }
+.conv-state:first-child { border-top: 0; padding-top: 0; }
