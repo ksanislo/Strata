@@ -1289,6 +1289,17 @@ class StrataEngine:
                 if sample is not None and self.proc is proc:
                     self.terminal_stage_sample = {**sample, "observed_monotonic": time.monotonic()}
                 continue
+            if line.startswith("KMEM "):               # KMEM <cards> (<device> <total> <free>)...: the slots' context memory
+                f = line.split()
+                try:
+                    n = int(f[1])
+                    cards = [{"device": int(f[2 + 3 * i]), "total": int(f[3 + 3 * i]), "free": int(f[4 + 3 * i])}
+                             for i in range(n)]
+                except (IndexError, ValueError):
+                    cards = None
+                if cards and self.proc is proc:
+                    self.info["slot_memory"] = cards
+                continue
             if line.startswith(SLOT_LINES) and slot_q:   # --batch: a batch slot's own lines
                 try:
                     slot_q[int(line.split()[1])].put(line)
