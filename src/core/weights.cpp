@@ -1,4 +1,5 @@
 // src/core/weights.cpp - the dense-weight loader.  See the header for the engine-vs-pack distinction.
+#include "strata/core/capture_lock.hpp"
 #include "strata/core/weights.hpp"
 #include <vector>
 #include <cmath>
@@ -506,7 +507,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
     report_.arena_bytes = pool;
     report_.read_ms = now_ms() - t_read0 - upload_ms;
     report_.upload_ms = upload_ms;
-    if (cudaDeviceSynchronize() != cudaSuccess) { err = "cudaDeviceSynchronize after the load failed"; return false; }
+    if (strata::core::device_sync() != cudaSuccess) { err = "cudaDeviceSynchronize after the load failed"; return false; }
     return true;
 }
 
