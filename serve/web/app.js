@@ -269,20 +269,19 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, agg, 
   const BADGES = [["idle", "", "Idle"], ["reading", "st-badge--reading", "Reading"],
                   ["generating", "st-badge--generating", "Generating"], ["queued", "st-badge--queued", "Queued"],
                   ["error", "st-badge--error", "Error"]];
-  const block = (title, s, detail, pct, ctxTok) =>
-    `<div class="conv-state"><div class="state-card__head"><span>${esc(title)}</span><span class="badges">` +
-    BADGES.map(([k, cls, t]) => `<span class="st-badge ${cls}${k === s ? " on" : ""}">${t}</span>`).join("") +
-    `</span></div><div class="state-card__row"><span class="muted">${detail}</span></div>` +
-    `<div class="st-progress"${s === "reading" ? ' data-tone="info"' : ""}><div class="st-progress__bar" style="width:${pct || 0}%"></div></div>` +
-    ctxRow(ctxTok) + `</div>`;
-  // the slot's context against the limit: a thin bar (amber past 75%, red past 90%) and its figures
-  const ctxRow = (tok) => {
-    if (!tok || !eng.max_context) return "";
-    const p = Math.min(100, (100 * tok) / eng.max_context);
-    const tone = p > 90 ? ' data-tone="danger"' : p > 75 ? ' data-tone="warn"' : "";
-    return `<div class="conv-ctx"><span class="muted">context</span><div class="st-progress"${tone}>` +
-           `<div class="st-progress__bar" style="width:${p.toFixed(1)}%"></div></div>` +
-           `<span class="muted">${kfmt(tok)} / ${ctxfmt(eng.max_context)} · ${Math.round(p)}%</span></div>`;
+  // a slot: its badges; one line with the state on the left and its context figures on the right; one bar split in two
+  // halves - the state's progress on top, the context against the limit below (grey, amber past 75%, red past 90%)
+  const block = (title, s, detail, pct, ctxTok) => {
+    const max = eng.max_context || 0, cp = ctxTok && max ? Math.min(100, (100 * ctxTok) / max) : 0;
+    const ctone = cp > 90 ? ' data-tone="danger"' : cp > 75 ? ' data-tone="warn"' : "";
+    const ctxText = ctxTok && max ? `${kfmt(ctxTok)} / ${ctxfmt(max)}` : "";
+    return `<div class="conv-state"><div class="state-card__head"><span>${esc(title)}</span><span class="badges">` +
+      BADGES.map(([k, cls, t]) => `<span class="st-badge ${cls}${k === s ? " on" : ""}">${t}</span>`).join("") +
+      `</span></div><div class="state-card__row"><span class="muted slot-detail">${detail}</span>` +
+      (ctxText ? `<span class="muted slot-ctx">${ctxText}</span>` : "") + `</div>` +
+      `<div class="slot-bars"${ctxText ? ` title="context ${ctxText} (${Math.round(cp)}%)"` : ""}>` +
+      `<div class="st-progress"${s === "reading" ? ' data-tone="info"' : ""}><div class="st-progress__bar" style="width:${pct || 0}%"></div></div>` +
+      `<div class="st-progress slot-ctx-bar"${ctone}><div class="st-progress__bar" style="width:${cp.toFixed(1)}%"></div></div></div></div>`;
   };
   const STATE = {decoding: "generating", reading: "reading", queued: "queued", waiting: "queued"};
   const one = (c, title) => {
