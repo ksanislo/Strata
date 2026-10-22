@@ -342,6 +342,13 @@ void qsa_slot_budget_give(int dev, VmmChunk h);
 int64_t qsa_slot_budget_take(int dev, int64_t n, std::vector<VmmChunk>& out);
 /// Chunks the budget holds now; `free` of them unused, `made` made at load.
 int64_t qsa_slot_budget_chunks(int dev, int64_t* free, int64_t* made);
+/// Frees up to `n` unused budget chunks back to the driver (VRAM for allocations outside the budget); returns how many.
+int64_t qsa_slot_budget_release(int dev, int64_t n);
+/// VRAM relief: an allocation on device `dev` that failed asks for `bytes` (the server's handler gives up expert cache or
+/// slot budget); returns the bytes freed, 0 when none (no handler set, or nothing to give).
+using VramRelief = std::function<uint64_t(int dev, uint64_t bytes)>;
+void set_vram_relief(VramRelief f);
+uint64_t vram_relief(int dev, uint64_t bytes);
 /// Chunks the states still lack to hold `cells` cells.
 int64_t qsa_slots_need(const std::vector<const QsaState*>& states, int64_t cells);
 /// Backs `cells` cells in every state (all on one device): all or nothing, false when the budget is short.  New chunks
