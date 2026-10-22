@@ -45,7 +45,12 @@ __device__ float warp_sum(float x) {
 // TAB (#280, STRATA_ROPE_TABLE=1): the angles from the session's float64 table.  The host launches <false> whenever
 // no table applies - the default - so the default kernel is 0.1.31's code exactly (the table read is not in it;
 // with it merely skipped at run time, the compiled default path changed its results).
-template <bool TAB>
+// ROW (a batch window's slot rows): the block's (t, h, w) come staged per step in `thw`, not from the shared table
+template <bool ROW>
+__device__ __forceinline__ int idx_rope_pos(const int32_t* mtab, const int32_t* thw, int rope_pos, int pair) {
+    return ROW ? __ldg(thw + pair % 3) : mrope_pos(mtab, rope_pos, pair);
+}
+template <bool TAB, bool ROW = false>
 __device__ __forceinline__ void append_body(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
                         int pos_stride, int n_steps,
                         int pos_base, const float* __restrict__ gamma, float epsilon,
@@ -53,7 +58,8 @@ __device__ __forceinline__ void append_body(const float* __restrict__ raw, const
                         float* __restrict__ pooled, int32_t* __restrict__ block_pos,
                         int max_cells, float theta_scale, float freq_scale, float corr_low,
                         float corr_high, float ext_factor, float mscale,
-                        const int32_t* __restrict__ mtab, const RopeTab& rt) {
+                        const int32_t* __restrict__ mtab, const RopeTab& rt,
+                        const int32_t* __restrict__ thw = nullptr) {
     __shared__ float values[D];
     __shared__ float partials[32];
     const int d = threadIdx.x;
@@ -99,8 +105,9 @@ __device__ __forceinline__ void append_body(const float* __restrict__ raw, const
                         // The spare (pos == 0) keeps its zero angle; under YaRN the mscale magnitude still rides in
                         // through cos(0) - which is exactly what the queries are scaled by, so the top-k is unmoved.
                         float c, s;
-                        if (!(TAB && rope_tab_cs(rt, pos == 0 ? 0 : mrope_pos(mtab, rope_pos, pair), pair, c, s))) {
-                            const float theta_extrap = (pos == 0 ? 0 : mrope_pos(mtab, rope_pos, pair)) * powf(theta_scale, float(pair));
+                        const int32_t* ts = ROW ? thw + (std::size_t) step_idx * 3 : nullptr;
+                        if (!(TAB && rope_tab_cs(rt, pos == 0 ? 0 : idx_rope_pos<ROW>(mtab, ts, rope_pos, pair), pair, c, s))) {
+                            const float theta_extrap = (pos == 0 ? 0 : idx_rope_pos<ROW>(mtab, ts, rope_pos, pair)) * powf(theta_scale, float(pair));
                             rope_scaled_angle(theta_extrap, freq_scale, corr_low, corr_high, ext_factor, mscale, pair, c, s);
                         }
                         const float a = values[pair], z = values[pair + ROT / 2];
@@ -116,7 +123,7 @@ __device__ __forceinline__ void append_body(const float* __restrict__ raw, const
         if (n_steps > 1) __syncthreads();
     }
 }
-template <bool TAB>
+template <bool TAB, bool ROW = false>
 __global__ void append(const float* __restrict__ raw, const int32_t* __restrict__ pos_dev,
                         int pos_stride, int n_steps,
                         int pos_base, const float* __restrict__ gamma, float epsilon,
@@ -124,9 +131,9 @@ __global__ void append(const float* __restrict__ raw, const int32_t* __restrict_
                         float* __restrict__ pooled, int32_t* __restrict__ block_pos,
                         int max_cells, float theta_scale, float freq_scale, float corr_low,
                         float corr_high, float ext_factor, float mscale,
-                        const int32_t* __restrict__ mtab, RopeTab rt) {
-    append_body<TAB>(raw, pos_dev, pos_stride, n_steps, pos_base, gamma, epsilon, tail, dead, pooled, block_pos, max_cells,
-                     theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale, mtab, rt);
+                        const int32_t* __restrict__ mtab, RopeTab rt, const int32_t* __restrict__ thw = nullptr) {
+    append_body<TAB, ROW>(raw, pos_dev, pos_stride, n_steps, pos_base, gamma, epsilon, tail, dead, pooled, block_pos,
+                          max_cells, theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale, mtab, rt, thw);
 }
 // engine-latency: the commit's appends of several QSA layers in one launch, one block per layer (blockIdx.x); each block
 // first restores its layer's tail from the window's snapshot (the commit's copy_from_mapped), then runs append's body
@@ -269,7 +276,8 @@ bool native_qsa_indexer_enabled() { return enabled.load(std::memory_order_relaxe
 void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_pos_device,
                                      int pos_stride, int n_steps, int32_t pos_base,
                                      const float* gamma, float epsilon, const QsaIndexerBuffers& b,
-                                     const QsaShapes& s, int64_t max_cells, const RopeScaling& scaling, void* stream) {
+                                     const QsaShapes& s, int64_t max_cells, const RopeScaling& scaling, void* stream,
+                                     const int32_t* thw) {
     if (n_steps <= 0) return;
     if (!stream || s.idx_dim != D || s.idx_block != R || s.n_rot != ROT ||
         max_cells < 1 || max_cells > INT32_MAX || pos_base < 0 || pos_base % R ||
@@ -285,7 +293,16 @@ void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_p
     const float theta_scale = powf((float) scaling.freq_base, -2.0f / ROT);
     const RopeKernelArgs k = scaling.kernel_args(ROT);   // none: the identity constants
     const RopeTab rt = rope_table_for(scaling);
-    if (rt.cos != nullptr)
+    if (thw != nullptr) {   // a slot row: its block's (t, h, w) staged beside it
+        if (rt.cos != nullptr)
+            append<true, true><<<1,THREADS,0,static_cast<cudaStream_t>(stream)>>>(raw,relative_pos_device,pos_stride,n_steps,
+                pos_base,gamma,epsilon,b.tail,b.dead,b.pooled,b.block_pos,int(max_cells),theta_scale,k.freq_scale,
+                k.corr_low,k.corr_high,k.ext_factor,k.attn_factor,nullptr,rt,thw);
+        else
+            append<false, true><<<1,THREADS,0,static_cast<cudaStream_t>(stream)>>>(raw,relative_pos_device,pos_stride,n_steps,
+                pos_base,gamma,epsilon,b.tail,b.dead,b.pooled,b.block_pos,int(max_cells),theta_scale,k.freq_scale,
+                k.corr_low,k.corr_high,k.ext_factor,k.attn_factor,nullptr,rt,thw);
+    } else if (rt.cos != nullptr)
         append<true><<<1,THREADS,0,static_cast<cudaStream_t>(stream)>>>(raw,relative_pos_device,pos_stride,n_steps,pos_base,gamma,epsilon,
             b.tail,b.dead,b.pooled,b.block_pos,int(max_cells),theta_scale,k.freq_scale,
             k.corr_low,k.corr_high,k.ext_factor,k.attn_factor,mrope_table(),rt);
@@ -334,8 +351,10 @@ void native_qsa_indexer_append_steps_layers(const float* raw0, int64_t raw_strid
 
 void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_device, int32_t pos_base,
                                const float* gamma, float epsilon, const QsaIndexerBuffers& b,
-                               const QsaShapes& s, int64_t max_cells, const RopeScaling& scaling, void* stream) {
-    native_qsa_indexer_append_steps(raw, relative_pos_device, 0, 1, pos_base, gamma, epsilon, b, s, max_cells, scaling, stream);
+                               const QsaShapes& s, int64_t max_cells, const RopeScaling& scaling, void* stream,
+                               const int32_t* thw) {
+    native_qsa_indexer_append_steps(raw, relative_pos_device, 0, 1, pos_base, gamma, epsilon, b, s, max_cells, scaling, stream,
+                                    thw);
 }
 void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, int32_t pos_base, const float* gamma,
                                      float epsilon, const QsaIndexerBuffers& b, const QsaShapes& s, int64_t max_cells,
