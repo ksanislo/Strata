@@ -208,6 +208,10 @@ public:
     /// of the slot (the pieces tile the blob).  Same queue, same `sync_queued`.
     bool fill_slot_queued_parts(int32_t slot, const BlobPart* parts, int n, std::string& err);
     bool sync_queued(std::string& err);
+    /// `fill_slot_queued` / `_parts` on `stream` (a cudaStream_t) instead of the legacy stream: the lazy refill
+    /// (STRATA_SHORT_READS), whose copies must not hold up the windows' synchronous copies.  CUDA / HIP only.
+    bool fill_slot_on(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes, void* stream);
+    bool fill_slot_on_parts(int32_t slot, const BlobPart* parts, int n, std::string& err, void* stream);
 
     /// Reads `slot` back to the host and compares it to `host_blob`, byte for byte.  **THE ONLY THING THAT SAYS
     /// THE CACHE HOLDS THE EXPERT IT CLAIMS TO.**  A slot table that is right about indices and wrong about
