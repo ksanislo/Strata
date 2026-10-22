@@ -1013,7 +1013,21 @@ function addFiles(files) {
       if (!health.images) { toast("warn", "Pictures are off", "This model was set up for text only."); continue; }
       if (f.size > 20e6) { toast("warn", "Picture too large", `${f.name} is over 20 MB.`); continue; }
       const r = new FileReader();
-      r.onload = () => { attachments.push({kind: "image", name: f.name || "pasted image", url: r.result}); renderAttachments(); };
+      const add = (url) => { attachments.push({kind: "image", name: f.name || "pasted image", url}); renderAttachments(); };
+      r.onload = () => {
+        // a format the server cannot decode (Safari's HEIC photos): the browser decodes it, the server gets a JPEG
+        if (/^image\/(jpeg|png|gif|bmp|webp|avif)$/.test(f.type)) { add(r.result); return; }
+        const img = new Image();
+        img.onload = () => {
+          const c = document.createElement("canvas");
+          c.width = img.naturalWidth;
+          c.height = img.naturalHeight;
+          c.getContext("2d").drawImage(img, 0, 0);
+          add(c.toDataURL("image/jpeg", 0.92));
+        };
+        img.onerror = () => toast("warn", "Picture not readable", `${f.name || "This picture"}: the browser cannot decode ${f.type}.`);
+        img.src = r.result;
+      };
       r.readAsDataURL(f);
       continue;
     }
