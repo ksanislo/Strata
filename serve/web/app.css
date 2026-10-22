@@ -197,3 +197,9 @@ main { flex: 1; min-height: 0; display: flex; }
 .img-results figure{margin:0}
 .img-results img{max-width:100%;border-radius:var(--st-r-lg);display:block}
 .img-results figcaption{font-size:var(--st-fs-sm, 13px);color:var(--st-ink-2, inherit);margin-top:4px}
+
+/* the Monitor's per-conversation table and engine-wide facts */
+.conv-table th, .conv-table td { padding: 6px 10px; white-space: nowrap; }
+.conv-read { display: flex; align-items: center; gap: 8px; min-width: 140px; }
+.conv-read .st-progress { flex: 1; min-width: 60px; }
+.engine-facts { grid-template-columns: minmax(160px, max-content) 1fr; gap: 6px var(--st-s-6); font-size: var(--st-fs-sm); }
