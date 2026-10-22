@@ -2604,6 +2604,26 @@ static void prime_hw_queues() {
 }
 #endif
 
+// A step that failed for lack of VRAM (an allocation or a graph instantiation; a CUDA error that does not stick): the
+// request fails and the engine goes on.  Clears that error; false for anything else (the caller's fatal path).
+// STRATA_BATCH_GRAPH_LAYOUTS (default 24 with --batch; 0: no bound): the batch row layouts whose graph pairs a stage
+// keeps (LRU); the VRAM floor keeps room for the ones still to come
+static size_t batch_graph_layouts(int batch) {
+    const char* v = std::getenv("STRATA_BATCH_GRAPH_LAYOUTS");
+    if (v != nullptr) return (size_t) std::max(0, std::atoi(v));
+    return batch > 0 ? 24 : 0;
+}
+
+static bool vram_short(const std::string& e) {
+    const cudaError_t pe = cudaPeekAtLastError();
+    const bool oom = pe == cudaErrorMemoryAllocation ||
+                     (pe == cudaSuccess && (e.find("out of memory") != std::string::npos ||
+                                            e.find("do not fit") != std::string::npos));
+    if (!oom) return false;
+    (void) cudaGetLastError();
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
 int main(int argc, char** argv) {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
@@ -6950,7 +6970,17 @@ int main(int argc, char** argv) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         // the drafter and the head are already allocated by now (they load above, before this), so what is left
         // to hold back is the windows - and `free_b` has already lost the drafter.
-        const int64_t room = stage_room(st.dev, true, false);
+        int64_t room = stage_room(st.dev, true, false);
+        // the last stage: the drafter's head and logits (and the slot drafters') bind there after this cache is sized
+        if (&st == last_st && !o.mtp.empty() && !mtp_first && st.head.loaded()) {
+            int64_t late = (int64_t) mtp.bind_bytes(st.head.row_bytes(), n_vocab);
+            for (const auto& d : slot_mtp)
+                late += (int64_t) d->bind_bytes(st.head.row_bytes(), n_vocab) +
+                        (int64_t) o.spec * g.hc * g.n_embd * (int64_t) sizeof(float);
+            room = std::max<int64_t>(room - late, 0);
+            std::fprintf(stderr, "strata generate: layer split, CUDA%d: %lld MiB kept for the drafter's head and logits "
+                                 "(bound after the cache)\n", st.dev, (long long) (late >> 20));
+        }
         const strata::core::OnDevice on(st.dev);
         {
             size_t fb = 0, tb = 0;
@@ -9599,7 +9629,7 @@ int main(int argc, char** argv) {
                     gs.ver.set_remote_expert_opt(remote_opt.get());
                     // --batch-mtp: every stage runs the same 2-rows-per-slot windows as the first (up to kVerifyMaxT
                     // rows, the hand-off's size) and bounds its captured batch layouts like the first (below)
-                    if (batch_mtp) gs.ver.set_batch_graph_limit(64);
+                    if (o.batch > 0) gs.ver.set_batch_graph_limit(batch_graph_layouts(o.batch));
                     ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr,
                                        batch_mtp ? strata::kernels::kVerifyMaxT
                                                  : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err);
@@ -9683,7 +9713,7 @@ int main(int argc, char** argv) {
         }
         ver.set_remote_expert_opt(remote_opt.get());
         if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
-        if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
+        if (o.batch > 0) ver.set_batch_graph_limit(batch_graph_layouts(o.batch));   // many slot layouts: LRU-bounded
         if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err) ||
             (use_mtp && !prefill_head_alias_bound && !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
@@ -10299,6 +10329,7 @@ int main(int argc, char** argv) {
         // #879: this request met a window whose head logits were not all finite (nonfinite_hit): it ends with
         // DONE ... nonfinite, emitting none of that window's tokens
         bool nf_hit = false;
+        bool read_vram = false;   // this request's prompt read found no VRAM: it ends with DONE ... vram
         auto nonfinite_hit = [&](const strata::core::Verifier& v, const char* what) -> bool {
             const int row = v.nonfinite_row();
             if (row < 0) return false;
@@ -12459,6 +12490,60 @@ int main(int argc, char** argv) {
         // conversations hold (one that keeps none: cell 0, state reset), the budget is topped up to what the decoding
         // slots need next, and what is left over goes back to the expert cache
         // `skip`: the slot an admission is filling (idle and not yet a cache: it would be cut to cell 0 under its copy)
+        // card k gives `n` chunks back to the driver: its budget's spare first, then (quiet, may_give) its expert cache;
+        // without a cache that gives, only the spare.  Returns the chunks freed
+        auto free_to_driver = [&](size_t k, int64_t n, bool may_give) -> int64_t {
+            int64_t fr = 0;
+            strata::core::qsa_slot_budget_chunks(eslot_dev(k), &fr, nullptr);
+            const int64_t spare = std::max<int64_t>(fr - slots_low_water(k), 0);
+            if (spare < n && may_give && give_on && gv[k].lo > give_floor) give(k, n - spare);
+            return strata::core::qsa_slot_budget_release(eslot_dev(k), give_on ? n : std::min(n, spare));
+        };
+        // STRATA_VRAM_FLOOR_MIB (default 160 with --batch; 0: off): the VRAM a card keeps free for what is allocated
+        // outside the expert cache and the slot budget (the solo windows' graphs, the drafter's prompt records, cuBLAS
+        // work space), plus room for the batch layouts it does not hold yet (STRATA_BATCH_GRAPH_LAYOUTS, at what a graph
+        // pair measured there, STRATA_BATCH_GRAPH_MIB until then); at most STRATA_VRAM_FLOOR_MAX_MIB (1024).  Below it
+        // the card's expert cache gives the difference back.  Looked at once a second
+        auto env_mib = [](const char* k, long long dflt) -> int64_t {
+            const char* v = std::getenv(k);
+            return v != nullptr ? std::max(0ll, std::atoll(v)) : dflt;
+        };
+        const int64_t vram_floor_mib = env_mib("STRATA_VRAM_FLOOR_MIB", o.batch > 0 ? 160 : 0);
+        const int64_t floor_graph_mib = env_mib("STRATA_BATCH_GRAPH_MIB", 16);
+        const int64_t floor_max_mib = env_mib("STRATA_VRAM_FLOOR_MAX_MIB", 1024);
+        auto floor_of = [&](size_t k) -> int64_t {   // bytes
+            const strata::core::Verifier& vk = k == 0 ? ver : stages[k - 1]->ver;
+            const size_t lim = vk.batch_graph_limit(), held = vk.batch_layouts();
+            const int64_t pair = vk.batch_graph_bytes() > 0 ? (int64_t) vk.batch_graph_bytes() : floor_graph_mib << 20;
+            const int64_t want = (vram_floor_mib << 20) + (lim > held ? (int64_t) (lim - held) * pair : 0);
+            return std::min(want, std::max(vram_floor_mib, floor_max_mib) << 20);
+        };
+        std::vector<Clock::time_point> floor_seen(bslot_ss.size());
+        std::vector<uint8_t> floor_said(bslot_ss.size(), 0);
+        auto vram_floor = [&](size_t k) {
+            if (vram_floor_mib <= 0 || !give_on) return;
+            const auto now = Clock::now();
+            if (now - floor_seen[k] < std::chrono::seconds(1)) return;
+            floor_seen[k] = now;
+            const int dev = eslot_dev(k);
+            const strata::core::OnDevice on(dev);
+            size_t fb = 0, tb = 0;
+            if (cudaMemGetInfo(&fb, &tb) != cudaSuccess) { (void) cudaGetLastError(); return; }
+            const int64_t floor_b = floor_of(k);
+            const int64_t short_b = floor_b - (int64_t) fb;
+            const uint64_t G = strata::core::vmm_granularity(dev);
+            if (short_b <= 0 || G == 0) return;
+            const int64_t got = free_to_driver(k, (short_b + (int64_t) G - 1) / (int64_t) G, true);
+            if (got > 0 || !floor_said[k]) {
+                const strata::core::Verifier& vk = k == 0 ? ver : stages[k - 1]->ver;
+                std::fprintf(stderr, "strata batch: CUDA%d: %zu MiB of VRAM free, below its floor of %lld MiB "
+                                     "(STRATA_VRAM_FLOOR_MIB; %zu of %zu batch layouts held, %.1f MiB a graph pair): "
+                                     "%lld MiB of expert cache / slot budget given back\n", dev, fb >> 20,
+                             (long long) (floor_b >> 20), vk.batch_layouts(), vk.batch_graph_limit(),
+                             (double) vk.batch_graph_bytes() / 1048576.0, (long long) (got * (int64_t) G >> 20));
+            }
+            floor_said[k] = 1;
+        };
         auto elastic_idle = [&](size_t k, bool may_give, int skip) {
             if (!eslots_on) return;
             const strata::core::OnDevice on_k(eslot_dev(k));
@@ -12478,6 +12563,8 @@ int main(int argc, char** argv) {
             strata::core::qsa_slot_budget_chunks(eslot_dev(k), &fr, &made);
             const int64_t low = slots_low_water(k);
             if (!may_give) return;
+            vram_floor(k);   // (first: the budget it leaves is what is settled below)
+            strata::core::qsa_slot_budget_chunks(eslot_dev(k), &fr, &made);
             if (fr < low && gv[k].lo > give_floor) {
                 give(k, low - fr + 16);
             } else if (fr > budget_keep(k, made) + low + 32) {
@@ -12742,8 +12829,26 @@ int main(int argc, char** argv) {
             }
             const Clock::time_point w0 = Clock::now();
             if (!ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
-                std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
-                return false;
+                if (drive.d.failed || !vram_short(err)) {
+                    std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
+                    return false;
+                }
+                // no VRAM for the window on a stage (before its launch there): its requests fail, their slots drop what
+                // they hold (the stages before it may have run it), the engine goes on
+                for (int a = 0; a < A; ++a) {
+                    BSlot& sl = bs[(size_t) active[a]];
+                    std::fprintf(stderr, "strata batch: slot %d ends at position %lld: no VRAM for its window (%s); the "
+                                         "request fails, the engine goes on\n", active[a], (long long) sl.p, err.c_str());
+                    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+                    std::printf("BDONE %d %lld vram %.1f\n", active[a], (long long) sl.produced, ms);
+                    sl.active = false;
+                    sl.cached = false;
+                    sl.draft_ready = false;
+                    sl.checks.clear();
+                }
+                std::fflush(stdout);
+                strata::core::progress().busy.store(was_busy);
+                return true;
             }
             const Clock::time_point w1 = Clock::now();
             // The adaptive VRAM tier, as the solo loop runs it: every --adapt-every windows, on a thread beside the commit and
@@ -13238,6 +13343,24 @@ int main(int argc, char** argv) {
         const std::function<bool(size_t)> stage_quiet = [&](size_t k) {
             return !conc_serving && !in_prompt_read && k < stage_group.size() && stage_group[k] < 0;
         };
+        // slots [b0, b0 + n) whose window found no VRAM on stage k: each request ends with `BDONE <slot> <n> vram` and the
+        // slot drops its state (the stages before k may have run the window)
+        auto end_slots_vram = [&](int b0, int n, int k, const std::string& why) {
+            for (int b = b0; b < b0 + n; ++b) {
+                BSlot& sl = bs[(size_t) b];
+                if (!sl.active) continue;
+                std::fprintf(stderr, "strata batch: slot %d ends at position %lld: no VRAM for its window on stage %d "
+                                     "(%s); the request fails, the engine goes on\n", b, (long long) sl.p, k + 1,
+                             why.c_str());
+                const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+                std::printf("BDONE %d %lld vram %.1f\n", b, (long long) sl.produced, ms);
+                sl.active = false;
+                sl.cached = false;
+                sl.draft_ready = false;
+                sl.checks.clear();
+            }
+            std::fflush(stdout);
+        };
         std::mutex bell_mu;
         std::condition_variable bell_cv;
         std::atomic<bool> bell_waiting{false};
@@ -13438,8 +13561,24 @@ int main(int argc, char** argv) {
                 if (!(piped_mtp ? stage_verifier(k).batch_launch_rows(G.lay.rows, G.lay.S, G.hbase, G.lay.tok, G.lay.pos,
                                                                       G.lay.drafts, err)
                                 : stage_verifier(k).batch_launch(pick * GS, G.S, G.tok, G.pos, err))) {
-                    std::printf("ERR %s\n", err.c_str());
-                    return false;
+                    if (!vram_short(err)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return false;
+                    }
+                    // no VRAM for this window on stage k (nothing of it launched there): the group's requests fail,
+                    // their slots drop what they hold (the stages before k ran the window), the engine goes on
+                    if (piped_mtp && G.lay.drafts) {   // the commits the stages before k hold back for its verdict
+                        std::vector<int> keep(bs.size(), 1);
+                        for (int j = 0; j < k; ++j)
+                            if (!stage_verifier(j).commit_deferred(G.hbase, keep.data(), err)) {
+                                std::printf("ERR %s\n", err.c_str());
+                                return false;
+                            }
+                    }
+                    if (batch_telemetry_enabled) stage_in_flight.complete(k, Clock::now());
+                    end_slots_vram(pick * GS, GS, k, err);
+                    G.inflight = false;
+                    continue;
                 }
                 stage_group[(size_t) k] = pick;
                 if (stage_serving) stsv[(size_t) k]->wake();
@@ -15212,6 +15351,23 @@ int main(int argc, char** argv) {
             for (size_t k = 0; k < bslot_ss.size(); ++k) elastic_idle(k, true, -1);   // (the caches take it back, refilled)
             return true;
         };
+        // an allocation that fails for lack of VRAM (a window graph, the drafter's records) asks for it here: the card's
+        // budget spare, and its expert cache when this thread asks and the card is quiet (any other thread: the spare)
+        const std::thread::id serve_thread = std::this_thread::get_id();
+        if (eslots_on)
+            strata::core::set_vram_relief([&](int dev, uint64_t bytes) -> uint64_t {
+                for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                    if (eslot_dev(k) != dev) continue;
+                    const uint64_t G = strata::core::vmm_granularity(dev);
+                    if (G == 0) return 0;
+                    const bool quiet = std::this_thread::get_id() == serve_thread && !conc_serving && !in_prompt_read &&
+                                       lazy_fly.empty() && (k >= stage_group.size() || stage_group[k] < 0);
+                    return (uint64_t) free_to_driver(k, (int64_t) ((bytes + G - 1) / G), quiet) * G;
+                }
+                return 0;
+            });
+        struct ReliefOff { ~ReliefOff() { strata::core::set_vram_relief(nullptr); } } relief_off;
+        for (size_t k = 0; eslots_on && k < bslot_ss.size(); ++k) vram_floor(k);   // the floor before the first window
         for (;;) {
             line_drain_ms = 0.0;
             bool adm_direct = false;   // STRATA_SLOT_ADMIT: this BGEN is read beside the slots (adm_run)
@@ -16001,6 +16157,7 @@ int main(int argc, char** argv) {
                 }
             }
             nf_hit = false;
+            read_vram = false;
             // #879: an earlier window met non-finite logits.  The poison sits in a conversation's K/V and recurrent
             // state, so nothing that may hold it is continued: the live session, every checkpoint, every parked
             // conversation and every idle batch slot go, and this prompt is read from token 0 (resume == 0 below)
@@ -17608,6 +17765,13 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                 }
                 if (!sp_ok) {
+                    if (yielded_at < 0 && !batch_fatal && !stop_req.load() && vram_short(err)) {
+                        std::fprintf(stderr, "strata serve: %s: no VRAM for this prompt's read; the request fails, the "
+                                             "engine goes on\n", err.c_str());
+                        read_vram = true;   // (as a cancel: the lent slots are refilled below, then DONE ... vram)
+                        cancelled = true;
+                        break;
+                    }
                     if (yielded_at < 0 && (batch_fatal || !stop_req.load())) {
                         std::fprintf(stderr, "strata serve: %s\n", err.c_str());
                         std::printf("ERR %s\n", err.c_str());
@@ -17724,7 +17888,7 @@ int main(int argc, char** argv) {
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
             const int64_t offload0 = drive.d.offload_entries;   // #588
             pcie_auto.mark(drive.d.ms_run, drive.d.multi_misses);   // the prompt's windows are not the decode's
-            if (cancelled) finish = nf_hit ? "nonfinite" : "cancel";
+            if (cancelled) finish = nf_hit ? "nonfinite" : read_vram ? "vram" : "cancel";
             // ======== --pipeline-windows 2: the decode windows with the two cards overlapped ========
             // Stage 0 (the first card) runs window K+1 while stage 1 verifies window K, on the guess that K is accepted
             // whole and that its bonus token is the drafter's.  The drafter, teacher-forced through K+1's drafts,
@@ -18748,7 +18912,7 @@ int main(int argc, char** argv) {
                 live_imgs = imgs_below(req_imgs, (int64_t) live.size());
                 live_ok = o.prompt_cache > 0 && req_ckpt;   // ckpt=0: nothing to continue or park (#830)
                 if (nf_hit) live_ok = false;   // #879 (the next request's start drops the rest)
-            } else if (!nf_hit && pp_exact && pp_reached > 0 && o.prompt_cache > 0 && req_ckpt &&
+            } else if (!nf_hit && !read_vram && pp_exact && pp_reached > 0 && o.prompt_cache > 0 && req_ckpt &&
                        pp_reached <= (int64_t) cur.size()) {
                 // #1620: stopped between two windows (or before the first token was read): the session is exactly at
                 // pp_reached, so it stays the live conversation - the next request continues from it or parks it.
