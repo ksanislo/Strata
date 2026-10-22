@@ -13456,6 +13456,14 @@ int main(int argc, char** argv) {
         int adm_reading = -1;               // the slot whose prompt is being read
         std::vector<std::atomic<bool>*> adm_stop_of(bs.size(), nullptr);   // STRATA_SLOT_ADMIT_MULTI: a slot's queued read
         size_t adm_held_n = 0;              // STRATA_SLOT_ADMIT_MULTI: reads that gave way, to go on in the next run
+        // STRATA_GIVEWAY_KEEP_LOAN=1 (an A/B): while reads that gave way wait, the prompt path's loan stays lent - no refill
+        // at the run's end, none in the requests between, no lend when they go on (windows meanwhile see those experts
+        // missing, as during a read)
+        static const bool giveway_keep_loan = [] {
+            const char* v = std::getenv("STRATA_GIVEWAY_KEEP_LOAN");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        auto keep_loan = [&] { return giveway_keep_loan && adm_held_n > 0; };
         std::atomic<bool> adm_stop{false};  // BSTOP for it
         bool adm_active = false;            // a run of admissions (reads and the loan between them) is under way
         struct AdmReq {
@@ -14618,7 +14626,7 @@ int main(int argc, char** argv) {
             const auto tf = Clock::now();
             std::string e;
             if (!pipe_drain()) return false;
-            if (!refill(e)) {
+            if (!keep_loan() && !refill(e)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", e.c_str());
                 return false;
             }
@@ -16951,7 +16959,7 @@ int main(int argc, char** argv) {
                 if (to <= at) continue;
                 err.clear();
                 const bool win = windows_ok(at, to);
-                if (win && !refill_lazy(err)) {
+                if (win && !keep_loan() && !refill_lazy(err)) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }
@@ -17021,7 +17029,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
                                  (long long) message_at, (long long) (turn_at - message_at));
             }
-            if (!(cancelled ? refill(err) : refill_lazy(err))) {
+            if (!keep_loan() && !(cancelled ? refill(err) : refill_lazy(err))) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                 return 1;
             }
