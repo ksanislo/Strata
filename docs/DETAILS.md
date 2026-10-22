@@ -895,6 +895,15 @@ print(r.choices[0].message.content)
   `strata-<model>.json` sets it for every request; a request's own value wins, and `0` means no budget. Off by default;
   Anthropic's `"thinking": {"budget_tokens": N}` chooses the level, as above, and since 0.1.45 is also the budget (a
   `reasoning_budget_tokens` in the same request wins).
+- **The reply's own token ids on the next turn (opt-in, `STRATA_REPLY_REUSE=1`).** After a request the engine holds
+  the prompt plus the ids it generated, and those are not always what the reply's text encodes to: a model writes a
+  Turkish word, a number or code in pieces BPE would merge. The next turn's prompt renders that text again, and a fresh
+  encode left the engine's ids at the first such piece, so the engine read the rest of the reply again from there.
+  With the variable the prompt encoder keeps the reply as an entry whose cuts are its own token boundaries, and the
+  next prompt takes the reply's ids up to where its text really differs (never across a split character or a tag; the
+  text the ids decode to is always the prompt's). The same switch keeps the few tokens the engine generated past a
+  thinking budget's stop (it holds them) when they are plain text, so the wrap-up continuation does not read the
+  thinking again. Off: every prompt is a fresh encode, as before.
 - **max_tokens counts the thinking, so the answer keeps its room (0.1.45).** A client that caps the whole reply (the
   desktop agent's harness sends `max_completion_tokens: 8192` on every request) and a task the model thinks long about
   used to be cut off in the middle of the thinking, with no answer. Now a request with thinking on, no budget of its
@@ -1096,11 +1105,15 @@ print(r.choices[0].message.content)
 **Conversation cache.** A request that continues a chat reads only the part after what the engine already holds: the
 live session, or one of the checkpoints it keeps in RAM (up to 6, ~118 MB each, taken at the start of each new
 assistant turn and every 16K prompt tokens). A checkpoint is used only when the prompt starts with exactly its tokens
-and pictures. The oldest checkpoint - in practice the end of the system prompt, which every chat of the same client
-shares - is kept for good while the rest rotates by least recent use, so a NEW chat that shares that prefix starts
-reading after it instead of from token 0. A prompt read from the start is also checkpointed at the end of its system
-prompt when that is 2,048 tokens or more (engine 0.1.20; PR #62 + #65), so that root exists for agent clients with long
-system prompts and tool lists. Claude Code stamps its system prompt with a billing header that changes on every
+and pictures. The checkpoint at the end of the system prompt - which every chat of the same client shares - is kept
+for good while the rest rotates by least recent use, so a NEW chat that shares that prefix starts reading after it
+instead of from token 0. It is found by its turn boundary, not by age: a system prompt that ends past the first
+periodic chunk end (16K at the defaults) leaves grid checkpoints ahead of it, and those rotate like any other
+(under `--prompt-cache-spread` the first of them stays, costing one slot). Without a matching system-prompt
+checkpoint the oldest one holds the pin, as before (a system prompt under 2,048 tokens saves none), and keeping
+the root beside the newest point needs at least two slots. A prompt read from the start is
+checkpointed at the end of its system prompt when that is 2,048 tokens or more (engine 0.1.20; PR #62 + #65), so
+that root exists for agent clients with long system prompts and tool lists. Claude Code stamps its system prompt with a billing header that changes on every
 request (`cch=...`) and every session (the 4th part of `cc_version=`); the server pins both stamps (to `f`s, as
 llama.cpp does), so the system prompt and the tool list in front of it are the same prompt on every turn. Engine options: `--prompt-cache N` (0 = off), `--prompt-cache-every N`,
 `--prompt-cache-root N` (0 = no system-prompt checkpoint), `--turn-token ID`.
@@ -1416,8 +1429,12 @@ the folder is over `--session-dir-gib G` (default 64) or `--session-dir-files N`
 `--session-dir-days D` (default 7) is deleted in any case, as is a file of another model, configuration or engine
 version. The server log shows each event (`[strata] sessions: ...`), every request's `done:` line ends with where
 its context came from (`context: N tokens from disk|from RAM (parked)|already on the GPU, M new`), and `GET /status`
-has `"sessions"` (files, bytes, limits and each conversation's tokens, bytes, last use and state). Same limits as the
-session files (`--peer-device`, `--batch`, `--prompt-cache 0` turn it off with a log line). Measured on 4 x T4
+has `"sessions"` (files, bytes, limits and each conversation's tokens, bytes, last use and state). With `--batch`
+(`"parallel"`) a finished request's conversation stays in its slot as before; when another conversation takes that
+slot, or at `QUIT`, the slot's conversation is parked (or written straight from the GPU) the same way first, unless
+the new request continues it or another slot holds it. Not saved: a slot that a pipelined group's pad row overwrites
+(`--batch-groups` with several slots per group; the log says so) and the slots dropped after non-finite logits.
+`--peer-device` and `--prompt-cache 0` turn it off with a log line. Measured on 4 x T4
 (Qwen3.8-Flash-Next Q8, `--layer-split`, NVMe): a 187,275-token conversation written at shutdown in 4.1 s (2.96 GB); a
 169,011-token one read on demand in 1.8 s, after which its next turn read only the 11,213 new tokens. In the GPU test
 (two ~8.5K-token conversations alternating, the server restarted before each one's third turn) every turn matched a

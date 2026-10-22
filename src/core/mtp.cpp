@@ -1,4 +1,5 @@
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
+#include "strata/core/capture_lock.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/pin_budget.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
@@ -21,6 +22,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_rope.hpp"
+#include "strata/kernels/mrope.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
@@ -35,6 +37,7 @@
 #include "strata/kernels/gfx_arch.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -147,9 +150,9 @@ MtpDrafter::~MtpDrafter() {
     if (cring_) cudaFree(cring_);
     if (dinv_) cudaFree(dinv_);
     if (cscratch_) cudaFree(cscratch_);
-    if (h_cparams_) cudaFreeHost(h_cparams_);
-    if (h_chist_) cudaFreeHost(h_chist_);
-    if (h_q_) cudaFreeHost(h_q_);
+    if (h_cparams_) strata::core::host_free_guarded(h_cparams_);
+    if (h_chist_) strata::core::host_free_guarded(h_chist_);
+    if (h_q_) strata::core::host_free_guarded(h_q_);
     if (cs_) cudaStreamDestroy(cs_);
     if (side_) cudaStreamDestroy(side_);
     if (sh_fork_) cudaEventDestroy(sh_fork_);
@@ -164,7 +167,7 @@ MtpDrafter::~MtpDrafter() {
     if (ev_chain_) cudaEventDestroy(ev_chain_);
     for (cudaEvent_t e : ev_step_) if (e) cudaEventDestroy(e);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, h_force_};
-    for (void* h : hosts) if (h) cudaFreeHost(h);
+    for (void* h : hosts) if (h) strata::core::host_free_guarded(h);
 }
 
 const float* MtpDrafter::f32(const char* name) const {
@@ -365,7 +368,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     qsa_set_kv_int8(kv_int8_was);
     qsa_set_kv_hybrid(kv_hybrid_was);
     qsa_state_zero(st_, g, nullptr);
-    cudaDeviceSynchronize();
+    strata::core::device_sync();
     vram_ += sb;
 
     // ---- buffers
@@ -439,7 +442,13 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)   // (HIP, Metal: the default priority)
     static const bool hi_prio = [] { const char* v = std::getenv("STRATA_MTP_PRIORITY"); return v == nullptr || std::atoi(v) != 0; }();
     int prio_lo = 0, prio_hi = 0;
-    if (force_on_ && hi_prio && cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi) == cudaSuccess)
+    // (STRATA_SLOT_ADMIT: the slot drafters share their card with prompt reads too)
+    static const bool beside_reads = [] {
+        const char* v = std::getenv("STRATA_SLOT_ADMIT");
+        const char* p = std::getenv("STRATA_PIPED_CONCURRENT_PRIO");
+        return v != nullptr && std::atoi(v) != 0 && (p == nullptr || std::atoi(p) != 0);
+    }();
+    if ((force_on_ || beside_reads) && hi_prio && cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi) == cudaSuccess)
         prio = cudaStreamCreateWithPriority(&cs_, cudaStreamNonBlocking, prio_hi) == cudaSuccess;
     cudaGetLastError();
 #endif
@@ -591,7 +600,7 @@ bool MtpDrafter::setup_coupled(std::string& err) {
         cudaMemcpy(dinv_, inv.data(), inv.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
         vram_ += inv.size() * sizeof(int32_t);
     }
-    if (cudaDeviceSynchronize() != cudaSuccess) {
+    if (strata::core::device_sync() != cudaSuccess) {
         err = std::string("mtp: coupled setup: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
@@ -719,7 +728,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                     if (ok_x) {
                         strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dv, n_dvocab_,
                                                      (uint8_t*) tmp, nullptr);
-                        ok_x = cudaDeviceSynchronize() == cudaSuccess;
+                        ok_x = strata::core::device_sync() == cudaSuccess;
                     }
                 }
                 ok_x = ok_x && cudaMemcpy(dhead_, tmp, (size_t) (n_dvocab_ * row_bytes), cudaMemcpyDeviceToDevice) == cudaSuccess;
@@ -732,7 +741,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             } else {
                 strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
             }
-            cudaDeviceSynchronize();
+            strata::core::device_sync();
             vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
             std::fprintf(stderr, "strata mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
                          (double) (n_dvocab_ * row_bytes) / 1048576.0);
@@ -1230,7 +1239,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
 namespace {
 bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char* what, std::string& err) {
     cudaGraph_t graph = nullptr;
-    const cudaError_t ce = cudaStreamEndCapture(cs, &graph);
+    const cudaError_t ce = strata::core::end_capture(cs, &graph);
     if (!ok) {
         if (graph) cudaGraphDestroy(graph);
         return false;
@@ -1252,7 +1261,7 @@ bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char*
 bool MtpDrafter::capture_prefill(int T, std::string& err) {
     if (prefill_exec_[T]) return true;
     using namespace strata::kernels;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    if (strata::core::begin_capture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     copy_i32_from_mapped(tok_, m_tok_, T, cs_);
     copy_i32_from_mapped(step_, m_step_, (int64_t) T * 4, cs_);
     copy_i32_from_mapped(pos_, m_pos_, (int64_t) T * g_->n_head, cs_);
@@ -1262,7 +1271,7 @@ bool MtpDrafter::capture_prefill(int T, std::string& err) {
 
 bool MtpDrafter::capture_prefill_dev(int T, std::string& err) {
     if (prefill_dev_exec_[T]) return true;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    if (strata::core::begin_capture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     const bool ok = record_forward(T, -1, cs_, err);   // K/V only, rows [0, T); tok_/step_/pos_ filled before launch
     return finish_capture(cs_, ok, prefill_dev_exec_[T], "prefill (device inputs)", err);
 }
@@ -1270,10 +1279,12 @@ bool MtpDrafter::capture_prefill_dev(int T, std::string& err) {
 bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
     cudaGraphExec_t& exec = coupled ? round_exec_c_[T] : round_exec_[T];
     if (exec) return true;
+    std::optional<strata::kernels::MropeScope> no_table;   // a slot's rounds: positions staged resolved
+    if (rope_slot_ >= 0 && strata::kernels::slot_rope_enabled()) no_table.emplace(nullptr);
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
     g_mp.init();   // (its allocation before the capture)
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    if (strata::core::begin_capture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     g_mp.base = 0;
     bool ok = true;
     // coupled: the request's chain and the penalty history's base, for this round's drafts
@@ -1320,11 +1331,13 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
 bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     cudaGraphExec_t& exec = coupled ? step_exec_c_[j] : step_exec_[j];
     if (exec) return true;
+    std::optional<strata::kernels::MropeScope> no_table;   // a slot's rounds: positions staged resolved
+    if (rope_slot_ >= 0 && strata::kernels::slot_rope_enabled()) no_table.emplace(nullptr);
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
     const int row = max_t_ + j - 1;
     g_mp.init();
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    if (strata::core::begin_capture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
 #if defined(STRATA_USE_HIP)
     copy_i32_from_mapped(step_ + row * 4, m_step_ + row * 4, 4, cs_);
     copy_i32_from_mapped(pos_ + row * g_->n_head, m_pos_ + row * g_->n_head, g_->n_head, cs_);
@@ -1355,6 +1368,16 @@ void MtpDrafter::kv_restore(int64_t upto) {
     cudaStreamSynchronize(cs_);
 }
 
+// the prompt records' device buffer: a failed allocation asks for VRAM once (vram_relief) and tries again
+static bool records_alloc(int32_t** p, size_t bytes, int dev) {
+    if (cudaMalloc((void**) p, bytes) == cudaSuccess) return true;
+    (void) cudaGetLastError();
+    if (vram_relief(dev, bytes + (2ull << 20)) == 0) return false;
+    if (cudaMalloc((void**) p, bytes) == cudaSuccess) return true;
+    (void) cudaGetLastError();
+    return false;
+}
+
 bool MtpDrafter::prepare_prefill(std::string& err) {
     const OnDevice on_device(device_);
     const int64_t per_row = 1 + 4 + g_->n_head;
@@ -1362,7 +1385,7 @@ bool MtpDrafter::prepare_prefill(std::string& err) {
         if (pf_dev_) cudaFree(pf_dev_);
         pf_dev_ = nullptr;
         pf_cap_ = 0;
-        if (cudaMalloc((void**) &pf_dev_, (size_t) (max_t_ * per_row) * sizeof(int32_t)) != cudaSuccess) {
+        if (!records_alloc(&pf_dev_, (size_t) (max_t_ * per_row) * sizeof(int32_t), device_)) {
             err = "mtp prefill: the input records do not fit";
             return false;
         }
@@ -1405,7 +1428,7 @@ bool MtpDrafter::reserve_prefill(int64_t n, std::string& err) {
     if (pf_dev_) cudaFree(pf_dev_);
     pf_dev_ = nullptr;
     pf_cap_ = 0;
-    if (cudaMalloc((void**) &pf_dev_, (size_t) (n * per_row) * sizeof(int32_t)) != cudaSuccess) {
+    if (!records_alloc(&pf_dev_, (size_t) (n * per_row) * sizeof(int32_t), device_)) {
         err = "mtp prefill: the input records do not fit";
         return false;
     }
@@ -1441,7 +1464,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
             if (pf_dev_) cudaFree(pf_dev_);
             pf_dev_ = nullptr;
             pf_cap_ = 0;
-            if (cudaMalloc((void**) &pf_dev_, (size_t) (n * per_row) * sizeof(int32_t)) != cudaSuccess) {
+            if (!records_alloc(&pf_dev_, (size_t) (n * per_row) * sizeof(int32_t), device_)) {
                 err = "mtp prefill: the input records do not fit";
                 return false;
             }
@@ -1551,6 +1574,94 @@ struct DraftTiming {
 DraftTiming g_dt;
 }  // namespace
 
+bool MtpDrafter::stage_round(int& T, const int32_t* tokens, int64_t p, int a, bool cp, int& max_steps,
+                             std::string& err) {
+    // #783 PR-i (stuchapin909): the round runs for the cells up to the accepted row a (T = a + 1): the K/V of the rejected
+    // rows is not caught up - no later read reaches a cell past the one being drafted and the next round writes it first
+    if (!mtp_catchup_all()) T = a + 1;
+    if (!capture_round(T, cp, err)) return false;
+    // Draft j writes its K/V at cell p + a + j, and the K/V ends at max_cells (its page table has no page past it):
+    // near the context's end the round drafts only the cells that exist
+    max_steps = (int) std::min<int64_t>(std::min(max_t_ - 1, max_drafts_), st_.max_cells - (p + a));
+    for (int j = 1; j < max_steps; ++j)
+        if (!capture_step(j, cp, err)) return false;
+    const int64_t NH = g_->n_head;
+    const auto rr = rope_slot_ >= 0 && strata::kernels::slot_rope_enabled() ? strata::kernels::slot_rope_get(rope_slot_)
+                                                                             : nullptr;
+    auto put = [&](int row, int64_t cell) {
+        h_step_[row * 4 + 0] = (int32_t) cell;
+        h_step_[row * 4 + 1] = (int32_t) (cell + 1);
+        h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
+        h_step_[row * 4 + 3] = (int32_t) (cell + 1);
+        int32_t c[3] = {(int32_t) cell, (int32_t) cell, (int32_t) cell};
+        if (rr) rr->at(cell, c);
+        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = c[0];
+    };
+    for (int t = 0; t < T; ++t) {
+        h_tok_[t] = tokens[t];
+        put(t, p + t);
+    }
+    put(2 * max_t_ - 1, coupled_draft_cell(p, a, 0));   // p + a: draft 0's cell
+    for (int j = 1; j < max_steps; ++j)
+        put(max_t_ + j - 1, coupled_draft_cell(p, a, j));
+    for (int j = 0; j < max_steps; ++j) ((volatile int32_t*) h_out_)[j] = -1;
+    h_row_[0] = a;
+    h_row_[1] = 0;
+    if (h_force_ != nullptr) for (int j = 0; j < 16; ++j) h_force_[j] = -1;   // the forcing kernels: no-ops here
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (!stage_source_R(T, err)) return false;
+    return true;
+}
+
+bool MtpDrafter::prepare_rounds(int max_T, std::string& err) {
+    const OnDevice on_device(device_);
+    for (int T = 1; T <= std::min(max_T, max_t_); ++T)
+        if (!capture_round(T, false, err)) return false;
+    for (int j = 1; j < std::min(max_t_ - 1, max_drafts_); ++j)
+        if (!capture_step(j, false, err)) return false;
+    return true;
+}
+
+bool MtpDrafter::draft_launch(int T, const int32_t* tokens, int64_t p, int a, std::string& err) {
+    const OnDevice on_device(device_);
+    if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
+    if (chain_live_ || async_live_) { err = "mtp: a draft is still in flight"; return false; }
+    const bool cp = coupled_active_;
+    int max_steps = 0;
+    async_t0_ = Clock::now();
+    if (!stage_round(T, tokens, p, a, cp, max_steps, err)) return false;
+    if (max_steps > 0) {
+        if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
+            err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+        for (int j = 1; j < max_steps; ++j)
+            if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
+                err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+        (void) cudaStreamQuery(cs_);
+    }
+    async_steps_ = max_steps;
+    async_live_ = true;
+    return true;
+}
+
+int MtpDrafter::draft_poll(int32_t* drafts, std::string& err, int* n_drafts) {
+    if (!async_live_) return 1;
+    const OnDevice on_device(device_);
+    const cudaError_t q = cudaStreamQuery(cs_);
+    if (q == cudaErrorNotReady) return 0;
+    async_live_ = false;
+    if (q != cudaSuccess) { err = std::string("mtp draft: ") + cudaGetErrorString(q); return -1; }
+    for (int j = 0; j < async_steps_; ++j) drafts[j] = ((volatile int32_t*) h_out_)[j];
+    for (int j = async_steps_; j < max_t_ - 1; ++j) drafts[j] = 0;
+    if (n_drafts) *n_drafts = async_steps_;
+    ms_draft += ms_since(async_t0_);
+    ++rounds;
+    return 1;
+}
+
 bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                        float* probs, float min_p, int* n_drafts) {
 #if defined(STRATA_GPU_METAL)
@@ -1569,39 +1680,11 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
 #endif
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
-    if (chain_live_) { err = "mtp: a pipelined chain is still in flight"; return false; }
-    // #783 PR-i (stuchapin909): the round runs for the cells up to the accepted row a (T = a + 1): the K/V of the rejected
-    // rows is not caught up - no later read reaches a cell past the one being drafted and the next round writes it first
-    if (!mtp_catchup_all()) T = a + 1;
+    if (chain_live_ || async_live_) { err = "mtp: a pipelined chain is still in flight"; return false; }
     const bool cp = coupled_active_;   // coupled draft sampling for this request: its own graphs
-    if (!capture_round(T, cp, err)) return false;
-    // Draft j writes its K/V at cell p + a + j, and the K/V ends at max_cells (its page table has no page past it):
-    // near the context's end the round drafts only the cells that exist
-    const int max_steps = (int) std::min<int64_t>(std::min(max_t_ - 1, max_drafts_), st_.max_cells - (p + a));
-    for (int j = 1; j < max_steps; ++j)
-        if (!capture_step(j, cp, err)) return false;
+    int max_steps = 0;
     const Clock::time_point t0 = Clock::now();
-    const int64_t NH = g_->n_head;
-    auto put = [&](int row, int64_t cell) {
-        h_step_[row * 4 + 0] = (int32_t) cell;
-        h_step_[row * 4 + 1] = (int32_t) (cell + 1);
-        h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
-        h_step_[row * 4 + 3] = (int32_t) (cell + 1);
-        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) cell;
-    };
-    for (int t = 0; t < T; ++t) {
-        h_tok_[t] = tokens[t];
-        put(t, p + t);
-    }
-    put(2 * max_t_ - 1, coupled_draft_cell(p, a, 0));   // p + a: draft 0's cell
-    for (int j = 1; j < max_steps; ++j)
-        put(max_t_ + j - 1, coupled_draft_cell(p, a, j));
-    for (int j = 0; j < max_steps; ++j) ((volatile int32_t*) h_out_)[j] = -1;
-    h_row_[0] = a;
-    h_row_[1] = 0;
-    if (h_force_ != nullptr) for (int j = 0; j < 16; ++j) h_force_[j] = -1;   // the forcing kernels: no-ops here
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (!stage_source_R(T, err)) return false;
+    if (!stage_round(T, tokens, p, a, cp, max_steps, err)) return false;
 
     SessionState* const pss = ple_ss_ ? ple_ss_ : ss_;
     const bool do_ple = pss != nullptr && pss->ple.ready() && pss->ple.table != nullptr;
@@ -1783,12 +1866,16 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
         if (step_exec_[j] == nullptr) { err = "mtp: chain graphs not prepared"; return false; }
     const Clock::time_point t0 = Clock::now();
     const int64_t NH = g_->n_head;
+    const auto rr = rope_slot_ >= 0 && strata::kernels::slot_rope_enabled() ? strata::kernels::slot_rope_get(rope_slot_)
+                                                                             : nullptr;
     auto put = [&](int row, int64_t cell) {
         h_step_[row * 4 + 0] = (int32_t) cell;
         h_step_[row * 4 + 1] = (int32_t) (cell + 1);
         h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
         h_step_[row * 4 + 3] = (int32_t) (cell + 1);
-        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) cell;
+        int32_t c[3] = {(int32_t) cell, (int32_t) cell, (int32_t) cell};
+        if (rr) rr->at(cell, c);
+        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = c[0];
     };
     for (int t = 0; t < T; ++t) {
         h_tok_[t] = tokens[t];

@@ -1,4 +1,5 @@
 // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the header first.
+#include "strata/core/capture_lock.hpp"
 #include "strata/core/expert_cache.hpp"
 
 // #533's segmented cache uses CUDA's virtual memory management (cuMem*): not on HIP, neither the RDNA backend nor
@@ -350,7 +351,7 @@ bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
 void ExpertCache::release_segmented() {
 #if !defined(STRATA_EC_NO_VMM)
     const Vmm& v = vmm();
-    if (base_ != nullptr) cudaDeviceSynchronize();
+    if (base_ != nullptr) strata::core::device_sync();
     const CUdeviceptr va = reinterpret_cast<CUdeviceptr>(base_);
     for (size_t i = 0; i < segs_.size(); ++i)
         if (segs_[i] != 0) {
@@ -394,7 +395,7 @@ bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
     int64_t keep = 0, at = 0;   // the segments [0, keep) hold the first keep_bytes
     while (keep < (int64_t) segs_.size() && at < keep_bytes) at += seg_size_[(size_t) keep++];
     if (keep >= mapped_segs_) return true;
-    if (cudaDeviceSynchronize() != cudaSuccess) {
+    if (strata::core::device_sync() != cudaSuccess) {
         err = std::string("the device failed before the cache shrank: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
@@ -762,6 +763,39 @@ bool ExpertCache::fill_slot_queued_parts(int32_t slot, const BlobPart* parts, in
             return false;
         }
     }
+    ++fills_;
+    return true;
+}
+
+bool ExpertCache::fill_slot_on(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes, void* stream) {
+    const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
+    uint8_t* dst = device_slot(slot);
+    if (dst == nullptr || host_blob == nullptr) {
+        err = dst == nullptr ? "ExpertCache::fill_slot_on: slot outside the arena" : "ExpertCache::fill_slot_on: the host blob is null";
+        return false;
+    }
+    if (const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice, (cudaStream_t) stream); e != cudaSuccess) {
+        err = std::string("ExpertCache::fill_slot_on: ") + cudaGetErrorString(e);
+        return false;
+    }
+    ++fills_;
+    return true;
+}
+
+bool ExpertCache::fill_slot_on_parts(int32_t slot, const BlobPart* parts, int n, std::string& err, void* stream) {
+    uint8_t* dst = device_slot(slot);
+    uint64_t total = 0;
+    for (int i = 0; parts != nullptr && i < n; ++i) total += parts[i].n;
+    if (dst == nullptr || parts == nullptr || n <= 0 || total > (uint64_t) blob_) {
+        err = "ExpertCache::fill_slot_on_parts: slot outside the arena, no pieces, or pieces larger than a slot";
+        return false;
+    }
+    for (int i = 0; i < n; ++i)
+        if (const cudaError_t e = cudaMemcpyAsync(dst + parts[i].at, parts[i].p, (size_t) parts[i].n,
+                                                  cudaMemcpyHostToDevice, (cudaStream_t) stream); e != cudaSuccess) {
+            err = std::string("ExpertCache::fill_slot_on_parts: ") + cudaGetErrorString(e);
+            return false;
+        }
     ++fills_;
     return true;
 }

@@ -16,11 +16,15 @@
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
 
+#include <deque>
+#include <mutex>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <future>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace strata::core { class PeerExperts; }
 namespace strata::kernels::cpu { class ExpertPool; }
@@ -44,6 +48,48 @@ struct PrefillStats {
 }  // namespace strata::prefill
 namespace strata::core { class MtpDrafter; }
 namespace strata::prefill {
+
+/// STRATA_PREFILL_MULTI: one prompt read into its own sessions, queued on a layer split's first stage (Prefill::enqueue).
+/// Its chunks follow the ones queued before it through every stage, so stage 0 reads this prompt while the later
+/// stages finish the one before. The callbacks are this prompt's (the Prefill's own members are not called).
+struct PromptJob {
+    std::vector<int64_t> tokens;
+    int64_t pos0 = 0;
+    /// The session each stage reads into, first stage first; null or missing: that stage's `init` session.
+    /// ple_prev of the first stage's session must be the two tokens before pos0 (advanced like run's).
+    std::vector<core::SessionState*> sessions;
+    std::function<bool(const float* R_rows, int64_t T, int64_t pos0, std::string& err)> on_chunk;   ///< the last stage
+    std::vector<std::function<bool(int64_t done, std::string& err)>> on_stage_chunk;            ///< per stage (optional)
+    std::function<bool()> should_stop;
+    const float* const* embd_rows = nullptr;
+    /// Once: from the last stage's thread when it has read the last chunk, or from the stage that failed.
+    std::function<void(bool ok, const std::string& err)> on_done;
+
+    /// STRATA_BATCH_READS: a batched chunk carries pieces of several queued prompts (each of its own sessions); this
+    /// job's tokens are theirs in order, and `segs` says whose.  Only the queue's worker builds one.
+    struct Seg {
+        std::shared_ptr<PromptJob> job;
+        int64_t off = 0, n = 0;   ///< tokens [off, off + n) of job->tokens
+        bool last = false;        ///< the job's last tokens: it finishes with this chunk
+    };
+    std::vector<Seg> segs;
+    int64_t taken = 0;   ///< tokens the worker gave stage 0 so far (a prompt a batch sliced stays queued for the rest)
+    bool whole = false;  ///< read in one chunk (at most the buffers' tokens), as a batch reads its segments
+    bool urgent = false; ///< STRATA_BATCH_READS_FAST: a short read's piece (the whole read fits FAST): the next chunk takes it
+    bool lead = false;   ///< its read's first piece: nothing of its sessions is in flight before it
+    bool overtake = false;   ///< STRATA_BATCH_READS_OVERTAKE: a chunk of lead urgent pieces only, which may pass chunks
+                             ///< waiting at a stage's hand-off (it shares no session with them)
+
+    bool failed() const { return failed_.load(); }
+    bool done() const { return done_.load(); }
+    void finish(bool ok, const std::string& err) {
+        if (!ok) failed_.store(true);
+        if (done_.exchange(true)) return;
+        if (on_done) on_done(ok, err);
+    }
+private:
+    std::atomic<bool> failed_{false}, done_{false};
+};
 
 /// HIP: one tiny BF16 and one tiny FP16 product on a private handle, so the first prompt does not pay hipBLAS's one-time
 /// library loads (about 2.5 s on an R9700); once per device, later calls wait for the first and return.  Safe to call from a
@@ -123,6 +169,7 @@ public:
     static void log_plan(int64_t n, int64_t chunk, int stages);
     /// The expert blobs this stage and the later ones copied host -> device so far (PrefillStats::experts_streamed).
     int64_t chain_experts_streamed() const;
+    int64_t chain_experts_cpu() const;   ///< the same chain's experts the CPU share took
     /// #340: the streamed ring's slot count for chunks that stream every expert, instead of the pinned-share rule
     /// (0 = that rule). Set before any `bytes_needed`/`init` (both count the ring); STRATA_PREFILL_RING still wins.
     static void set_ring_override(int slots);
@@ -175,6 +222,66 @@ public:
 
     const PrefillStats& stats() const { return stats_; }
 
+    /// STRATA_PREFILL_MULTI, first stage only: queue a prompt (see PromptJob). Returns at once; a worker thread reads
+    /// the queued prompts in order, each without waiting for the later stages to finish the one before. Every stage's
+    /// buffers (and a loan they are carved from) serve all queued prompts: keep the loan until drain_jobs.
+    /// Not beside `run` (drain_jobs first).
+    /// `front`: before the prompts not started yet (a shorter one first; the one being read goes on).
+    void enqueue(std::shared_ptr<PromptJob> job, bool front = false);
+    /// Several at once, in order (the worker sees them together: STRATA_BATCH_READS can read them in one chunk).
+    void enqueue(std::vector<std::shared_ptr<PromptJob>> jobs, bool front = false);
+    /// The queued prompts stage 0 has not started that `pred` picks, taken out of the queue (their on_done never runs).
+    /// One a batched chunk read part of (STRATA_BATCH_READS) has started: it stays.
+    std::vector<std::shared_ptr<PromptJob>> withdraw(const std::function<bool(const PromptJob&)>& pred);
+    /// Waits until every queued prompt has gone through every stage (each one's on_done has run).
+    void drain_jobs();
+    /// Prompts queued or being read on the first stage.
+    size_t jobs_pending() const;
+    /// Prompts queued (not being read) whose first stage's session is `s0`.
+    size_t jobs_queued_for(const core::SessionState* s0) const;
+    /// STRATA_BATCH_READS=1: the worker reads up to STRATA_BATCH_READS_MAX (4) queued prompts of different sessions
+    /// in one chunk; 0 when off.  Each gets an even share of the chunk (what one leaves goes to the others).
+    static int batch_reads_max();
+    /// The batch of a chunk: tokens per prompt for budget `budget` and what each has left (water-filling, in order).
+    static std::vector<int64_t> batch_shares(const std::vector<int64_t>& left, int64_t budget);
+    /// The tokens a batched chunk holds: the smallest chunk any stage's buffers hold.
+    int64_t batch_budget() const;
+    /// Which queued prompts a batched chunk takes (their indices in `q`, in order) and how many tokens each (`got`);
+    /// empty when fewer than two can go.  The first queued prompt of each session (a later piece waits for it).
+    struct BatchPlan {
+        std::vector<size_t> at;
+        std::vector<int64_t> got;
+        bool fast = false;   ///< a latency chunk: urgent reads whole, the others at most `share` each (may be one prompt)
+        bool overtake = false;   ///< (STRATA_BATCH_READS_OVERTAKE) the lead urgent reads only, nothing of the others
+    };
+    /// STRATA_BATCH_READS_FAST=<tokens> (512; 0 off): an urgent piece of at most that many tokens goes in the next chunk
+    /// whole, ahead of everything not started; each other reader gets STRATA_BATCH_READS_FAST_SHARE (128) at most, the
+    /// chunk at most STRATA_BATCH_READS_FAST_CHUNK tokens (default: just below the stream-all size, 1023).
+    /// STRATA_BATCH_READS_FAST_SHRINK (512; 0 off): while a short read is admitted but not queued yet
+    /// (set_urgent_wait), the chunks are at most that many tokens, a lone reader's piece sliced too.
+    struct BatchFast {
+        int64_t tokens = 0, share = 128, chunk = 0, shrink = 0;
+        bool overtake = false;   ///< STRATA_BATCH_READS_OVERTAKE=1
+    };
+    /// STRATA_BATCH_READS_OVERTAKE: each stage's own pinned hand-off buffer for overtaking chunks of up to `rows` tokens
+    /// (this stage and the later ones). Call before any read (an allocation takes the driver's lock).
+    bool reserve_overtake(int64_t rows);
+    void set_urgent_wait(bool on) { urgent_wait_.store(on, std::memory_order_release); }
+    /// Each stage before each queued chunk but one with an urgent read (stage 0: the queue's worker; a later stage: its
+    /// hand-off thread), with nothing of the prompt path held: may wait (the decode share,
+    /// STRATA_BATCH_READS_DECODE_WINDOWS), never compute. `chunk_ms`: that stage's last chunk time. Set while idle.
+    std::function<void(double chunk_ms)> between_chunks;
+    double last_chunk_ms_ = -1.0;   ///< (a later stage: its last queued chunk's time, set on its hand-off thread)
+    /// A queued prompt's chunk is on this stage's card now (any thread may read).
+    bool reading_job() const { return job_busy_.load(std::memory_order_acquire); }
+    std::atomic<bool> job_busy_{false};
+    static BatchFast batch_fast();
+    static BatchPlan plan_batch(const std::deque<std::shared_ptr<PromptJob>>& q, int max_segs, int64_t budget,
+                                const BatchFast& fast, int64_t fast_cap, bool single_ok = false);
+    static BatchPlan plan_batch(const std::deque<std::shared_ptr<PromptJob>>& q, int max_segs, int64_t budget);   ///< FAST off
+    /// A queued prompt that can share a chunk: its own sessions, no picture rows, not failed or stopped, tokens left.
+    static bool batchable(const PromptJob& j);
+
     /// multi-GPU: the experts the peer GPU holds are computed THERE for every prompt chunk (up to `cap_rows` routed
     /// rows per layer; the rest of the peer's experts are read by this GPU over P2P).  Allocates the peer's buffers for
     /// chunks of up to init's `chunk` tokens.  Needs P2P between the two cards.
@@ -190,6 +297,10 @@ public:
     /// earlier stage is a chunk or more ahead of the last one by the time `on_chunk` runs, so this is where a
     /// mid-prompt checkpoint takes each stage's part.  Runs on that stage's thread, with its device current.
     std::function<bool(int64_t done, std::string& err)> on_stage_chunk;
+    /// STRATA_READ_INTERLEAVE_LAYERS: a queued prompt's (PromptJob) read calls this on its stage's thread before every
+    /// `layer_gap_every`-th layer of a chunk but the first, with its stream (cudaStream_t); it may wait, never compute.
+    std::function<void(int64_t layer, void* stream)> on_layer_gap;
+    int layer_gap_every = 0;
 
     /// Checked before every chunk: true stops the prompt early (`run` returns false with err "cancelled").
     std::function<bool()> should_stop;
@@ -202,6 +313,10 @@ public:
     /// for its grouping on the host; a policy may count them. Not called on the paths that keep the ids on the GPU.
     std::function<void(int64_t layer, const int32_t* ids, int64_t n)> on_routes;
     int64_t stopped_at() const { return stopped_at_; }
+    /// The session this stage's runs read into and advance (`init`'s until changed): another session carved alike on
+    /// the same device and range (a batch slot's).  Set between runs, never during one.
+    void set_session(core::SessionState& ss);
+    core::SessionState& session() const;
     /// Grows this stage's (and the later stages') pinned upload slots to what a text chunk of `T` tokens uploads, so
     /// a run of such chunks allocates no pinned memory (STRATA_PIPED_CONCURRENT: an allocation or free on the read's
     /// thread takes the driver's lock).  Before the run, with nothing of this path in flight.  False: a slot could
@@ -220,6 +335,8 @@ public:
     void set_stage(int64_t layer_begin, int64_t layer_end, Prefill* next) {
         stage_lb_ = layer_begin; stage_le_ = layer_end; next_ = next;
     }
+    /// STRATA_NUMA_PLACE: the NUMA node of the hand-off buffers (the next stage's card, which reads them); set before `init`.
+    void set_hand_node(int node) { hand_node_ = node; }
 
     /// LAYER SPLIT: `helper` is another stage's prompt path (another GPU).  A prompt of one chunk runs the stages one
     /// after the other, so while this stage reads it the helper's GPU idles: it then streams a share of this stage's
@@ -239,12 +356,18 @@ public:
     /// thread runs meanwhile (no batch slots); on a layer split every stage may have it - one stage at a time takes it
     /// for a chunk. Set before `init`.
     void set_cpu_pool(kernels::cpu::ExpertPool* pool);
+    /// STRATA_P2P_HANDOFF=2: hand each chunk to the next stage in that stage's VRAM (two buffers of the host hand-off's
+    /// size there, written peer to peer) where this GPU can reach it; otherwise the pinned host buffers stay.  After
+    /// every stage's `init`; once.  Returns the line for the log ("" when there is no next stage on another GPU).
+    std::string enable_peer_handoff();
     /// With STRATA_PREFILL_CPU_SHARE set and `applies` (a pool will be set): the chunks staged after their routing - the
     /// only ones the share applies to - go up to STRATA_PREFILL_CPU_SHARE_MAX tokens (default 3072) instead of 1024.
     /// Before any `bytes_needed` (the ring and the small-chunk buffers follow the limit); `init` also sets it.
     /// `by_default`: this path is one the share was measured on (CUDA, one GPU, no batch slots), so with the variable unset
     /// the share is on for chunks below 1024 tokens (STRATA_PREFILL_CPU_SHARE=0 turns it off).
     static void arm_cpu_share(bool applies, bool by_default = false);
+    /// The staged-chunk limit of a default-armed share (1024; STRATA_SHORT_READS raises it).  Call before arm_cpu_share.
+    static void set_share_default_max(int64_t tokens);
 
 private:
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
@@ -252,11 +375,17 @@ private:
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool
     // Stage-1 pipeline: intermediate stages return after handing their chunk to
     // the direct successor. The public run() drains the chain once at prompt end.
-    bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
+    bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err,
+                  const std::shared_ptr<PromptJob>& job = nullptr, size_t depth = 0, bool job_last = false);
+    struct JobQueue;
+    std::unique_ptr<JobQueue> jobs_;
+    std::shared_ptr<PromptJob> take_batch(std::deque<std::shared_ptr<PromptJob>>& q, bool overtake_only = false);
+    std::atomic<bool> urgent_wait_{false};
     bool drain_pipeline(std::string& err);
 
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;
+    int hand_node_ = -1;
     Prefill* helper_ = nullptr;         ///< set_stage_helper
     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)
     int64_t stopped_at_ = -1;           ///< stop_at_chunk ended the last run after this many tokens (-1: it read all)
@@ -265,6 +394,7 @@ private:
     bool force_single_ = false, force_planned_ = false;
     bool bind_stage_helper(int64_t T);  // binds the helper's buffers for a one-chunk prompt of T tokens
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
+    bool hand_in_peer_ = false;         ///< ... in this stage's VRAM instead (enable_peer_handoff)
     /// STRATA_HANDOFF_PIPE: the previous stage's per-piece "landed in hand_in_" events (cudaEvent_t[hand_pieces_],
     /// on its device) when it copies the chunk in pieces without a host wait; null with the one-copy hand-off
     const void* hand_ev_ = nullptr;
@@ -273,6 +403,30 @@ private:
     std::string next_err_;
     std::future<bool> next_run_;
     int hand_buf_ = 0;
+
+    // STRATA_BATCH_READS_OVERTAKE: an overtaking chunk handed to this stage while it reads another one waits in `ubox_`
+    // (only while `ubox_open_`: this stage's run of a queued prompt is under way); the stage runs it at its next
+    // hand-off wait or before its run returns.  Each stage hands its own overtaking chunk through `hand_urg_`.
+    struct UrgentEntry {
+        std::shared_ptr<PromptJob> job;
+        const int64_t* tokens = nullptr;
+        int64_t T = 0, p0 = 0;
+        size_t depth = 0;
+        const float* h = nullptr;
+        std::atomic<bool>* src_busy = nullptr;   ///< the sender's hand_urg_ in use until this entry ran
+    };
+    std::mutex ubox_mu_;
+    std::deque<UrgentEntry> ubox_;
+    bool ubox_open_ = false;
+    float* hand_urg_ = nullptr;
+    int64_t hand_urg_rows_ = 0;
+    std::atomic<bool> hand_urg_busy_{false};
+    bool nested_ = false;
+    bool ot_ready_ = false;   ///< reserve_overtake gave every stage its buffer
+    bool run_urgent(const UrgentEntry& e, bool nested);            // one entry, on this stage (members saved)
+    bool overtake_here(bool can_nest);                             // at a hand-off wait: an overtaking chunk to run
+    void ubox_close(bool run);                                     // the run ends: run (or fail) what waits
+    std::shared_ptr<PromptJob> take_overtake();                    // stage 0: the queue's overtaking chunk, if any
 
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     void release();                          // the destructor's cleanup (also `reset`'s)

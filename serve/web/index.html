@@ -100,16 +100,8 @@
       <div class="st-card state-card">
         <div class="state-card__head">
           <span class="card-title">Model state</span>
-          <span class="badges" id="state-badges">
-            <span class="st-badge" data-s="idle">Idle</span>
-            <span class="st-badge st-badge--reading" data-s="reading">Reading</span>
-            <span class="st-badge st-badge--generating" data-s="generating">Generating</span>
-            <span class="st-badge st-badge--queued" data-s="queued">Queued</span>
-            <span class="st-badge st-badge--error" data-s="error">Error</span>
-          </span>
         </div>
-        <div class="state-card__row"><span id="state-label">Waiting for a request</span><span class="muted" id="state-detail"></span></div>
-        <div class="st-progress" id="state-progress"><div class="st-progress__bar" id="state-bar" style="width:0%"></div></div>
+        <div class="conv-states" id="conv-states"></div>
       </div>
 
       <div class="metrics" id="metrics">
@@ -118,7 +110,7 @@
 
       <div class="monitor-row">
         <div class="st-card ctx-card">
-          <span class="card-title">Context fill</span>
+          <span class="card-title" id="ctx-title">Context fill</span>
           <div class="ctx-gauge">
             <svg class="st-gauge" viewBox="0 0 120 120" aria-hidden="true">
               <circle class="st-gauge__track" cx="60" cy="60" r="50" fill="none" stroke-width="10" stroke-linecap="round"

@@ -26,6 +26,7 @@
 
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -55,6 +56,9 @@ public:
     }
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
     void set_max_drafts(int k) { max_drafts_ = k; }
+    /// a --batch slot's drafter (before prepare_rounds): with per-slot positions on, its rounds read that slot's own
+    /// (strata/kernels/mrope.hpp SlotRope), not the shared position table
+    void set_rope_slot(int slot) { rope_slot_ = slot; }
     /// --mtp-hnorm stream (opt-in; before the first draft or prefill): pre_fc_norm_hidden normalizes each
     /// hyper-connection stream on its own, as llama.cpp's qwen4exp MTP graph does, instead of one RMS over all four.
     void set_hnorm_per_stream(bool on) { hnorm_stream_ = on; }
@@ -103,6 +107,14 @@ public:
     /// accepted row) for T-1 drafts at cells p+a+1 ...  `drafts` gets T-1 tokens.
     bool draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
+
+    /// draft() split in two (STRATA_PIPED_MTP): the round is launched and draft_poll returns 1 once its drafts are in
+    /// `drafts` (0: still running, -1: an error).  Greedy drafts only (no min_p); no PLE prefetch.
+    bool draft_launch(int T, const int32_t* tokens, int64_t p, int a, std::string& err);
+    int draft_poll(int32_t* drafts, std::string& err, int* n_drafts = nullptr);
+    bool draft_live() const { return async_live_; }
+    /// Capture the round graphs for T = 1..max_T and the step graphs now, with nothing in flight.
+    bool prepare_rounds(int max_T, std::string& err);
 
     /// The first round: one cell (`cell`) from `R_row` (device) and `token` -> T-1 drafts.
     bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
@@ -179,6 +191,11 @@ private:
     bool capture_prefill(int T, std::string& err);
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
     bool capture_round(int T, bool coupled, std::string& err);
+    /// draft()'s staging: the graphs captured, the window's tokens and cells, the source rows
+    bool stage_round(int& T, const int32_t* tokens, int64_t p, int a, bool cp, int& max_steps, std::string& err);
+    bool async_live_ = false;
+    int async_steps_ = 0;
+    std::chrono::steady_clock::time_point async_t0_{};
     bool capture_step(int j, bool coupled, std::string& err);
     cudaGraphExec_t step_exec_[9] = {};
     // coupled draft sampling: its own round/step graphs (the argmax ones stay as they were), the request's
@@ -204,6 +221,7 @@ private:
     const NativeHead* head_ = nullptr;
     const float* window_R_ = nullptr;
     int max_t_ = 0;
+    int rope_slot_ = -1;
     int device_ = -1;   ///< the device `load` ran on: the public calls switch to it (layer split)
     int max_drafts_ = 1 << 30;
     bool hnorm_stream_ = false;

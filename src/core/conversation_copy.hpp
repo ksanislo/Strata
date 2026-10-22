@@ -9,6 +9,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <cstdint>
+#include <cstring>
 #include <thread>
 #include <vector>
 
@@ -35,12 +37,44 @@ inline cudaError_t private_stream(cudaStream_t& s) {
     return cudaSuccess;
 }
 
+/// A --batch slot's park (STRATA_PARK_STAGING_MIB): while set on this thread, a copy into pageable host memory is
+/// only queued, into this pinned buffer at PCIe speed; the caller synchronizes `devices`' private streams, then
+/// `land` moves the bytes to their pageable targets (on any thread).  A copy that does not fit runs as before.
+struct StagedCopies {
+    uint8_t* base = nullptr;
+    size_t cap = 0, used = 0;
+    struct Item { void* dst; const void* src; size_t off, n; };
+    std::vector<Item> items;
+    std::vector<int> devices;
+    void reset() { used = 0; items.clear(); devices.clear(); }
+    void land() const { for (const Item& i : items) std::memcpy(i.dst, base + i.off, i.n); }
+};
+inline StagedCopies*& staged_copies() { thread_local StagedCopies* p = nullptr; return p; }
+
 /// `queued`: the copy is only queued on the private stream, and the caller synchronizes the device (or orders a
 /// later launch after it with order_after_queued) before anything reads the target or writes the source.
 inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes, bool queued = false) {
     cudaStream_t s = nullptr;
     cudaError_t e = private_stream(s);
     if (e != cudaSuccess) return e;
+    if (StagedCopies* sc = staged_copies(); sc != nullptr && !queued) {
+        cudaPointerAttributes a{};
+        if (cudaPointerGetAttributes(&a, dst) != cudaSuccess) (void) cudaGetLastError();
+        else if (a.type == cudaMemoryTypeUnregistered) {   // pageable: through the pinned buffer
+            const size_t off = (sc->used + 255) & ~(size_t) 255;
+            if (off + bytes <= sc->cap) {
+                e = cudaMemcpyAsync(sc->base + off, src, bytes, cudaMemcpyDefault, s);
+                if (e != cudaSuccess) return e;
+                sc->used = off + bytes;
+                sc->items.push_back({dst, src, off, bytes});
+                int dev = 0;
+                if (cudaGetDevice(&dev) == cudaSuccess &&
+                    std::find(sc->devices.begin(), sc->devices.end(), dev) == sc->devices.end())
+                    sc->devices.push_back(dev);
+                return cudaSuccess;
+            }
+        }
+    }
     e = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, s);
     if (e != cudaSuccess || queued) return e;
     e = cudaStreamSynchronize(s);

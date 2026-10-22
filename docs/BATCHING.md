@@ -352,6 +352,44 @@ one cold 64K prompt joining four streams: `STRATA_BATCH_DECODE_SHARE=2.0` 2.4 s 
 s and 13.8 s. Pieces of one chunk (`PIECE=8192`) cost the long prompt the most. Not measured: other GPU pairs, three or
 more stages, HIP and SYCL (built for CUDA only), sampled decoding, prompts with pictures.
 
+## One CPU pool and doorbell thread per stage (experimental, opt-in)
+
+`STRATA_STAGE_SERVE=1` (Linux, a layer split on separate GPUs) gives every stage its own expert pool on the cores of
+the NUMA node its GPU hangs off (sysfs: the card's `numa_node`, the node's `cpulist`) and its own expert dispatch, so
+two stages never share the pool's scratch and nothing is re-pointed per layer. A node's physical cores, minus the host
+thread's core, are cut between the stages on it by their layers, at least one each: the first core of a share runs the
+stage's service thread, the rest are its pool's workers (the start-up log prints each stage's line). `--pool-workers N`
+caps the workers of all stages together, split by layers; the service threads are not counted.
+
+- Every verify window's doorbells are served by its stage's service thread: the pipelined groups' batch windows (the
+  `STRATA_PIPED_CONCURRENT` doorbell thread is not started), the serial decode's and a slot's first token's windows
+  (`Verifier::run`: the host thread waits, and meanwhile stages the next stage's window), and `--pipeline-windows`
+  (both parities of a stage on its thread: the front stages' guessed window and the last stage's verify are served at
+  once, each on its own node). The host thread launches and polls; the 20 s timeout and the "never rang" check stay
+  there. Between windows a service thread spins 20 ms, then sleeps until the next launch wakes it.
+- A window with the adaptive tier's overlap gate active, the PCIe balance or `--remote-expert-opt` still serves itself
+  on the host thread, on its stage's pool.
+- The prompt path's CPU share (`STRATA_PREFILL_CPU_SHARE`, off by default on a layer split) takes each stage's own pool,
+  so the stages no longer take turns. The engine's own pool stays (it is built before the stages are known, and the
+  single-GPU paths use it) but idles: its workers sleep.
+- Off (with a log line) beside what also keeps `STRATA_PIPED_CONCURRENT` off, the routing-aware prefetch, a peer
+  device, `--dump-routing`, `--no-pool` and `--split-device 0`.
+
+That describes `STRATA_STAGE_SERVE=split`. `=1` lets the CPU workers follow the work: on an AVX-only CPU the expert
+kernels are compute-bound (~1.2 GB/s a thread, local memory buys nothing), so cutting the pool into 3-5 workers per
+stage starved the one stage that works when one conversation decodes (2x Xeon E5-2660 v2, Q8: 19.0 tok/s against 29
+with the switches off). With `=1`:
+
+- A stage whose window is the only one in flight takes the engine's whole pool for its layers; while another stage
+  works (several conversations in the pipelined groups, `--pipeline-windows`) each stage takes its own, and the engine's
+  pool waits 25 ms after the last such moment, so its workers and a stage pool's never spin on one core. Decided per
+  layer; one stage at a time holds the engine's pool.
+- The serial windows (one conversation's decode, a slot's first token) serve on the host thread again, as without the
+  switch.
+- A stage's service thread runs on the SMT sibling of its share's first core, and every physical core of the share is
+  a worker.
+- Each request's log line is followed by how many layers ran on the engine's pool and on the stages' own.
+
 ## The VRAM expert tier keeps adapting in batch windows
 
 Batch windows count which experts they route to, and every `--adapt-every` windows (default 4) the engine swaps the
@@ -418,13 +456,33 @@ texts read as well as their solo runs.
 Sampled requests (temperature, top_p, top_k, min_p, seed) are drawn row by row with the solo window's
 counter-based draw (Philox(seed, position)).
 
+## MTP drafts in pipelined groups (experimental, opt-in)
+
+`STRATA_PIPED_MTP=1` keeps `--batch-mtp`'s drafts in pipelined slot groups (a layer split, `--batch-groups` above 1,
+the default there); it implies `--batch-mtp`. While at most `STRATA_PIPED_MTP_MAX` (default 2) conversations decode,
+a group's window carries each live slot's token and up to `STRATA_PIPED_MTP_DRAFTS` of its drafts (default `--spec`
+minus one, as a solo window; a group's window holds at most 8 rows, shared out one draft per slot in turn; idle slots
+get no row). Such a
+window is launched on every stage without its commit; when the last stage has picked, the host decides each slot's
+accepted prefix (its drafts up to the first the target did not pick), queues the group's commit on every stage's stream, starts the
+slots' drafters on the last stage's GPU (from the window's final residual rows, copied on that stage's stream), and the
+group's next window enters stage 0 once those drafts have landed; the other groups keep flowing meanwhile. A stage
+that runs another window before a group's commit first copies that group's commit inputs (its window rows of the GDN
+inputs, indexer keys and PLE history, a few MiB per group and stage, allocated at start) aside and puts them back for
+the commit. With more conversations the groups build one row per slot again (switched per window); a slot's drafter
+then skips those cells, so the first drafts after the switch back are accepted less often. Logs: `STRATA_PIPED_MTP:
+N pipelined groups of M slots keep their MTP drafts ...` at start, `strata batch (pipelined): MTP proposals accepted A
+of P (X%); W windows of R rows avg, T ms launch to picks, drafts D ms after; K tokens per window` when the slots go
+idle (what more drafts per window cost against what they bring). Each slot's tokens are the serial `--batch-mtp` windows' and its solo tokens
+(greedy, `STRATA_IQ_MT_MIN=1`): `STRATA_PIPED_MTP=1 tools/batch_test.py ... --batch 4 --n 2`.
+
 ## Limits (for now)
 
 - By default, batch windows carry no MTP drafts: a conversation in a slot decodes one token per window (the solo
   path keeps its drafts, which is why a request alone is not put in a slot, and goes back to it when left alone).
 - `--batch-mtp` uses one proposal per slot. With a layer split it needs each stage on its own GPU, does not combine
-  with `--batch-groups` above 1 (pipelined slot groups run no drafts, #1413) and has not been run with helper expert
-  caches.
+  with `--batch-groups` above 1 (pipelined slot groups run no drafts, #1413; see `STRATA_PIPED_MTP` below) and has not
+  been run with helper expert caches.
 - Repetition / frequency / presence penalties are not applied in batch windows.
 - A prompt shorter than one chunk is read in one piece (the slots wait for it); a read gives way only at a chunk
   boundary, and not for pictures.

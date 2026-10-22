@@ -20,6 +20,8 @@
 #include <utility>
 #include <vector>
 
+#include "strata/platform/numa.hpp"
+
 namespace strata::core {
 
 enum class PageBacking { LargePages, NormalPages, PinnedByCuda };
@@ -29,6 +31,8 @@ enum class PageBacking { LargePages, NormalPages, PinnedByCuda };
 /// -2 for "auto" (Windows: the sliced pin stays below the GPU's shared-memory budget).
 int arena_pin_cap_gib();
 
+/// STRATA_NUMA_PLACE: spans (arena offsets) the next anonymous arena binds to their nodes before it registers (used once).
+void pinned_arena_numa_plan(std::vector<strata::platform::NumaSpan> spans);
 struct PinnedArena {
     void* base = nullptr;
     uint64_t capacity = 0;
@@ -73,11 +77,21 @@ struct PinnedArena {
     /// Registers the deferred slices in order, publishing how many are done in `ready`, and INT_MAX once it
     /// returns (a slice CUDA refuses ends the registration, and the rest is kept resident by the working-set lock).
     void register_slices(std::atomic<int>& ready);
+    /// STRATA_PARALLEL_LOAD (Linux): reserve only; the caller fills the arena (its threads fault the pages in, on
+    /// their own nodes), then register_filled() registers it as the first constructor would (the same cap, the same
+    /// sliced and locked fallbacks).  cudaHostRegister holds the driver while it faults pages in on one thread.
+    struct FillFirst {};
+    PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, FillFirst, uint64_t max_pinned_bytes = 0);
+    void register_filled();
     std::vector<uint64_t> bounds_;
     std::vector<uint64_t> slice_starts;
     void* mapping_base = nullptr;     ///< actual mapping start; differs from base when a shared-file header exists
     uint64_t mapping_bytes = 0;       ///< bytes to release from mapping_base
     ~PinnedArena();
+private:
+    void register_now(const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes);
+    uint64_t fill_first_cap_ = 0;
+public:
     PinnedArena(const PinnedArena&) = delete;
     PinnedArena& operator=(const PinnedArena&) = delete;
 

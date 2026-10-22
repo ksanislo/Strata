@@ -618,6 +618,8 @@ struct ExpertDispatch {
     /// Plan v0.3 P6: decayed routing counts per (layer, expert) during decode (sized by the caller; empty = off),
     /// which the driver uses to swap the most-routed missing experts into the VRAM tier between rounds.
     std::vector<float> usage;
+    /// STRATA_STAGE_SERVE: a layer-split stage's own dispatch counts into the base dispatch's `usage` (its layers only).
+    std::vector<float>* usage_into = nullptr;
     /// The adaptive tier's evictions reach the device's table before the next window, not when the round's copies
     /// land: until then doorbell_publish_res can skip a layer's activation while the pool computes an evicted expert
     /// from the one published before.  The driver sets it where the tier does not wait for its copies
@@ -1257,6 +1259,10 @@ public:
     }
     /// Pin by need, after open(): the registered ranges (0 when the prefix rule, or nothing, is in force)
     size_t pin_ranges() const { return pin_start_.size(); }
+    /// STRATA_NUMA_PLACE, before open(): the NUMA node of each layer (the node of the card that runs it).
+    void set_numa_layer_nodes(std::vector<int> nodes) { numa_nodes_ = std::move(nodes); }
+    /// After open(): where the arena's pages landed per node (empty without a placement).
+    const std::string& numa_note() const { return numa_note_; }
 
     /// What backing was obtained and why, for the startup print.  "The engine adapts to the machine it is on" is
     /// only true if the engine says what it got.
@@ -1284,6 +1290,8 @@ private:
     std::atomic<int64_t> reads_{0};   ///< (a counter only; two threads can read blobs at once)
     std::string note_;
     std::string ram_warning_;
+    std::vector<int> numa_nodes_;
+    std::string numa_note_;
     double gib_per_s_ = 0.0;
     double load_seconds_ = 0.0;
     double load_read_s_ = 0.0;
@@ -1306,6 +1314,10 @@ private:
     /// index of the registered range holding [off, off + len), or -1
     int64_t pin_range_of(uint64_t off, uint64_t len) const;
     std::string gguf_;
+    std::vector<int> load_nodes_;
+public:
+    /// STRATA_PARALLEL_LOAD, before open(): each layer's NUMA node (the node of the card that runs it); empty: unpinned.
+    void set_load_layer_nodes(std::vector<int> nodes) { load_nodes_ = std::move(nodes); }
 };
 
 /// Plan v0.3 P6: checks native_experts.txt's GGUF spans against the files, before anything is read: each layer's
@@ -1319,5 +1331,15 @@ bool check_experts_gguf(const std::string& native, const strata::kernels::cpu::E
 LoadStats load_experts_gguf(const std::string& native, uint8_t* dst, const strata::kernels::cpu::ExpertLayout& lay,
                             int threads, bool unbuffered = false, const std::atomic<int>* ready = nullptr,
                             const PadMap* pad = nullptr);
+/// STRATA_PARALLEL_LOAD: the same fill, each (expert, role) piece read straight into its place (no staging copy) by
+/// `threads_per_node` threads per NUMA node of `layer_nodes` (one per layer; a thread runs on its node's CPUs and
+/// fills that node's layers), or `threads_per_node` unpinned threads over every layer when `layer_nodes` is empty.
+LoadStats load_experts_gguf_parallel(const std::string& native, uint8_t* dst,
+                                     const strata::kernels::cpu::ExpertLayout& lay, const std::vector<int>& layer_nodes,
+                                     int threads_per_node, const PadMap* pad = nullptr);
+/// STRATA_PARALLEL_LOAD: 0 off (default), 1 on.  STRATA_PARALLEL_LOAD_REGISTER=first keeps the registration before
+/// the fill (only the fill is parallel); default: the arena is filled first and registered after.
+int parallel_load_mode();
+bool parallel_load_register_first();
 
 }  // namespace strata::core

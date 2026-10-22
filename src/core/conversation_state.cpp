@@ -1,3 +1,4 @@
+#include "strata/core/capture_lock.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "conversation_checked.hpp"
 #include "conversation_copy.hpp"
@@ -24,7 +25,12 @@ bool fail(std::string& error, const char* message) {
 }
 
 bool sync(std::string& error) {
-    const auto status = cudaDeviceSynchronize();
+    if (strata::core::device_sync_override()) {   // (the narrowed sync: this thread's queued copies are not in it)
+        cudaStream_t s = nullptr;
+        if (conversation_detail::private_stream(s) == cudaSuccess && cudaStreamSynchronize(s) != cudaSuccess)
+            return fail(error, "the copy stream failed");
+    }
+    const auto status = strata::core::device_sync();
     if (status == cudaSuccess) return true;
     error = std::string("conversation snapshot synchronize: ") + cudaGetErrorString(status);
     return false;

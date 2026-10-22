@@ -811,8 +811,9 @@ template<int TY> inline constexpr bool kSplit = false;
 // The K-quant / Q8_0 / Q5_1 formats (UD-Q4_K_XL) have Split traits (SplitK below), but their decode-once multi kernels
 // run only with STRATA_KQ_SPLIT=1 until the A/B on the measured cards decides (bitwise the old kernels either way).
 template<int TY> inline constexpr bool kq_type = (TY == 12 || TY == 13 || TY == 8);   // not Q5_1: its Split apply is not bitwise the old dot (FMA contraction), see notes-151-amd
-inline bool g_kq_split = [] { const char* v = std::getenv("STRATA_KQ_SPLIT"); return v != nullptr && v[0] == '1'; }();
-template<int TY> inline bool split_off() { return kq_type<TY> && !g_kq_split; }
+// read at first use, not at load: the sm_75 table (nv_defaults, STRATA_SM75_STACK) sets it in main
+inline bool kq_split_on() { static const bool on = [] { const char* v = std::getenv("STRATA_KQ_SPLIT"); return v != nullptr && v[0] == '1'; }(); return on; }
+template<int TY> inline bool split_off() { return kq_type<TY> && !kq_split_on(); }
 template<int TY> inline constexpr bool kStageIqGrid = (TY == 16 || TY == 17 || TY == 18 || TY == 21 || TY == 22 || TY == 29);
 
 template<> inline constexpr bool kSplit<16> = true;
@@ -3055,6 +3056,15 @@ bool gu_split(int t) {
         default: return false;
     }
 }
+// dots per gate/up row ((n_embd / qk) * ipb); launch_gu takes the 16-lane rows only at 80 (Q8_0 at 2560: 320)
+int gu_dots(int t, int64_t n_embd) {
+    switch (t) {
+#define STRATA_DOTS(T) case T: return (int) (n_embd / Fmt<T>::qk) * Fmt<T>::ipb;
+        STRATA_GU_FMTS(STRATA_DOTS)
+#undef STRATA_DOTS
+        default: return 0;
+    }
+}
 
 bool env_on(const char* name) {
     const char* v = std::getenv(name);
@@ -3803,6 +3813,244 @@ bool expdec_down(const NativeExpertLayout& L, int64_t gy, int64_t cap_groups, cu
     if (L.d_type == 20) expdec_down_t<20>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else expdec_down_t<42>(gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     return true;
+}
+
+// ---------------------------------------------------------------- STRATA_KQL: UD-Q4_K_XL / Q8_0 experts, rows staged
+// The default Q4_K / Q5_K / Q5_1 / Q8_0 rows loop one call per lane at a time (a DRAM round trip per step, 2-byte loads
+// for Q8_0).  Here a warp first copies its P consecutive rows into shared memory with 16-byte loads, all in flight at
+// once, then runs Fmt<TY>::dot on them: each original lane's calls in its order, then warp_sum's butterfly (the levels
+// >= 32 / P inside the thread), so every output is the row_dot bits.  P rows a warp in sub-warps of 32 / P lanes.
+template<int TY> struct KqlBlk;
+template<> struct KqlBlk<12> { static constexpr int bytes = sizeof(block_q4_K); };
+template<> struct KqlBlk<13> { static constexpr int bytes = sizeof(block_q5_K); };
+template<> struct KqlBlk<7> { static constexpr int bytes = sizeof(block_q5_1); };
+template<> struct KqlBlk<8> { static constexpr int bytes = sizeof(block_q8_0); };
+
+// rows per warp: gate/up 1 | 2 (STRATA_KQL_GU_P), down 1 | 2 | 4 (STRATA_KQL_D_P); warps per block 4 | 8 (STRATA_KQL_WARPS)
+int g_kql_force = -1;   // native_expert_set_mode: 9 on, any other mode off, -1 the env
+int kql_bits() {   // STRATA_KQL: 1 gate/up, 2 down, 3 both
+    static const int env = env_int_or("STRATA_KQL", 0);
+    return g_kql_force < 0 ? env : g_kql_force ? 3 : 0;
+}
+// unset: 2 for Q4_K / Q5_K (09-kq-layout: gu -20..-30%), 1 for Q8_0 (2 was +7-9%)
+int kql_gu_rows(int gt) { static const int v = env_int_or("STRATA_KQL_GU_P", 0); return v == 1 || v == 2 ? v : gt == 8 ? 1 : 2; }
+// unset: 4 for Q5_1 (80 registers), 2 for Q8_0 (4 takes 128: two blocks an SM)
+int kql_d_rows(int dt) { static const int v = env_int_or("STRATA_KQL_D_P", 0); return v == 1 || v == 2 || v == 4 ? v : dt == 8 ? 2 : 4; }
+int kql_warps() { static const int v = env_int_or("STRATA_KQL_WARPS", 8); return v == 4 ? 4 : 8; }
+
+// One warp: rows src[0 .. P) (contiguous, P * RB bytes) into s_w, 16 bytes a lane-load when aligned.
+template<int BYTES>
+__device__ __forceinline__ void kql_stage(const uint8_t* src, uint8_t* s_w, int lane) {
+    if constexpr (BYTES % 16 == 0) {
+        if ((reinterpret_cast<uintptr_t>(src) & 15) == 0) {
+            constexpr int N = BYTES / 16, PER = (N + 31) / 32;
+            int4 v[PER];
+#pragma unroll
+            for (int i = 0; i < PER; ++i)
+                if (lane + 32 * i < N) v[i] = __ldcs(reinterpret_cast<const int4*>(src) + lane + 32 * i);
+#pragma unroll
+            for (int i = 0; i < PER; ++i)
+                if (lane + 32 * i < N) reinterpret_cast<int4*>(s_w)[lane + 32 * i] = v[i];
+            __syncwarp();
+            return;
+        }
+    }
+    constexpr int N = BYTES / 4, PER = (N + 31) / 32;
+    int v[PER];
+#pragma unroll
+    for (int i = 0; i < PER; ++i)
+        if (lane + 32 * i < N) v[i] = __ldcs(reinterpret_cast<const int*>(src) + lane + 32 * i);
+#pragma unroll
+    for (int i = 0; i < PER; ++i)
+        if (lane + 32 * i < N) reinterpret_cast<int*>(s_w)[lane + 32 * i] = v[i];
+    __syncwarp();
+}
+
+// Row `row` (shared) against x, lane t of a 32 / P-lane sub-warp; every lane of the sub-warp returns the row_dot sum.
+template<int TY, int K, int P>
+__device__ __forceinline__ float kql_dot(const uint8_t* row, const block_q8_1* x, int t) {
+    using F = Fmt<TY>;
+    constexpr int SW = 32 / P;
+    float s[P];
+#pragma unroll
+    for (int j = 0; j < P; ++j) {
+        s[j] = 0.0f;
+#pragma unroll
+        for (int i = 0; i < (K + 31) / 32; ++i) {
+            const int k = t + SW * j + 32 * i;
+            if (k < K) {
+                const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                s[j] += F::dot(row, x + kbx * (F::qk / 32), kbx, iqs);
+            }
+        }
+    }
+#pragma unroll
+    for (int o = P / 2; o >= 1; o >>= 1)   // warp_sum's xor 16 .. SW levels: lanes t + SW j and t + SW (j + o)
+#pragma unroll
+        for (int j = 0; j < o; ++j) s[j] = __fadd_rn(s[j], s[j + o]);
+#pragma unroll
+    for (int o = SW / 2; o > 0; o >>= 1) s[0] += __shfl_xor_sync(0xffffffffu, s[0], o);
+    return s[0];
+}
+
+// kql_dot for NC entries (x + off[c]) with each weight part decoded once (S27 load / apply: bitwise Fmt<TY>::dot for
+// Q4_K, Q5_K and Q8_0, as KQ_SPLIT's row_dot_multi; Q5_1 has no such pair and takes kql_dot per entry)
+template<int TY, int K, int P, int NC>
+__device__ __forceinline__ void kql_dot_n(const uint8_t* row, const block_q8_1* x, const int (&off)[NC], int t, float (&out)[NC]) {
+    using F = Fmt<TY>;
+    using S = S27<TY>;
+    constexpr int SW = 32 / P;
+    float s[P][NC];
+#pragma unroll
+    for (int j = 0; j < P; ++j) {
+#pragma unroll
+        for (int c = 0; c < NC; ++c) s[j][c] = 0.0f;
+#pragma unroll
+        for (int i = 0; i < (K + 31) / 32; ++i) {
+            const int k = t + SW * j + 32 * i;
+            if (k < K) {
+                const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                const typename S::W w = S::load(row, kbx, iqs);
+#pragma unroll
+                for (int c = 0; c < NC; ++c) s[j][c] += S::apply(w, x + off[c] + kbx * (F::qk / 32), iqs);
+            }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+#pragma unroll
+        for (int o = P / 2; o >= 1; o >>= 1)
+#pragma unroll
+            for (int j = 0; j < o; ++j) s[j][c] = __fadd_rn(s[j][c], s[j + o][c]);
+#pragma unroll
+        for (int o = SW / 2; o > 0; o >>= 1) s[0][c] += __shfl_xor_sync(0xffffffffu, s[0][c], o);
+        out[c] = s[0][c];
+    }
+}
+// A group's entries e0 .. e1 against one staged row: off(e) = the entry's q8_1 offset, put(e, v) its store (lane t 0)
+template<int TY, int K, int P, typename Off, typename Put>
+__device__ __forceinline__ void kql_entries(const uint8_t* row, const block_q8_1* x, int e0, int e1, int t, Off off, Put put) {
+    if constexpr (TY == 12 || TY == 13 || TY == 8) {
+        for (int e = e0; e < e1; e += GRP_NC) {
+            const int n = min(GRP_NC, e1 - e);
+            auto pass = [&](auto nc) {
+                constexpr int NC = decltype(nc)::value;
+                int o[NC];
+                float v[NC];
+#pragma unroll
+                for (int c = 0; c < NC; ++c) o[c] = off(e + c);
+                kql_dot_n<TY, K, P, NC>(row, x, o, t, v);
+#pragma unroll
+                for (int c = 0; c < NC; ++c) put(e + c, v[c]);
+            };
+            if (n == 1) pass(std::integral_constant<int, 1>{});
+            else if (n == 2) pass(std::integral_constant<int, 2>{});
+            else if (n == 3) pass(std::integral_constant<int, 3>{});
+            else pass(std::integral_constant<int, 4>{});
+        }
+    } else {
+        for (int e = e0; e < e1; ++e) put(e, kql_dot<TY, K, P>(row, x + off(e), t));
+    }
+}
+
+// gate/up: n_embd = K dots of TG a row; warp w of block b takes rows (b W + w) P .. + P of gate | up (n_ff % P == 0)
+template<int TG, int K, int P>
+__global__ void __launch_bounds__(256) kql_gu_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                     const int32_t* __restrict__ grp_start,
+                                                     const int32_t* __restrict__ n_groups,
+                                                     const int32_t* __restrict__ ent_tok,
+                                                     const block_q8_1* __restrict__ xq, NativeExpertLayout L,
+                                                     float* __restrict__ gate, float* __restrict__ up) {
+    constexpr int RB = (K / Fmt<TG>::ipb) * KqlBlk<TG>::bytes, XB = K / Fmt<TG>::ipb * Fmt<TG>::qk / 32;
+    extern __shared__ int4 kql_smem[];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    const int row0 = (blockIdx.x * nw + warp) * P;
+    if (row0 >= 2 * L.n_ff) return;
+    const bool is_up = row0 >= L.n_ff;
+    const int r0 = is_up ? row0 - (int) L.n_ff : row0;
+    const size_t w_off = (is_up ? L.up_off : 0) + (size_t) r0 * RB;
+    float* dst = is_up ? up : gate;
+    uint8_t* s_w = reinterpret_cast<uint8_t*>(kql_smem) + (size_t) warp * P * RB;
+    const int sub = lane / (32 / P), t = lane % (32 / P);
+    const int ng = *n_groups;
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        __syncwarp();   // the previous group's rows are read
+        const unsigned long long p = grp_ptr[g];
+        kql_stage<P * RB>((const uint8_t*) p + w_off, s_w, lane);
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        kql_entries<TG, K, P>(s_w + sub * RB, xq, e0, e1, t, [&](int e) { return ent_tok[e] * XB; },
+                              [&](int e, float v) { if (t == 0) dst[(size_t) e * L.n_ff + r0 + sub] = v; });
+    }
+}
+
+// down: n_ff = K dots of TD a row
+template<int TD, int K, int P>
+__global__ void __launch_bounds__(256) kql_down_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                       const int32_t* __restrict__ grp_start,
+                                                       const int32_t* __restrict__ n_groups,
+                                                       const int32_t* __restrict__ ent_dst,
+                                                       const block_q8_1* __restrict__ hq, NativeExpertLayout L,
+                                                       float* __restrict__ out) {
+    constexpr int RB = (K / Fmt<TD>::ipb) * KqlBlk<TD>::bytes, HB = K / Fmt<TD>::ipb * Fmt<TD>::qk / 32;
+    extern __shared__ int4 kql_smem[];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    const int r0 = (blockIdx.x * nw + warp) * P;
+    if (r0 >= L.n_embd) return;
+    const size_t w_off = L.down_off + (size_t) r0 * RB;
+    uint8_t* s_w = reinterpret_cast<uint8_t*>(kql_smem) + (size_t) warp * P * RB;
+    const int sub = lane / (32 / P), t = lane % (32 / P);
+    const int ng = *n_groups;
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        __syncwarp();   // the previous group's rows are read
+        const unsigned long long p = grp_ptr[g];
+        kql_stage<P * RB>((const uint8_t*) p + w_off, s_w, lane);
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        kql_entries<TD, K, P>(s_w + sub * RB, hq, e0, e1, t, [&](int e) { return e * HB; },
+                              [&](int e, float v) { if (t == 0) out[(size_t) ent_dst[e] * L.n_embd + r0 + sub] = v; });
+    }
+}
+
+// Flash-Next's geometry only (n_embd 2560, n_ff 640): the dot counts are template constants
+bool kql_gu_fits(const NativeExpertLayout& L) {
+    return (kql_bits() & 1) && !g_old_kernels && L.n_embd == 2560 && L.n_ff == 640 && L.tail_off == 0 && L.had_block == 0 &&
+           (L.gu_type == 12 || L.gu_type == 13 || L.gu_type == 8);
+}
+bool kql_down_fits(const NativeExpertLayout& L) {
+    return (kql_bits() & 2) && !g_old_kernels && L.n_embd == 2560 && L.n_ff == 640 && L.tail_off == 0 && L.had_block == 0 &&
+           (L.d_type == 7 || L.d_type == 8);
+}
+template<int TG, int P>
+void kql_gu_p(int64_t gy, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+              const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L, float* gate, float* up) {
+    constexpr int K = 2560 / Fmt<TG>::qk * Fmt<TG>::ipb, RB = (K / Fmt<TG>::ipb) * KqlBlk<TG>::bytes;
+    const int nw = kql_warps();
+    const dim3 grid((unsigned) (2 * L.n_ff / (nw * P)), (unsigned) gy);
+    kql_gu_kernel<TG, K, P><<<grid, 32 * nw, (size_t) nw * P * RB, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+}
+template<int TD, int P>
+void kql_down_p(int64_t gy, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+                const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L, float* out) {
+    constexpr int K = 640 / Fmt<TD>::qk * Fmt<TD>::ipb, RB = (K / Fmt<TD>::ipb) * KqlBlk<TD>::bytes;
+    const int nw = kql_warps();
+    const dim3 grid((unsigned) (L.n_embd / (nw * P)), (unsigned) gy);
+    kql_down_kernel<TD, K, P><<<grid, 32 * nw, (size_t) nw * P * RB, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+}
+void kql_gu(int64_t gy, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+            const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L, float* gate, float* up) {
+    const bool p2 = kql_gu_rows(L.gu_type) == 2;
+#define STRATA_KQL_GU(T) if (L.gu_type == T) { if (p2) kql_gu_p<T, 2>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); \
+                                               else kql_gu_p<T, 1>(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); }
+    STRATA_KQL_GU(12) else STRATA_KQL_GU(13) else STRATA_KQL_GU(8)
+#undef STRATA_KQL_GU
+}
+void kql_down(int64_t gy, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+              const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L, float* out) {
+    const int p = kql_d_rows(L.d_type);
+#define STRATA_KQL_D(T) if (L.d_type == T) { if (p == 1) kql_down_p<T, 1>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); \
+                                             else if (p == 2) kql_down_p<T, 2>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); \
+                                             else kql_down_p<T, 4>(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); }
+    STRATA_KQL_D(7) else STRATA_KQL_D(8)
+#undef STRATA_KQL_D
 }
 
 template<int TG>
@@ -4721,6 +4969,8 @@ int sm75_down_em(int em0, int64_t) { return em0; }
 #endif
 
 void native_expert_set_mode(int mode, int phase) {
+    g_kql_force = mode == 9 ? 1 : mode >= 0 ? 0 : -1;   // 9: STRATA_KQL=3 on the CUDA layout (native_expert_bench)
+    if (mode == 9) mode = 0;
 #if STRATA_EXP_LAYOUTS
     g_exp_mode = mode;
 #else
@@ -4791,6 +5041,48 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         check("native_expert_grouped (v2)");
         return;
     }
+    // STRATA_KQL (kql_gu_kernel above): either half alone, the other on the kernels below; bitwise the same outputs
+    const bool kgu = kql_gu_fits(L), kdn = kql_down_fits(L);
+    if (kgu || kdn) {
+        const int64_t gy = (g_grouped_v1 || grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
+        const long long nh = (long long) cap_entries * L.n_ff;
+        if (g_exp_phase != 2) {
+            if (kgu) kql_gu(gy, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+            else {
+                const int gu_rows = (!g_no_sub16_gu && gu_split(L.gu_type) && gu_dots(L.gu_type, L.n_embd) == 80) ? 16 : GU_ROWS;
+                const dim3 ggu((unsigned) ((2 * L.n_ff + gu_rows - 1) / gu_rows), (unsigned) gy);
+                switch (L.gu_type) {
+#define STRATA_GU(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+                    STRATA_GU_FMTS(STRATA_GU)
+#undef STRATA_GU
+                    default: std::fprintf(stderr, "native_expert_grouped: gate/up type %d\n", L.gu_type); std::exit(1);
+                }
+            }
+            check("native_expert_grouped/gu (kql)");
+            if (g_grouped_v1) {   // the default path's SwiGLU + q8_1 passes, unchanged
+                swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
+                quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
+            } else {
+                swiglu_q8_1_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, grp_start, n_groups,
+                                                                                        (int) L.n_ff, hq);
+            }
+            check("native_expert_grouped/swiglu (kql)");
+        }
+        if (g_exp_phase == 1) return;
+        if (kdn) kql_down(gy, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        else {
+            const int d_rows = (!g_no_sub16_gu && L.n_ff == 640) ? (L.d_type == 20 || L.d_type == 40 ? 32 : (L.d_type == 42 ? 16 : 8)) : 8;
+            const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) gy);
+            switch (L.d_type) {
+#define STRATA_DOWN(T) case T: launch_down<T>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+                STRATA_D_FMTS(STRATA_DOWN)
+#undef STRATA_DOWN
+                default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); std::exit(1);
+            }
+        }
+        check("native_expert_grouped/down (kql)");
+        return;
+    }
     // stream B: UD-Q4_K_XL's Q4_K / Q5_K gate/up and Q5_1 / Q8_0 down (see S27 above)
     // MODEL-UPDATE: on by default on gfx12 (every output the old kernels' bits; R9700, UD-Q4_K_XL decode, 5 interleaved
     // pairs: story +1.2% 5/5, code +0.8% 5/5, after 6K +0.2% 4/5); STRATA_EXPERT_V2K=0 turns it off, =1 turns it on
@@ -4836,8 +5128,9 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }
     const bool v1 = g_grouped_v1;
     const int64_t gy = (v1 || grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
+    // the grid must match launch_gu's row width: 16 rows a block only where it takes the sub-16 kernel (80 dots a row)
     const int gu_rows = (!g_old_kernels && !g_no_sub16_gu && L.n_embd == 2560 && gu_split(L.gu_type) &&
-                         gu_qk(L.gu_type) != 128 && L.gu_type != 12 && L.gu_type != 13) ? 16 : GU_ROWS;   // qk 128 (APR trellis): no sub-16 rows, see launch_gu
+                         gu_dots(L.gu_type, L.n_embd) == 80) ? 16 : GU_ROWS;
     const dim3 ggu((unsigned) ((2 * L.n_ff + gu_rows - 1) / gu_rows), (unsigned) gy);
 #if STRATA_EXP_LAYOUTS
 #if defined(STRATA_HIP_GFX906)
