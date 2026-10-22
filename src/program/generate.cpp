@@ -11933,6 +11933,26 @@ int main(int argc, char** argv) {
             }
             return r;
         };
+        // per card, the slot budget and its free part on stdout whenever they change (the server's context memory):
+        // KMEM <cards> then <device> <total bytes> <free bytes> per card
+        std::vector<uint64_t> kmem_last;
+        auto kmem_note = [&]() {
+            if (!eslots_on) return;
+            std::vector<uint64_t> v;
+            for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                uint64_t t = 0, f = 0;
+                strata::core::qsa_slot_budget(eslot_dev(k), t, f);
+                v.push_back(t);
+                v.push_back(f);
+            }
+            if (v == kmem_last) return;
+            kmem_last = v;
+            std::printf("KMEM %zu", bslot_ss.size());
+            for (size_t k = 0; k < bslot_ss.size(); ++k)
+                std::printf(" %d %llu %llu", eslot_dev(k), (unsigned long long) v[2 * k], (unsigned long long) v[2 * k + 1]);
+            std::printf("\n");
+            std::fflush(stdout);
+        };
         // ---- STRATA_ELASTIC_SLOTS_GIVE: per card, the expert cache gives the slot budget whole chunks from the slots
         // just below its prompt loan when the slots need them, and takes them back when the slots let them go (kvg_ensure
         // and kvg_trim, for one stage's cache, its layers and its own residency table).  Only on a quiet card: no window
@@ -12346,6 +12366,7 @@ int main(int argc, char** argv) {
             for (size_t k = 0; k < bslot_ss.size(); ++k) elastic_idle(k, true, b);
             std::fprintf(stderr, "strata batch: elastic slot %d holds %lld cells: %s\n", b, (long long) upto,
                          slot_mem_note(b).c_str());
+            kmem_note();
             return true;
         };
         // a decoding slot whose next window would need memory the budget does not have ends there (`length`); its state
@@ -13481,6 +13502,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (drive.d.failed) { std::printf("ERR %s\n", drive.d.fail ? drive.d.fail : "the expert pool failed"); return false; }
+            kmem_note();
             if (batch_telemetry_enabled) {
                 const auto sample = stage_in_flight.sample(Clock::now(), !pipe_inflight() && !batch_on());
                 if (sample) {
