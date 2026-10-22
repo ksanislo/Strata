@@ -14761,6 +14761,7 @@ int main(int argc, char** argv) {
                 auto pj = std::make_shared<strata::prefill::PromptJob>();
                 pj->tokens.assign(j.r.ids.begin() + a, j.r.ids.begin() + z);
                 pj->pos0 = a;
+                pj->lead = a == j.resume;   // (its read's first piece: nothing of its slot is in flight before it)
                 if (!j.fed_any) j.t_fed0 = Clock::now();
                 j.fed_any = true;
                 // STRATA_BATCH_READS_FAST: a read short enough to go whole is read in the next chunk (a chat question
@@ -15201,6 +15202,13 @@ int main(int argc, char** argv) {
             }
             if (!adm_reserved) {   // (an allocation on the read's thread takes the driver's lock: before it, once)
                 adm_reserved = true;
+                // STRATA_BATCH_READS_OVERTAKE: every stage's own hand-off buffer for overtaking chunks (two FAST reads)
+                if (strata::prefill::Prefill::batch_fast().overtake) {
+                    const int64_t rows = std::min<int64_t>(o.prefill_chunk, 2 * strata::prefill::Prefill::batch_fast().tokens);
+                    std::fprintf(stderr, "strata batch: STRATA_BATCH_READS_OVERTAKE: %s (chunks of up to %lld tokens)\n",
+                                 sp.reserve_overtake(rows) ? "on" : "no pinned RAM for the hand-off buffers; off",
+                                 (long long) rows);
+                }
                 if (!sp.reserve_uploads(sp.chunk()))
                     std::fprintf(stderr, "strata batch: the prompt path's pinned upload slots could not be reserved "
                                          "(they grow at first use)\n");
