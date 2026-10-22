@@ -11983,7 +11983,7 @@ int main(int argc, char** argv) {
             const uint64_t G = r.granularity();
             const strata::core::OnDevice on(v.dev);
             apply_pending(true);   // a swap still copying could write a slot given up here
-            if (cudaDeviceSynchronize() != cudaSuccess) return 0;
+            if (strata::core::device_sync() != cudaSuccess) return 0;
             auto freeable = [&]() -> int64_t {   // mapped chunks wholly inside [lo, top): a chunk a live slot shares stays
                 const int64_t c0 = (int64_t) ((xc.slot_offset(v.lo) + G - 1) / G), c1 = (int64_t) (xc.slot_offset(v.top) / G);
                 int64_t n = 0;
@@ -12040,7 +12040,7 @@ int main(int argc, char** argv) {
                 ++v.evicted;
             }
             // the moves still read the slots given up: they land before a chunk is unmapped
-            if (gave > 0 && cudaDeviceSynchronize() != cudaSuccess) {
+            if (gave > 0 && strata::core::device_sync() != cudaSuccess) {
                 std::fprintf(stderr, "strata: elastic slots: moving experts failed on CUDA%d: %s\n", v.dev,
                              cudaGetErrorString(cudaGetLastError()));
                 return 0;
@@ -12073,7 +12073,7 @@ int main(int argc, char** argv) {
             const uint64_t G = r.granularity();
             const strata::core::OnDevice on(v.dev);
             apply_pending(true);
-            if (cudaDeviceSynchronize() != cudaSuccess) return false;
+            if (strata::core::device_sync() != cudaSuccess) return false;
             const int64_t c0 = (int64_t) (xc.slot_offset(v.lo) / G), c1 = (int64_t) (xc.slot_offset(v.top) / G);
             int64_t holes = 0;
             for (int64_t c = c0; c < c1; ++c) holes += r.mapped(c) ? 0 : 1;
@@ -12110,7 +12110,7 @@ int main(int argc, char** argv) {
                     break;
                 }
             }
-            if (cudaDeviceSynchronize() != cudaSuccess) {
+            if (strata::core::device_sync() != cudaSuccess) {
                 std::fprintf(stderr, "strata: elastic slots: refilling CUDA%d's expert cache failed: %s\n", v.dev,
                              cudaGetErrorString(cudaGetLastError()));
                 return false;
@@ -12193,7 +12193,7 @@ int main(int argc, char** argv) {
             if (!eslots_on) return true;
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 const strata::core::OnDevice on_k(eslot_dev(k));
-                if (cudaDeviceSynchronize() != cudaSuccess) { e = "elastic slots: device sync failed"; return false; }
+                if (strata::core::device_sync() != cudaSuccess) { e = "elastic slots: device sync failed"; return false; }
             }
             bool ok = slot_fit(b, upto + 1, true, all_quiet) == 0;
             for (int pass = 0; !ok && pass < 2; ++pass)
@@ -12208,7 +12208,7 @@ int main(int argc, char** argv) {
                         const strata::core::OnDevice on_k(eslot_dev(k));
                         (void) strata::core::session_slot_fit(u, 1, true);
                         strata::core::session_zero(u, g, nullptr, nullptr);   // its K/V map named the slots given back
-                        if (cudaDeviceSynchronize() != cudaSuccess) { e = "elastic slots: device sync failed"; return false; }
+                        if (strata::core::device_sync() != cudaSuccess) { e = "elastic slots: device sync failed"; return false; }
                     }
                     std::fprintf(stderr, "strata batch: elastic slots: slot %d gives its memory to slot %d and drops the "
                                          "%zu tokens it kept%s\n", j, b, sj.ids.size(), sj.partial ? " (a parked read)" : "");
@@ -12223,7 +12223,7 @@ int main(int argc, char** argv) {
                 if (u.slot_cells < 0) continue;
                 const strata::core::OnDevice on_k(eslot_dev(k));
                 strata::core::session_zero(u, g, nullptr, nullptr);
-                if (cudaDeviceSynchronize() != cudaSuccess) { e = "elastic slots: device sync failed"; return false; }
+                if (strata::core::device_sync() != cudaSuccess) { e = "elastic slots: device sync failed"; return false; }
             }
             if (!ok) {
                 e = "elastic slots: the slot budget (STRATA_ELASTIC_SLOTS_MIB) has no room for " + std::to_string(upto) +
@@ -13744,7 +13744,7 @@ int main(int argc, char** argv) {
             auto sync_stages = [&]() -> bool {
                 for (size_t k = 0; k < n_st; ++k) {
                     const strata::core::OnDevice on(k == 0 ? adm_main_dev : stages[k - 1]->dev);
-                    if (cudaDeviceSynchronize() != cudaSuccess) return false;
+                    if (strata::core::device_sync() != cudaSuccess) return false;
                 }
                 return true;
             };
@@ -14055,7 +14055,7 @@ int main(int argc, char** argv) {
             std::string e = pipe_inflight() ? "pipelined groups in flight" : "";
             for (size_t k = 0; e.empty() && k < bslot_ss.size(); ++k) {
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
-                if (cudaDeviceSynchronize() != cudaSuccess) e = "device sync failed";
+                if (strata::core::device_sync() != cudaSuccess) e = "device sync failed";
             }
             if (e.empty() && use_mtp) {
                 const strata::core::OnDevice on_mtp(mtp.device());
@@ -14547,7 +14547,7 @@ int main(int argc, char** argv) {
                         restored = strata::core::conversation_snapshot_restore(image.stage_images[k], stages[k]->ss, g,
                                                                                draft_of(k), err) ==
                                        strata::core::ConversationRestore::restored &&
-                                   cudaDeviceSynchronize() == cudaSuccess;
+                                   strata::core::device_sync() == cudaSuccess;
                         if (!restored && err.empty()) err = "stage CUDA" + std::to_string(stages[k]->dev) + " sync";
                     }
                     if (!restored) {
@@ -16322,7 +16322,7 @@ int main(int argc, char** argv) {
                     for (size_t k = 0; k < bslot_ss.size(); ++k) {
                         const strata::core::OnDevice on_k(dev_of(k));
                         strata::core::session_zero(*bslot_ss[k][(size_t) b], g, nullptr, nullptr);
-                        if (cudaDeviceSynchronize() != cudaSuccess) return false;
+                        if (strata::core::device_sync() != cudaSuccess) return false;
                     }
                     bslot_ss[0][(size_t) b]->ple_prev[0] = bslot_ss[0][(size_t) b]->ple_prev[1] = -1;
                     BSlot& s = bs[(size_t) b];
@@ -16342,7 +16342,7 @@ int main(int argc, char** argv) {
                     for (size_t k = 0; k < bslot_ss.size(); ++k) {
                         const strata::core::OnDevice on_k(dev_of(k));
                         strata::core::SessionState& s = *bslot_ss[k][(size_t) b];
-                        if (cudaDeviceSynchronize() != cudaSuccess) { e = "device sync"; return false; }
+                        if (strata::core::device_sync() != cudaSuccess) { e = "device sync"; return false; }
                         strata::core::ConversationCheckpoint ck;
                         ck.ids = ids32;
                         if (!strata::core::conversation_checkpoint_save(ck, s, g, e)) return false;
