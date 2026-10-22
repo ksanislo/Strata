@@ -14826,7 +14826,7 @@ int main(int argc, char** argv) {
                 for (const auto& v : bslot_ss) big = big || v[b]->slot_cells > 1;
                 if (big) due.push_back((int) b);
             }
-            if (conc_serving || in_prompt_read || share_live || adm_held_n > 0 || adm_active) return true;
+            if (conc_serving || in_prompt_read || share_live || cy_held_n > 0 || adm_active) return true;
             if (due.empty()) {   // nothing running: budget chunks a slot let go of go back to the expert caches
                 if (pipe_inflight() || batch_on()) return true;
                 for (size_t k = 0; k < bslot_ss.size(); ++k) {
