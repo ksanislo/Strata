@@ -228,9 +228,6 @@ inline int64_t cpu_share_max() {
     if (g_share_default && cpu_share_explicit() == -2.0 && !explicit_max) return g_share_default_max;   // its measured range
     return v;
 }
-// On a layer split every stage may have the pool (set_cpu_pool), and the stages read different chunks at the same time:
-// one stage at a time takes it for a chunk, the other reads its chunk with the GPU alone.
-std::atomic<bool> g_cpu_pool_busy{false};
 double g_pinned_share = 1.0;
 // The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
 // 8192-token chunks: 96 slots 1153 tok/s, 384 1294 (the next layer's experts arrive during its attention half) -
@@ -2987,14 +2984,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
         // the CPU share: this chunk takes the pool if no other stage of a layer split has it now (released at the end
         // of the chunk, after the last layer's CPU thread is joined)
+        // On a layer split the stages read different chunks at the same time: one stage at a time takes a shared pool
+        // (set_cpu_pool), the other reads its chunk with the GPU alone; STRATA_STAGE_SERVE gives each stage its own.
         struct PoolHold {
-            bool held = false;
-            ~PoolHold() { if (held) g_cpu_pool_busy.store(false, std::memory_order_release); }
+            kernels::cpu::ExpertPool* pool = nullptr;
+            ~PoolHold() { if (pool != nullptr) pool->release_hold(); }
         } pool_hold;
-        if (cpu_pool_ != nullptr && cpu_share_on() && !stream_all && !pipe_chunked) {
-            bool expect = false;
-            pool_hold.held = g_cpu_pool_busy.compare_exchange_strong(expect, true, std::memory_order_acq_rel);
-        }
+        if (cpu_pool_ != nullptr && cpu_share_on() && !stream_all && !pipe_chunked && cpu_pool_->try_hold())
+            pool_hold.pool = cpu_pool_;
         const bool ps_on = stream_all && m.pp && m.pp->ps_frac > 0.0;
         if (m.pp && !ps_on) m.pp->ps_flag.clear();
         // multi-GPU: the peer's ring - issue its copies up to `limit` / give entries back (the peer device is current)
@@ -3802,7 +3799,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             err = "prefill: the routed ids' download failed";   // #1996
                             return false;
                         }
-                        bool cpu_maybe = pool_hold.held && !stream_all && m.src != nullptr && !m.cpu_dead &&
+                        bool cpu_maybe = pool_hold.pool != nullptr && !stream_all && m.src != nullptr && !m.cpu_dead &&
                                          lay.native && !m.pp && !lay.fmt.empty();
                         // The share's two pinned buffers are small (~50 MB) but are had mid-request, when the host may have
                         // nothing left (0.1.41 report: tight RAM, chats failing).  A buffer that cannot be had ends the share
