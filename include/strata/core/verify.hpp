@@ -255,6 +255,18 @@ public:
     /// for its doorbell, #31); batch_poll then makes no CUDA call before every layer is served.
     int batch_serve(PoolMultiFn pool, void* user);
     void set_external_serve(bool on) { ext_serve_.store(on, std::memory_order_release); }
+    /// STRATA_STAGE_SERVE: another thread serves the doorbells of this verifier's run() and pipelined windows
+    /// (serve_external); `wake` is called at each such launch, `served` on the launching thread once every layer of a
+    /// window is served (the server's dispatch is idle then).  The launching thread only waits and checks.  Unset:
+    /// the windows serve themselves.  Not for windows with --remote-expert-opt, the PCIe balance or an adaptive gate.
+    void set_external_server(std::function<void()> wake, std::function<void()> served) {
+        xwake_ = std::move(wake);
+        xserved_ = std::move(served);
+    }
+    bool external_busy() const { return x_running_.load(std::memory_order_acquire); }
+    /// Serves the layers of the external window in flight that have rung, with no CUDA call: 1 when none is in flight
+    /// or every layer is served, 0 while one is still to ring, -1 on a failure (the launching thread reports it).
+    int serve_external(PoolMultiFn pool, void* user);
     /// A slot's sampling (temperature / top_p / top_k / min_p / seed; penalties are not applied in batch windows):
     /// its row is drawn again on the last stage with Philox(seed, position), as a solo window draws it.  Greedy by
     /// default.  Set on the first stage, it reaches the last.
@@ -423,6 +435,24 @@ private:
             std::chrono::steady_clock::duration(b_last_.load(std::memory_order_acquire)));
     }
     std::chrono::steady_clock::time_point ext_checked_{};   ///< batch_poll's last check with external serving
+    // set_external_server: the window the server thread serves (run() or pl_launch).  The launching thread writes the
+    // shape, then x_running_; the server writes x_k_ (and clears x_running_ before it publishes the last layer)
+    std::function<void()> xwake_, xserved_;
+    std::atomic<bool> x_running_{false}, x_failed_{false}, x_nopool_{false};
+    std::atomic<int64_t> x_k_{0};
+    int64_t x_total_ = 0;
+    int x_T_ = 0, x_G_ = 1;
+    bool x_ple_ = false;
+    std::vector<uint32_t> x_ple_rows_;
+    std::string x_err_;
+    std::chrono::steady_clock::time_point x_since_{};   ///< (the server's) the last layer served, for ms_wait
+    bool fl_ext_ = false;   ///< the pipelined window in flight is served externally
+    bool external_window() const;
+    void start_external(int T, int G, int64_t total, bool ple, const uint32_t* ple_rows);
+    /// The launching thread's checks while the server serves: a graph that ended (or failed) with a layer still to
+    /// ring (`query`: the graph's state, asked at most every millisecond), no ring for 20 s, the server's failure.
+    /// 0: keep waiting; -1: `err`, and the window is no longer served.
+    int check_external(const std::function<cudaError_t()>& query, std::string& err);
     int32_t b_out_[8] = {};
     std::vector<strata::kernels::SamplerParams> slot_sp_;
     bool sample_rows(int S, std::string& err);   ///< the sampled slots' rows of the last batch window
