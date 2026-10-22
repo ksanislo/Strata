@@ -4237,6 +4237,13 @@ int main(int argc, char** argv) {
         }
         strata::kernels::mrope_table_set(d_mrope);
     }
+    // --batch: each slot decodes at its own conversation's positions (batch windows and slot drafters never read the
+    // table above), so a picture conversation runs beside text ones; STRATA_PICTURE_SERIAL=1: one table, kept apart
+    const bool picture_serial = [] {
+        const char* e = std::getenv("STRATA_PICTURE_SERIAL");
+        return e != nullptr && e[0] == '1';
+    }();
+    strata::kernels::slot_rope_enable(o.vision && o.batch > 0 && !picture_serial);
     strata::kernels::ple_set_native_postops(o.native_ple_postops);
     // before session_init: every graph captured from here on has the vector's kernels where it applies
     std::string cvec_summary = "0";
@@ -9631,6 +9638,7 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 slot_mtp_rows.emplace_back(r, free_slot_mtp_rows);
+                slot_mtp[(size_t) b]->set_rope_slot(b);
                 if (!slot_mtp[(size_t) b]->bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, r, err,
                                                 &mtp)) {
                     std::fprintf(stderr, "strata serve: batch MTP slot %d: %s%s\n", b, err.c_str(),
@@ -13944,7 +13952,7 @@ int main(int argc, char** argv) {
         auto adm_decide = [&](std::string& l) -> bool {
             AdmReq r;
             bool direct = false;
-            const bool ok = adm_parse(l, r) && !r.bias && (mrope_identity || !img_decoding()) && r.slot >= 0 && r.slot < (int) bs.size() &&
+            const bool ok = adm_parse(l, r) && !r.bias && (!picture_serial || mrope_identity || !img_decoding()) && r.slot >= 0 && r.slot < (int) bs.size() &&
                             !bs[(size_t) r.slot].active && !adm_queued[(size_t) r.slot] && !adm_paused[(size_t) r.slot] && adm_reading != r.slot && adm_stop_of[(size_t) r.slot] == nullptr &&
                             r.max_new >= 1 && !r.ids.empty();
             if (ok) {
@@ -14487,6 +14495,7 @@ int main(int argc, char** argv) {
             if (ckpt_pool.on())
                 for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
             sl = BSlot{};
+            strata::kernels::slot_rope_set(b, nullptr);   // text: the identity
             sl.active = true;
             sl.x = (int32_t) ids[(size_t) n - 1];
             sl.p = n - 1;
@@ -14936,6 +14945,7 @@ int main(int argc, char** argv) {
                 if (ckpt_pool.on())
                     for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
                 sl = BSlot{};
+                strata::kernels::slot_rope_set(b, nullptr);   // text: the identity
                 sl.active = true;
                 sl.x = (int32_t) ids[(size_t) n - 1];
                 sl.p = n - 1;
@@ -15153,7 +15163,7 @@ int main(int argc, char** argv) {
         auto adm_run = [&](std::string first) -> bool {
             const auto t_run = Clock::now();
             cudaGetDevice(&adm_main_dev);
-            while (img_decoding()) {   // (the position table is the picture conversation's until it ends: see the main loop)
+            while (picture_serial && img_decoding()) {   // (STRATA_PICTURE_SERIAL: the table is the picture's until it ends)
                 {
                     std::lock_guard<std::mutex> lk(in_mu);
                     adm_lines();
@@ -15227,8 +15237,8 @@ int main(int argc, char** argv) {
                     bell_waiting.store(false, std::memory_order_relaxed);
                 }
             });
-            // text reads after a picture request: the position table back to the identity (no picture slot decodes:
-            // adm_decide), as the request path does for a text request
+            // text reads after a picture request: the position table back to the identity, as the request path does for
+            // a text request (slots decoding a picture conversation read their own positions, not this table)
             if (!mrope_identity && !mrope_host.empty()) {
                 const int64_t cells = (int64_t) mrope_host.size() / 3;
                 for (int64_t c = 0; c < cells; ++c)
@@ -15532,11 +15542,9 @@ int main(int argc, char** argv) {
                 adm_bstop(std::atoi(line.c_str() + 6));
                 continue;
             }
-            // --vision beside the slots: every rope kernel reads a cell's position from ONE table, which a picture request
-            // rewrites (and a text request puts back), so a slot decoding meanwhile reads shifted positions - non-finite
-            // logits in the soak right after a picture admission.  A picture request starts when no slot decodes, a
-            // text one when no picture conversation does (the slots decode on meanwhile; BSTOPs are taken)
-            if (slot_admit && o.vision && !adm_direct) {
+            // STRATA_PICTURE_SERIAL=1 (the old way: one position table for every slot, which a picture request rewrites):
+            // a picture request starts when no slot decodes, a text one when no picture conversation does
+            if (picture_serial && slot_admit && o.vision && !adm_direct) {
                 const bool img_line = line.rfind("BGENI ", 0) == 0 || line.rfind("GENI ", 0) == 0;
                 const bool req = img_line || line.rfind("BGEN ", 0) == 0 || line.rfind("GEN ", 0) == 0;
                 bool waited = false;
@@ -19299,6 +19307,15 @@ int main(int argc, char** argv) {
                     if (ckpt_pool.on())
                         for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
                     sl = BSlot{};
+                    if (strata::kernels::slot_rope_enabled()) {   // the slot's own positions, before its first draft
+                        std::shared_ptr<strata::kernels::SlotRope> rr;
+                        if (!live_imgs.empty() && (size_t) p * 3 + 2 < mrope_host.size()) {
+                            rr = std::make_shared<strata::kernels::SlotRope>();
+                            rr->thw.assign(mrope_host.begin(), mrope_host.begin() + (std::ptrdiff_t) p * 3);
+                            rr->delta = mrope_host[(size_t) p * 3] - (int32_t) p;
+                        }
+                        strata::kernels::slot_rope_set(admit_slot, std::move(rr));
+                    }
                     const auto tc2 = Clock::now();   // (the slot's old checkpoints freed)
                     sl.active = true;
                     sl.x = x;

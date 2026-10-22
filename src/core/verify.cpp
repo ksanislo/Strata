@@ -44,6 +44,7 @@
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/native_rope.hpp"
+#include "strata/kernels/mrope.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/pdl.hpp"
 #include "strata/kernels/ple.hpp"
@@ -61,6 +62,7 @@
 #include <algorithm>
 #include <atomic>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <optional>
@@ -751,7 +753,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     // ---- mapped staging
     bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
               mapped(T * strata::kernels::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) &&
-              mapped(T * (NH + NKV + IQ) * 4, (void**) &h_pos_, (void**) &m_pos_) &&
+              mapped(T * (NH + NKV + IQ + 3) * 4, (void**) &h_pos_, (void**) &m_pos_) &&
               mapped((2 + T) * 4 + 16, (void**) &h_commit_, (void**) &m_commit_) &&
               mapped(T * N * 4, (void**) &h_ple_, (void**) &m_ple_) &&
               mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) &&
@@ -811,7 +813,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     // ---- the device arena: the same sequence counted, then carved
     auto carve = [&](Bump& b) {
         tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(T * strata::kernels::kStepCount);
-        pos_ = b.take<int32_t>(T * (NH + NKV + IQ)); commit_ = b.take<int32_t>(2 + T);
+        pos_ = b.take<int32_t>(T * (NH + NKV + IQ + 3)); commit_ = b.take<int32_t>(2 + T);
         ple_ = b.take<float>(T * N); emb_ = b.take<float>(T * N); R_ = b.take<float>(T * HC * N);
         mixed_ = b.take<float>(T * N); bo_ = b.take<float>(T * N);
         inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
@@ -1124,10 +1126,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         inputs_pending = true;
     }
     copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, in_s);
-    copy_i32_from_mapped(pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ), in_s);
+    // a batch window with per-slot positions (--vision): the rows' rotary positions, and [t][3] the (t, h, w) of each
+    // row's indexer block, staged by stage_batch; the window reads no shared position table then
+    const bool row_rope = batch_rec_ && strata::kernels::slot_rope_enabled();
+    copy_i32_from_mapped(pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ + (row_rope ? 3 : 0)), in_s);
     // per-ROW positions of the K rows [t][NKV] and the indexer query rows [t][IQ] (for batched RoPE)
     const int32_t* pos_k = pos_ + MT * NH;
     const int32_t* pos_i = pos_ + MT * (NH + NKV);
+    const int32_t* pos_thw = pos_ + MT * (NH + NKV + IQ);
 
     // ---- the embeddings, broadcast to the hc streams - or, in a later stage of a layer split, the previous stage's
     // residual, pending write and inject (see set_stage)
@@ -1583,7 +1589,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                             const QsaIndexerBuffers ib{sx.idx_tail, sx.idx_dead, sx.idx_pooled, sx.idx_block_pos};
                             native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
                                                       (const float*) wikn->data, EPS, ib, s, sx.max_cells,
-                                                      rope_scaling(), ns);
+                                                      rope_scaling(), ns, row_rope ? pos_thw + t * 3 : nullptr);
                         }
                     }
                 };
@@ -3347,7 +3353,9 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
         }
     }
     const strata::kernels::QsaShapes s = shapes_of(*g_);
-    const int64_t S = (int64_t) slots.size(), CB = 2 + max_t_;
+    // the commit record of a slot: kept count, last row, the rows' cells, then (per-slot positions) their blocks' (t, h, w)
+    cb_ = 2 + (int64_t) max_t_ * (strata::kernels::slot_rope_enabled() ? 4 : 1);
+    const int64_t S = (int64_t) slots.size(), CB = cb_;
     const int64_t TS = (s.idx_block - 1) * g_->idx_key_dim, nQ = g_->n_qsa_layers();
     void* d = nullptr;
     if (!mapped((size_t) (S * CB * 4 + 16), (void**) &h_commitb_, (void**) &m_commitb_)) {
@@ -3372,6 +3380,9 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
 bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err) {
     cudaGraphExec_t& ex = exec_bm_[bkey(rows, S, hbase)];
     if (ex != nullptr) return true;
+    // per-slot positions: the rows' rope kernels take the staged rotary positions as they are
+    std::optional<strata::kernels::MropeScope> no_table;
+    if (strata::kernels::slot_rope_enabled()) no_table.emplace(nullptr);
     if (strata::core::begin_capture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin batch capture failed";
         return false;
@@ -3414,11 +3425,13 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
     if (batch_self_commits(rows, S)) return true;   // the window keeps its rows: no commit graph
     cudaGraphExec_t& cex = commit_bm_[bkey(rows, S, hbase)];
     if (cex != nullptr) return true;
+    std::optional<strata::kernels::MropeScope> no_table;
+    if (strata::kernels::slot_rope_enabled()) no_table.emplace(nullptr);
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     const QsaShapes s = shapes_of(g);
     const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, ZV = g.ssm_value_dim, ID = g.idx_key_dim, MT = max_t_;
-    const int64_t CB = 2 + MT, nQ = g.n_qsa_layers();
+    const int64_t CB = cb_, nQ = g.n_qsa_layers();
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     const int64_t TS = (s.idx_block - 1) * ID;
@@ -3493,7 +3506,9 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                         native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + u) * ID,
                                                   commitb_ + (size_t) rows[first] * CB + 2 + (u - first),
                                                   0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                                  rope_scaling(), cs_);
+                                                  rope_scaling(), cs_,
+                                                  CB > 2 + MT ? commitb_ + (size_t) rows[first] * CB + 2 + MT + 3 * (u - first)
+                                                              : nullptr);
                 }
                 ++qsa_index;
             }
@@ -3644,14 +3659,31 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     }
     const Clock::time_point t0 = Clock::now();
     const QsaShapes s = shapes_of(g);
+    // per-slot positions (--vision beside other slots): a row's rotary position and its indexer block's (t, h, w) from
+    // its slot's own table; decoded cells are text, so t = h = w for the row itself
+    const bool row_rope = strata::kernels::slot_rope_enabled();
+    int32_t* const pthw = h_pos_ + (size_t) max_t_ * (g.n_head + g.n_head_kv + g.idx_q_heads);
+    std::shared_ptr<const strata::kernels::SlotRope> rr[kVerifyMaxT];
     for (int t = 0; t < S; ++t) {
         h_tok_[t] = tokens[t];
         qsa_step_fill(h_step_ + t * kStepCount, pos[t], s);
-        for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = (int32_t) pos[t];
+        int32_t rp = (int32_t) pos[t];
+        if (row_rope) {
+            if (t == 0 || rows[t] != rows[t - 1]) rr[t] = strata::kernels::slot_rope_get(rows[t]);
+            else rr[t] = rr[t - 1];
+            int32_t c[3] = {rp, rp, rp};
+            if (rr[t]) rr[t]->at(pos[t], c);
+            rp = c[0];
+            const int64_t b0 = pos[t] - pos[t] % s.idx_block;
+            int32_t* o = pthw + t * 3;
+            o[0] = o[1] = o[2] = (int32_t) b0;
+            if (rr[t]) rr[t]->at(b0, o);
+        }
+        for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = rp;
         int32_t* pk = h_pos_ + (size_t) max_t_ * g.n_head;
         int32_t* pi = pk + (size_t) max_t_ * g.n_head_kv;
-        for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = (int32_t) pos[t];
-        for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = (int32_t) pos[t];
+        for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = rp;
+        for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = rp;
     }
     if (ss_->ple.ready() && ple_stage()) {
         uint32_t ple_rows[kVerifyMaxT * PLE_N_HEADS];   // (not `rows`: that is the slots of the window's rows)
@@ -3668,7 +3700,7 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     }
     // Each slot owns a contiguous group. The default commit keeps all its rows; speculative
     // decoding may change the prefix length after comparing the draft with these picks.
-    const int64_t CB = 2 + max_t_;
+    const int64_t CB = cb_;
     for (int t = 0; t < S;) {
         const int first = t;
         while (t < S && rows[t] == rows[first]) ++t;
@@ -3677,6 +3709,9 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
         c[1] = t - first - 1;
         for (int64_t j = 0; j < max_t_; ++j)
             c[2 + j] = j < t - first ? (int32_t) pos[first + j] : -1;
+        if (CB > 2 + max_t_)   // the commit's indexer appends read the same blocks' (t, h, w) as the window's
+            for (int j = 0; j < t - first; ++j)
+                std::memcpy(c + 2 + max_t_ + 3 * j, pthw + (first + j) * 3, 3 * sizeof(int32_t));
     }
     *(volatile uint32_t*) h_seq_ = 0;
     *(volatile uint32_t*) h_flag_ = 0;
@@ -3815,7 +3850,7 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
     if (!last_batch_ || last_t_ < 1) { err = "verify: commit_slots without a batch window"; return false; }
     const int S = last_t_;
     const Clock::time_point t0 = Clock::now();
-    const int64_t CB = 2 + max_t_;
+    const int64_t CB = cb_;
     // One prefix per slot: rejected draft rows must not enter recurrent state.
     for (int t = 0; t < S;) {
         const int first = t;
@@ -4003,7 +4038,7 @@ bool Verifier::commit_deferred(int hbase, const int* keep, std::string& err) {
     }
     arena_holds_ = -1;
     const int S = w.S;
-    const int64_t CB = 2 + max_t_;
+    const int64_t CB = cb_;
     for (int t = 0; t < S;) {   // as commit_slot_prefixes
         const int first = t;
         while (t < S && w.rows[t] == w.rows[first]) ++t;
