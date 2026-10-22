@@ -1470,6 +1470,9 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(slot_idle_test src/program/slot_idle_test.cpp)
   target_include_directories(slot_idle_test PRIVATE include)
   add_test(NAME slot_idle_test COMMAND slot_idle_test)
+  add_executable(fair_slice_test src/program/fair_slice_test.cpp)
+  target_include_directories(fair_slice_test PRIVATE include)
+  add_test(NAME fair_slice_test COMMAND fair_slice_test)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp

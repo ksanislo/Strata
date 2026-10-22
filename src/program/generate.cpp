@@ -81,6 +81,7 @@
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/program/slot_idle.hpp"
+#include "strata/program/fair_slice.hpp"
 #include "strata/program/split_rules.hpp"
 #include "strata/prefill/share_rules.hpp"
 #include "strata/platform/host_limits.hpp"
@@ -11750,6 +11751,7 @@ int main(int argc, char** argv) {
         int64_t bt_miss0 = 0, bt_hits0 = 0, bt_pcie0 = 0;
         int64_t bt_windows = 0, bt_rows = 0, bt_tokens = 0, bt_accepted = 0;   // bt_accepted: --batch-mtp proposals taken
         int64_t pipe_rows = 0;   // the pipelined groups' rows, never reset (bt_rows restarts when the slots go idle)
+        int64_t wins_done = 0;   // windows finished on the last stage, never reset (STRATA_FAIR_SLICE's decode turns)
         // per stage (0 = CUDA0's verifier): the GPU-reach wait and pool time when the timed windows began; and the routed
         // (token, expert) entries the CPU and the PCIe share had served by then (bt_hits0 holds the VRAM entries)
         std::vector<double> bt_stage_wait0, bt_stage_pool0;
@@ -12442,6 +12444,7 @@ int main(int argc, char** argv) {
             bt_run += msd(w0, w1);
             bt_commit += msd(w1, w2);
             ++bt_windows;
+            ++wins_done;
             for (int a = 0; a < A; ++a) {
                 bt_rows += keep[active[a]];
                 bt_accepted += keep[active[a]] - 1;
@@ -12937,6 +12940,7 @@ int main(int argc, char** argv) {
                         rows_wait = nullptr;
                     }
                     ++bt_windows;
+                    ++wins_done;
                     G.inflight = false;
                     report_batch_window(G.S, G.active, !pipe_inflight() && !batch_on(), G.started);
                     continue;
@@ -12995,6 +12999,7 @@ int main(int argc, char** argv) {
                     rows_wait = nullptr;
                 }
                 ++bt_windows;
+                ++wins_done;
                 G.inflight = false;
                 report_batch_window(G.S, G.active, !pipe_inflight() && !batch_on(), G.started);
             }
@@ -13531,6 +13536,29 @@ int main(int argc, char** argv) {
             const char* v = std::getenv("STRATA_READ_YIELD_LINES");
             return v != nullptr ? std::max(1, std::atoi(v)) : 4;
         }();
+        // STRATA_FAIR_SLICE=1 (with STRATA_READ_YIELD): beside decoding slots the reads go in read turns and the slots
+        // in decode turns; each of n active requests gets ~STRATA_FAIR_SLICE_S / n a cycle (fair_slice.hpp)
+        static const bool fs_on = [] {
+            const char* v = std::getenv("STRATA_FAIR_SLICE");
+            return cy_on && v != nullptr && std::atoi(v) != 0;
+        }();
+        strata::program::FairSliceCfg fs_cfg;
+        {
+            auto num = [](const char* k, double d) {
+                const char* v = std::getenv(k);
+                return v != nullptr && std::atof(v) > 0.0 ? std::atof(v) : d;
+            };
+            fs_cfg.cycle_s = num("STRATA_FAIR_SLICE_S", 3.0);
+            fs_cfg.floor = (int64_t) num("STRATA_FAIR_SLICE_FLOOR", 1024);
+            fs_cfg.quantum = (int) num("STRATA_FAIR_SLICE_QUANTUM", 2);
+            fs_cfg.rate0 = num("STRATA_FAIR_SLICE_RATE", 300.0);
+        }
+        strata::program::FairSlice fair(fs_cfg);
+        const auto fs_epoch = Clock::now();
+        if (fs_on)
+            std::fprintf(stderr, "strata batch: STRATA_FAIR_SLICE: reads beside decoding slots take turns with them in a "
+                                 "%.1f s cycle (read pieces >= %lld tokens, decode turns >= %d windows a decoding group)\n",
+                         fs_cfg.cycle_s, (long long) fs_cfg.floor, fs_cfg.quantum);
         size_t cy_held_n = 0;                // reads held at a piece boundary (cy_held, below)
         bool cy_yielded = false;             // the last run of reads ended by yielding
         int cy_served = 0;                   // old-way lines served since the held reads last went on
@@ -13759,6 +13787,7 @@ int main(int argc, char** argv) {
             Clock::time_point t_read{};
             int64_t rows0 = 0;
             Clock::time_point t_fed{};   // STRATA_READ_YIELD: when it last got a piece (j.at: where the next one starts)
+            int64_t fs_turn = -1;        // STRATA_FAIR_SLICE: the read turn it last got a piece in
         };
         std::vector<std::unique_ptr<AdmJob>> cy_held;   // STRATA_READ_YIELD: reads held at a piece boundary
         // a held read a BSTOP reached: it ends there (nothing of it is in flight), before its slot is admitted again
@@ -14443,6 +14472,10 @@ int main(int argc, char** argv) {
             };
             if (!first.empty() && !take(first)) return false;
             // STRATA_READ_YIELD: the reads held at a piece boundary go on from where they stopped (the loan still out)
+            if (fs_on) {
+                fair.set_pmax(P);
+                fair.restart();
+            }
             const size_t resumed = cy_held.size();
             for (auto& j : cy_held) live.push_back(std::move(j));
             cy_held.clear();
@@ -14457,8 +14490,72 @@ int main(int argc, char** argv) {
             auto cy_done = [](const AdmJob& j) {
                 return !j.setup_ok || j.at >= j.n - 1 || j.stop.load() || j.failed.load();
             };
+            // STRATA_FAIR_SLICE: the reads with pieces left, the decoding slots and their pipelined groups
+            struct FsCount { int n_r = 0, n_d = 0, groups = 0; };
+            auto fs_count = [&] {
+                FsCount c;
+                for (const auto& jj : live) c.n_r += jj->queued && !cy_done(*jj) ? 1 : 0;
+                int last_g = -1;
+                for (size_t b = 0; b < bs.size(); ++b) {
+                    if (!bs[b].active) continue;
+                    ++c.n_d;
+                    const int gi = piped ? (int) b / GS : 0;
+                    if (gi != last_g) { ++c.groups; last_g = gi; }
+                }
+                return c;
+            };
+            auto fs_now = [&] { return std::chrono::duration<double>(Clock::now() - fs_epoch).count(); };
+            // a read turn: one piece for each read (the one waiting longest first) while the reads' share lasts; reads
+            // only: round robin.  Not shared (one read, nobody decoding): as STRATA_READ_YIELD alone
+            auto fs_feed = [&]() -> bool {
+                const FsCount c = fs_count();
+                if (!strata::program::FairSlice::shared(c.n_r, c.n_d)) return false;
+                while (!yielding && sp.jobs_pending() < cy_ahead && fair.feeding()) {
+                    AdmJob* j = nullptr;
+                    for (auto& jj : live)
+                        if (jj->queued && !cy_done(*jj) && (c.n_d == 0 || jj->fs_turn != fair.turn()) &&
+                            (j == nullptr || jj->t_fed < j->t_fed))
+                            j = jj.get();
+                    if (j == nullptr) {   // every read had its piece in this turn
+                        fair.close();
+                        break;
+                    }
+                    const int64_t a = j->at;
+                    int64_t z = std::min(j->n - 1, a + fair.piece(c.n_r, c.n_d));
+                    const bool ck = j->turn_at > a;
+                    if (ck && z > j->turn_at) z = j->turn_at;
+                    if (!fair.may_feed(c.n_r, c.n_d, z - a)) {
+                        fair.close();
+                        break;
+                    }
+                    j->inflight.fetch_add(1);
+                    sp.enqueue(make_piece(*j, a, z, ck));
+                    j->at = z;
+                    j->t_fed = Clock::now();
+                    j->fs_turn = fair.turn();
+                    fair.fed(fs_now(), z - a);
+                    ++cy_fed;
+                }
+                return true;
+            };
+            // the turns move on: a read turn's pieces all landed -> the decode turn; its windows done -> a read turn
+            auto fs_tick = [&] {
+                const FsCount c = fs_count();
+                const auto ph = fair.phase();
+                if (ph == strata::program::FairSlice::Phase::read && !fair.feeding() && in_flight() == 0) {
+                    fair.read_done(fs_now(), c.n_r, c.n_d, c.groups, wins_done);
+                    if (trace && fair.phase() == strata::program::FairSlice::Phase::decode)
+                        std::fprintf(stderr, "strata trace: STRATA_FAIR_SLICE: decode turn: %lld windows (%d reads, %d "
+                                             "decoding in %d groups; read %.0f tok/s, %.0f ms a window)\n",
+                                     (long long) fair.target(), c.n_r, c.n_d, c.groups, fair.rate(), 1000.0 * fair.win_s());
+                } else if (ph == strata::program::FairSlice::Phase::decode &&
+                           (fair.decode_over(fs_now(), c.n_d, wins_done) || !strata::program::FairSlice::shared(c.n_r, c.n_d))) {
+                    fair.decode_done(fs_now(), wins_done);
+                }
+            };
             // the next piece: of the read with the least left, unless one has waited STRATA_READ_YIELD_STARVE_S for one
             auto cy_feed = [&] {
+                if (fs_on && fs_feed()) return;
                 while (!yielding && sp.jobs_pending() < cy_ahead) {
                     const auto now = Clock::now();
                     AdmJob* best = nullptr;
@@ -14530,13 +14627,14 @@ int main(int argc, char** argv) {
                                 j->parts.assign(n_st, ConvCheckpoint{});
                                 j->part_ok.assign(n_st, 0);
                             }
-                            j->t_fed = Clock::now();
+                            j->t_fed = fs_on ? j->t_bgen : Clock::now();   // (STRATA_FAIR_SLICE: waiting since its BGEN)
                         } else if (j->setup_ok && j->at < j->n - 1) {
                             queue_pieces(*j);
                         } else {
                             j->queued = true;   // (nothing to read, or its set-up failed: finished below)
                         }
                     }
+                if (fs_on) fs_tick();
                 if (cy_on) cy_feed();
                 for (auto it = live.begin(); it != live.end();) {
                     AdmJob& j = **it;
@@ -14742,7 +14840,18 @@ int main(int argc, char** argv) {
                 return j;
             };
             std::unique_ptr<AdmJob> cur = adm_multi ? nullptr : take(first);
+            const strata::program::FairSlice fs0 = fair;
             if (adm_multi && !adm_multi_run(first, n_adm)) return false;
+            if (fs_on && (fair.reads_n_ > fs0.reads_n_ || fair.decs_n_ > fs0.decs_n_)) {
+                const int64_t rn = fair.reads_n_ - fs0.reads_n_, dn = fair.decs_n_ - fs0.decs_n_;
+                std::fprintf(stderr, "strata batch: STRATA_FAIR_SLICE: %lld read turns (%.1f s, %.1f pieces each), %lld decode "
+                                     "turns (%.1f s, %.1f windows each); read %.0f tok/s a turn, %.0f ms a window\n",
+                             (long long) rn, rn > 0 ? (fair.reads_s_ - fs0.reads_s_) / (double) rn : 0.0,
+                             rn > 0 ? (double) (fair.reads_pieces_ - fs0.reads_pieces_) / (double) rn : 0.0, (long long) dn,
+                             dn > 0 ? (fair.decs_s_ - fs0.decs_s_) / (double) dn : 0.0,
+                             dn > 0 ? (double) (fair.decs_w_ - fs0.decs_w_) / (double) dn : 0.0, fair.rate(),
+                             1000.0 * fair.win_s());
+            }
             for (; !adm_multi;) {
                 if (fatal) return false;
                 if (cur) {
