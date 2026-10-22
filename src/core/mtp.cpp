@@ -1,4 +1,5 @@
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
+#include "strata/core/capture_lock.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/pin_budget.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
@@ -365,7 +366,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     qsa_set_kv_int8(kv_int8_was);
     qsa_set_kv_hybrid(kv_hybrid_was);
     qsa_state_zero(st_, g, nullptr);
-    cudaDeviceSynchronize();
+    strata::core::device_sync();
     vram_ += sb;
 
     // ---- buffers
@@ -591,7 +592,7 @@ bool MtpDrafter::setup_coupled(std::string& err) {
         cudaMemcpy(dinv_, inv.data(), inv.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
         vram_ += inv.size() * sizeof(int32_t);
     }
-    if (cudaDeviceSynchronize() != cudaSuccess) {
+    if (strata::core::device_sync() != cudaSuccess) {
         err = std::string("mtp: coupled setup: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
@@ -719,7 +720,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                     if (ok_x) {
                         strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dv, n_dvocab_,
                                                      (uint8_t*) tmp, nullptr);
-                        ok_x = cudaDeviceSynchronize() == cudaSuccess;
+                        ok_x = strata::core::device_sync() == cudaSuccess;
                     }
                 }
                 ok_x = ok_x && cudaMemcpy(dhead_, tmp, (size_t) (n_dvocab_ * row_bytes), cudaMemcpyDeviceToDevice) == cudaSuccess;
@@ -732,7 +733,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             } else {
                 strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
             }
-            cudaDeviceSynchronize();
+            strata::core::device_sync();
             vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
             std::fprintf(stderr, "strata mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
                          (double) (n_dvocab_ * row_bytes) / 1048576.0);
@@ -1230,7 +1231,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
 namespace {
 bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char* what, std::string& err) {
     cudaGraph_t graph = nullptr;
-    const cudaError_t ce = cudaStreamEndCapture(cs, &graph);
+    const cudaError_t ce = strata::core::end_capture(cs, &graph);
     if (!ok) {
         if (graph) cudaGraphDestroy(graph);
         return false;
@@ -1252,7 +1253,7 @@ bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char*
 bool MtpDrafter::capture_prefill(int T, std::string& err) {
     if (prefill_exec_[T]) return true;
     using namespace strata::kernels;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    if (strata::core::begin_capture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     copy_i32_from_mapped(tok_, m_tok_, T, cs_);
     copy_i32_from_mapped(step_, m_step_, (int64_t) T * 4, cs_);
     copy_i32_from_mapped(pos_, m_pos_, (int64_t) T * g_->n_head, cs_);
@@ -1262,7 +1263,7 @@ bool MtpDrafter::capture_prefill(int T, std::string& err) {
 
 bool MtpDrafter::capture_prefill_dev(int T, std::string& err) {
     if (prefill_dev_exec_[T]) return true;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    if (strata::core::begin_capture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     const bool ok = record_forward(T, -1, cs_, err);   // K/V only, rows [0, T); tok_/step_/pos_ filled before launch
     return finish_capture(cs_, ok, prefill_dev_exec_[T], "prefill (device inputs)", err);
 }
@@ -1273,7 +1274,7 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
     g_mp.init();   // (its allocation before the capture)
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    if (strata::core::begin_capture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     g_mp.base = 0;
     bool ok = true;
     // coupled: the request's chain and the penalty history's base, for this round's drafts
@@ -1324,7 +1325,7 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     const int64_t HCN = g_->hc * g_->n_embd;
     const int row = max_t_ + j - 1;
     g_mp.init();
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    if (strata::core::begin_capture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
 #if defined(STRATA_USE_HIP)
     copy_i32_from_mapped(step_ + row * 4, m_step_ + row * 4, 4, cs_);
     copy_i32_from_mapped(pos_ + row * g_->n_head, m_pos_ + row * g_->n_head, g_->n_head, cs_);

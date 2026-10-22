@@ -1,4 +1,5 @@
 // src/core/graph.cpp - P2.S5: the GraphRegistry implementation.
+#include "strata/core/capture_lock.hpp"
 #include "strata/core/graph.hpp"
 
 #include <immintrin.h>
@@ -46,13 +47,13 @@ void CapturedGraph::reset() {
 
 bool CapturedGraph::begin(void* stream, std::string& err) {
     if (graph_ || exec_) { err = "begin: this CapturedGraph is already recorded"; return false; }
-    const cudaError_t e = cudaStreamBeginCapture((cudaStream_t) stream, cudaStreamCaptureModeThreadLocal);
+    const cudaError_t e = strata::core::begin_capture((cudaStream_t) stream, cudaStreamCaptureModeThreadLocal);
     if (e != cudaSuccess) return fail(err, "cudaStreamBeginCapture", e);
     return true;
 }
 
 bool CapturedGraph::end(void* stream, std::string& err) {
-    cudaError_t e = cudaStreamEndCapture((cudaStream_t) stream, &graph_);
+    cudaError_t e = strata::core::end_capture((cudaStream_t) stream, &graph_);
     if (e != cudaSuccess) { graph_ = nullptr; return fail(err, "cudaStreamEndCapture", e); }
 
     nodes_ = 0;
@@ -114,7 +115,7 @@ bool GraphRegistry::record(LayerType type, int n_tokens, const std::function<voi
     if (body_err != cudaSuccess) {
         // Abandon the capture without instantiating anything.
         cudaGraph_t junk = nullptr;
-        cudaStreamEndCapture((cudaStream_t) stream_, &junk);
+        strata::core::end_capture((cudaStream_t) stream_, &junk);
         if (junk) cudaGraphDestroy(junk);
         return fail(err, "the capture body left a CUDA error", body_err);
     }
