@@ -8,6 +8,7 @@
 //
 //   STRATA_SM86_PERF=0   turns the sm_86 table off (cards of compute capability 8.6: RTX 3050-3090, RTX A2000-A6000)
 //   STRATA_SM60_PERF=0   turns the sm_60 table off (Pascal GP100: Tesla P100)
+//   STRATA_SM75_STACK=1  turns the sm_75 candidate table ON (Turing: Tesla T4, RTX 20; not measured yet, so opt-in)
 //
 // A switch the user set (to anything, including 0) is never overridden.  Applied once at start, before any engine code reads its
 // switches; the table is used only when every visible CUDA device has the same compute capability.
