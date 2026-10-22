@@ -3063,7 +3063,8 @@ class Vision:
             from PIL import ImageOps
             im = ImageOps.exif_transpose(im)             # the camera's orientation tag, applied (#1229)
         except Exception as e:
-            raise ValueError(f"the image could not be read ({e})") from None
+            kind = data[8:12].decode("latin-1") if data[4:8] == b"ftyp" else data[:8].hex()   # HEIC: ftyp heic/mif1
+            raise ValueError(f"the image could not be read ({e}; {len(data)} bytes, starts {kind!r})") from None
         if im.mode in ("RGBA", "LA", "P") and "transparency" in im.info or im.mode in ("RGBA", "LA"):
             im = im.convert("RGBA")
             bg = Image.new("RGB", im.size, (255, 255, 255))   # transparent areas become white, not black
