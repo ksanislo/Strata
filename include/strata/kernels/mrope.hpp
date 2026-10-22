@@ -15,6 +15,8 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
+#include <vector>
 #if defined(__HIPCC__) && defined(STRATA_HIP_GFX906)   // PR #638: the gfx906 compat build only
 #include <hip/hip_runtime.h>
 #endif
@@ -26,6 +28,38 @@ namespace strata::kernels {
 /// The table of the CURRENT device (a layer split sets one per device; null = the identity).
 void mrope_table_set(const int32_t* device_table);
 const int32_t* mrope_table();
+/// Overrides mrope_table() on this thread while it lives (a batch capture: its rows' positions come resolved per slot).
+class MropeScope {
+public:
+    explicit MropeScope(const int32_t* table);
+    ~MropeScope();
+    MropeScope(const MropeScope&) = delete;
+    MropeScope& operator=(const MropeScope&) = delete;
+private:
+    const int32_t* prev_;
+    bool had_;
+};
+
+/// --vision with --batch: each slot's own positions, so a picture conversation decodes beside text ones.  `thw` holds
+/// the (t, h, w) of the prompt's cells; a cell past them is text at t = h = w = cell + delta.  No entry: the identity.
+struct SlotRope {
+    std::vector<int32_t> thw;
+    int32_t delta = 0;
+    void at(int64_t cell, int32_t out[3]) const {
+        if (cell >= 0 && (size_t) cell * 3 + 2 < thw.size()) {
+            out[0] = thw[(size_t) cell * 3]; out[1] = thw[(size_t) cell * 3 + 1]; out[2] = thw[(size_t) cell * 3 + 2];
+        } else {
+            out[0] = out[1] = out[2] = (int32_t) (cell + delta);
+        }
+    }
+};
+/// On when batch windows resolve positions per slot (set before any batch graph or slot drafter is captured).
+void slot_rope_enable(bool on);
+bool slot_rope_enabled();
+void slot_rope_set(int slot, std::shared_ptr<const SlotRope> r);   ///< null: the identity
+std::shared_ptr<const SlotRope> slot_rope_get(int slot);
+/// The (t, h, w) of `cell` in `slot` (the identity without an entry)
+void slot_rope_at(int slot, int64_t cell, int32_t out[3]);
 
 /// #280, opt-in (STRATA_ROPE_TABLE=1): the rotation angles, 32 pairs of a 64-wide rotary slice, from the session's
 /// float64 table (build_rope_table, [max_pos][32] cos and sin in VRAM, the rope scaling inside) of the CURRENT
