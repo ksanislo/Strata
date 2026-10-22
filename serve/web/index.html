@@ -100,31 +100,8 @@
       <div class="st-card state-card">
         <div class="state-card__head">
           <span class="card-title">Model state</span>
-          <span class="badges" id="state-badges">
-            <span class="st-badge" data-s="idle">Idle</span>
-            <span class="st-badge st-badge--reading" data-s="reading">Reading</span>
-            <span class="st-badge st-badge--generating" data-s="generating">Generating</span>
-            <span class="st-badge st-badge--queued" data-s="queued">Queued</span>
-            <span class="st-badge st-badge--error" data-s="error">Error</span>
-          </span>
         </div>
-        <div class="state-card__row"><span id="state-label">Waiting for a request</span><span class="muted" id="state-detail"></span></div>
-        <p class="muted small" id="engine-old" hidden>This server process started before its engine-wide figures were
-          installed: reload the model for the totals and the Engine card.</p>
-        <div class="table-wrap conv-wrap" id="conv-wrap" hidden>
-          <table class="st-table conv-table">
-            <thead><tr><th>Slot</th><th>State</th><th class="num">Prompt</th><th>Read</th><th class="num">Generated</th>
-              <th class="num">Context</th><th class="num" title="Waiting for the engine or a slot before it started">Queued</th>
-              <th class="num" title="Time to first token, from the start in the engine (so far, while still reading)">TTFT</th>
-              <th class="num">tok/s</th><th class="num">Age</th></tr></thead>
-            <tbody id="conv-body"></tbody>
-          </table>
-        </div>
-      </div>
-
-      <div class="st-card engine-card" id="engine-card" hidden>
-        <div class="req-head"><span class="card-title">Engine (all slots)</span><span class="muted small" id="engine-sum"></span></div>
-        <dl class="facts engine-facts" id="engine-facts"></dl>
+        <div class="conv-states" id="conv-states"></div>
       </div>
 
       <div class="metrics" id="metrics">
