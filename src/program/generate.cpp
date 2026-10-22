@@ -80,6 +80,7 @@
 #include "strata/program/slot_persist.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/program/slot_idle.hpp"
 #include "strata/program/split_rules.hpp"
 #include "strata/prefill/share_rules.hpp"
 #include "strata/platform/host_limits.hpp"
@@ -212,6 +213,21 @@ bool elastic_give_env() {
 int64_t elastic_slots_env(const char* name, int64_t dflt) {
     const char* v = std::getenv(name);
     return v != nullptr && std::atoll(v) > 0 ? std::atoll(v) : dflt;
+}
+// STRATA_ELASTIC_IDLE=1 (with STRATA_ELASTIC_SLOTS=1 and _GIVE=1): the slot budget made at load is only each slot's first
+// cell plus STRATA_ELASTIC_IDLE_SPARE_MIB (default 64); the rest comes from the expert cache as the slots grow, and a slot
+// idle for STRATA_ELASTIC_IDLE_S seconds (default 120) parks its conversation and gives its VRAM back to the expert cache
+bool elastic_idle_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_ELASTIC_IDLE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0' && elastic_give_env() && elastic_slots_mode() == 2;
+    }();
+    return on;
+}
+double elastic_idle_seconds() {
+    const char* v = std::getenv("STRATA_ELASTIC_IDLE_S");
+    const double s = v != nullptr ? std::atof(v) : 0.0;
+    return s > 0.0 ? s : 120.0;
 }
 
 // STRATA_PIPE_BYIELD_NODRAIN=1 (read once; off by default): with the pipelined groups, a BYIELD that reaches the main
@@ -5550,8 +5566,19 @@ int main(int argc, char** argv) {
             if (elastic) {
                 // the budget the slots grow into, made now: the expert cache is sized around it
                 for (auto& u : bslot_ss[k]) reserved += strata::core::session_slot_reserved(*u);
-                budget = strata::core::qsa_slot_budget_add(
-                    dev, std::min<uint64_t>((uint64_t) elastic_slots_env("STRATA_ELASTIC_SLOTS_MIB", 1024) << 20, reserved));
+                const uint64_t full =
+                    std::min<uint64_t>((uint64_t) elastic_slots_env("STRATA_ELASTIC_SLOTS_MIB", 1024) << 20, reserved);
+                uint64_t want = full;
+                if (elastic_idle_env()) {   // STRATA_ELASTIC_IDLE: the first cells and a spare; the expert cache holds the rest
+                    uint64_t first = 0;
+                    for (auto& u : bslot_ss[k])
+                        first += (uint64_t) strata::core::session_slot_need(*u, 1) * strata::core::vmm_granularity(dev);
+                    want = std::min<uint64_t>(full, first + ((uint64_t) elastic_slots_env("STRATA_ELASTIC_IDLE_SPARE_MIB", 64) << 20));
+                    std::fprintf(stderr, "strata generate: STRATA_ELASTIC_IDLE: CUDA%d's slot budget is %.0f MiB at load "
+                                         "instead of %.0f MiB; the expert cache holds the rest until the slots need it\n",
+                                 dev, (double) want / 1048576.0, (double) full / 1048576.0);
+                }
+                budget = strata::core::qsa_slot_budget_add(dev, want);
                 for (size_t b = 0; b < bslot_ss[k].size(); ++b)
                     if (!strata::core::session_slot_fit(*bslot_ss[k][b], 1, false)) {
                         std::fprintf(stderr, "strata generate: WARNING: --batch %d: elastic slot %zu has no budget left "
@@ -11874,6 +11901,26 @@ int main(int argc, char** argv) {
             }
             return true;
         }();
+        // STRATA_ELASTIC_IDLE without a cache that gives: the slots get their whole budget after all (what VRAM is left)
+        if (eslots_on && !give_on && elastic_idle_env())
+            for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                uint64_t reserved = 0, bt = 0, bf = 0;
+                for (auto& u : bslot_ss[k]) reserved += strata::core::session_slot_reserved(*u);
+                const uint64_t full =
+                    std::min<uint64_t>((uint64_t) elastic_slots_env("STRATA_ELASTIC_SLOTS_MIB", 1024) << 20, reserved);
+                strata::core::qsa_slot_budget(eslot_dev(k), bt, bf);
+                const uint64_t got = full > bt ? strata::core::qsa_slot_budget_add(eslot_dev(k), full - bt) : 0;
+                std::fprintf(stderr, "strata batch: WARNING: STRATA_ELASTIC_IDLE needs STRATA_ELASTIC_SLOTS_GIVE: CUDA%d's "
+                                     "slot budget made up to %.0f of %.0f MiB\n", eslot_dev(k),
+                             (double) (bt + got) / 1048576.0, (double) full / 1048576.0);
+            }
+        const bool eidle_on = eslots_on && give_on && elastic_idle_env();
+        // the free budget chunks card k keeps beyond its decoding slots' next step: what was made at load, or the spare
+        auto budget_keep = [&](size_t k, int64_t made) -> int64_t {
+            if (!eidle_on) return made;
+            const uint64_t G = strata::core::vmm_granularity(eslot_dev(k));
+            return G == 0 ? made : (int64_t) (((uint64_t) elastic_slots_env("STRATA_ELASTIC_IDLE_SPARE_MIB", 64) << 20) / G);
+        };
         // the slots a loan may not reach into on this cache (its whole size without giving)
         auto give_top = [&](const strata::core::ExpertCache* xc) -> int64_t {
             for (const Give& v : gv) if (v.cache == xc) return v.top;
@@ -12098,11 +12145,11 @@ int main(int argc, char** argv) {
             if (!may_give) return;
             if (fr < low && gv[k].lo > give_floor) {
                 give(k, low - fr + 16);
-            } else if (fr > made + low + 32) {
+            } else if (fr > budget_keep(k, made) + low + 32) {
                 bool lent = false;
                 for (const PfPart& p : pf_parts) lent = lent || (p.cache == gv[k].cache && !p.lent.empty());
                 lent = lent || !lazy_fly.empty();   // (STRATA_SHORT_READS: copies back into the loan still landing)
-                if (!lent) (void) take_back(k, fr - made - low - 16);
+                if (!lent) (void) take_back(k, fr - budget_keep(k, made) - low - 16);
             }
         };
         // an admission into slot b (everything drained): it is trimmed to its new conversation and backed for it; when the
@@ -13114,16 +13161,17 @@ int main(int argc, char** argv) {
         // --session-dir: slot b's kept conversation, before `next` overwrites the slot - parked like the main sessions'
         // (RAM, written behind) or written straight from the GPU (slot_persist_wanted says when it is not needed).
         // Never while pipelined groups are in flight: the device syncs would wait on windows only this thread serves.
+        // `ram`: parked in the conversation cache even without --session-dir (STRATA_ELASTIC_IDLE).  false: not saved
         auto persist_slot = [&](int b, bool from_this_slot, const std::vector<int32_t>& next, bool exiting,
-                                const char* why) {
-            if (!sdir || b < 0 || b >= (int) bs.size()) return;
+                                const char* why, bool ram = false) -> bool {
+            if (!(sdir || (ram && conversations.enabled())) || b < 0 || b >= (int) bs.size()) return true;
             BSlot& sl = bs[(size_t) b];
             std::vector<const std::vector<int32_t>*> others;   // the slots saved in their turn (at exit: the kept ones)
             for (size_t c = 0; c < bs.size(); ++c)
                 if ((int) c != b && (bs[c].cached || (!exiting && bs[c].active && !bs[c].tainted && !bs[c].img)))
                     others.push_back(&bs[c].ids);
             if (!strata::program::slot_persist_wanted(sl.cached && !sl.active, from_this_slot, sl.ids, next, others))
-                return;
+                return true;
             std::string e = pipe_inflight() ? "pipelined groups in flight" : "";
             for (size_t k = 0; e.empty() && k < bslot_ss.size(); ++k) {
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
@@ -13135,7 +13183,7 @@ int main(int argc, char** argv) {
             }
             if (!e.empty()) {
                 std::fprintf(stderr, "strata batch: slot %d's conversation not saved (%s)\n", b, e.c_str());
-                return;
+                return false;
             }
             std::fprintf(stderr, "strata batch: saving slot %d's conversation (%zu tokens) before %s\n", b,
                          sl.ids.size(), why);
@@ -13149,6 +13197,7 @@ int main(int argc, char** argv) {
             }
             if (!ok) std::fprintf(stderr, "strata batch: slot %d's conversation not saved (%s)\n", b, err.c_str());
             err.clear();
+            return ok;
         };
         slot_drop_save = [&](int b, const char* why) { persist_slot(b, false, {}, false, why); };
         if (!o.session_dir.empty()) {
@@ -13751,11 +13800,14 @@ int main(int argc, char** argv) {
                     std::string fe;
                     if (adm_quiet && !adm_quiet()) return AdmEnd::fatal;   // (no queued read beside the fit)
                     if (!pipe_drain()) return AdmEnd::fatal;
-                    if (!slot_admit_fit(b, n, fe)) {
-                        sl.cached = false;
-                        return refuse(fe.c_str());
+                    // STRATA_ELASTIC_IDLE: with the cards quiet the expert caches give room and the slot keeps what it holds
+                    if (!(eidle_on && slot_fit(b, n + 1, false, all_quiet) == 0)) {
+                        if (!slot_admit_fit(b, n, fe)) {
+                            sl.cached = false;
+                            return refuse(fe.c_str());
+                        }
+                        fresh = true;
                     }
-                    fresh = true;
                 }
             }
             if (o.prompt_cache > 0 && !nan_flush && !sl.tainted && !sl.img && sl.cvec == cvec_cached) {
@@ -14638,6 +14690,83 @@ int main(int argc, char** argv) {
                          (long long) (pipe_rows - rows_run0), window_note().c_str());
             return true;
         };
+        // STRATA_ELASTIC_IDLE: a slot that has kept the same conversation for STRATA_ELASTIC_IDLE_S parks it (RAM, then
+        // --session-dir) and gives its VRAM back to the expert caches.  Never a slot a read, an admission or a window holds;
+        // the groups in flight drain first (the park's device syncs).  false: the engine cannot go on
+        std::vector<strata::program::SlotIdleSeen<Clock::time_point>> eidle_seen(bs.size());
+        Clock::time_point eidle_last{};
+        const double eidle_s = elastic_idle_seconds();
+        if (eidle_on)
+            std::fprintf(stderr, "strata batch: STRATA_ELASTIC_IDLE: a slot idle for %.0f s parks its conversation (%s) and "
+                                 "gives its VRAM back to the expert cache\n", eidle_s,
+                         sdir ? "RAM, --session-dir" : conversations.enabled() ? "RAM only" : "nowhere: it is dropped");
+        auto eidle_tick = [&]() -> bool {
+            if (!eidle_on) return true;
+            const auto now = Clock::now();
+            if (now - eidle_last < std::chrono::milliseconds(500)) return true;
+            eidle_last = now;
+            std::vector<int> due;
+            for (size_t b = 0; b < bs.size(); ++b) {
+                const BSlot& sl = bs[b];
+                const bool kept = !sl.active && !sl.reading && !sl.partial && sl.cached && (int) b != admit_slot &&
+                                  !adm_queued[b] && !adm_paused[b] && adm_reading != (int) b && adm_stop_of[b] == nullptr;
+                if (!eidle_seen[b].see(now, kept, sl.t0, sl.ids.size()) ||
+                    std::chrono::duration<double>(now - eidle_seen[b].since).count() < eidle_s)
+                    continue;
+                bool big = false;
+                for (const auto& v : bslot_ss) big = big || v[b]->slot_cells > 1;
+                if (big) due.push_back((int) b);
+            }
+            if (conc_serving || in_prompt_read || share_live || adm_held_n > 0 || adm_active) return true;
+            if (due.empty()) {   // nothing running: budget chunks a slot let go of go back to the expert caches
+                if (pipe_inflight() || batch_on()) return true;
+                for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                    int64_t fr = 0, made = 0;
+                    strata::core::qsa_slot_budget_chunks(eslot_dev(k), &fr, &made);
+                    if (fr > budget_keep(k, made) + 32) elastic_idle(k, true, -1);
+                }
+                return true;
+            }
+            const auto t_d = Clock::now();
+            if (!pipe_drain()) return false;
+            const double drain_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_d).count();
+            for (const int b : due) {
+                BSlot& sl = bs[(size_t) b];
+                const auto t_p = Clock::now();
+                if (!persist_slot(b, false, {}, false, "it gives its VRAM back (STRATA_ELASTIC_IDLE)", true)) {
+                    eidle_seen[(size_t) b].since = now;   // kept; tried again after another idle stretch
+                    continue;
+                }
+                const double park_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_p).count();
+                std::string note;
+                for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                    strata::core::SessionState& u = *bslot_ss[k][(size_t) b];
+                    if (u.slot_cells < 0) continue;
+                    const strata::core::OnDevice on_k(eslot_dev(k));
+                    const uint64_t held = strata::core::session_slot_backed(u);
+                    (void) strata::core::session_slot_fit(u, 1, true);
+                    strata::core::session_zero(u, g, nullptr, nullptr);   // its K/V map named the page slots given back
+                    if (cudaDeviceSynchronize() != cudaSuccess) {
+                        std::printf("ERR elastic idle: device sync failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+                        return false;
+                    }
+                    char x[64];
+                    std::snprintf(x, sizeof x, "%sCUDA%d %.0f MiB", note.empty() ? "" : ", ", eslot_dev(k),
+                                  (double) (held - std::min(held, strata::core::session_slot_backed(u))) / 1048576.0);
+                    note += x;
+                }
+                sl.cached = false;
+                if (ckpt_pool.on())
+                    for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
+                sl.checks.clear();
+                std::fprintf(stderr, "strata batch: elastic idle: slot %d idle %.0f s: its %zu tokens parked in %.0f ms "
+                                     "(drain %.0f ms); freed %s\n", b,
+                             std::chrono::duration<double>(now - eidle_seen[(size_t) b].since).count(), sl.ids.size(),
+                             park_ms, drain_ms, note.c_str());
+            }
+            for (size_t k = 0; k < bslot_ss.size(); ++k) elastic_idle(k, true, -1);   // (the caches take it back, refilled)
+            return true;
+        };
         // --serve is driven by its server over stdin (QUIT, or EOF when the server is gone): a SIGTERM / SIGINT sent to
         // the whole process group (systemd stopping a service, Ctrl+C in a terminal) must not end the engine before
         // the server's orderly QUIT.  SIGKILL still ends it.
@@ -14660,6 +14789,7 @@ int main(int argc, char** argv) {
             }
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
+                    if (!eidle_tick()) return 1;
                     if (!(piped ? pump(true) : batch_step())) return 1;
                     continue;
                 }
@@ -14683,6 +14813,23 @@ int main(int argc, char** argv) {
                         std::fflush(stderr);
                     }
                 }
+            } else if (eidle_on) {   // STRATA_ELASTIC_IDLE: the idle slots are looked at every second while no line comes
+                bool got = false;
+                for (;;) {
+                    {
+                        std::unique_lock<std::mutex> lk(in_mu);
+                        in_cv.wait_for(lk, std::chrono::seconds(1), [&] { return !in_lines.empty() || in_eof; });
+                        if (!in_lines.empty()) {
+                            line = std::move(in_lines.front());
+                            in_lines.pop_front();
+                            got = true;
+                        }
+                        if (got || in_eof) break;
+                    }
+                    if (!eidle_tick()) return 1;
+                }
+                if (!got) break;
+                adm_direct = adm_take(line);
             } else if (!next_line(line)) {
                 break;
             } else {
