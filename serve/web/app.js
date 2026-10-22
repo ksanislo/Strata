@@ -293,24 +293,34 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, agg, 
     }
     return block(title, s, detail, pct);
   };
-  // every configured slot, in order and numbered from 1, so a conversation keeps its place; requests outside the
-  // slots (queued, or on the single-request path) follow
+  // every configured slot, in order and numbered from 1, so a conversation keeps its place. A request the engine
+  // runs on its single-conversation path (everything else idle) has no slot number: it shows in the first idle slot,
+  // where it lands when it ends. Only requests still waiting for the engine follow the slots, as Queued.
+  const solo = (c) => c.slot == null && (c.state === "reading" || c.state === "decoding");
+  if (live.state === "generating" || live.state === "reading")
+    for (const c of conv) if (solo(c) && c.tok_s == null && live.state === "generating") c.tok_s = live.tok_s;
   const bySlot = new Map(conv.filter((c) => c.slot != null).map((c) => [c.slot, c]));
   const slots = (live.slots || []).slice().sort((x, y) => x.slot - y.slot);
+  const loose = conv.filter(solo);
   let html = slots.map((x) => {
-    const c = bySlot.get(x.slot);
+    let c = bySlot.get(x.slot);
+    if (!c && x.state === "idle" && loose.length) c = loose.shift();
     return one(c ? {...c, held_tokens: x.held_tokens} : {...x, context_tokens: (x.prompt_tokens || 0) + (x.generated || 0)},
                `Slot ${x.slot + 1}`);
-  }).join("") + conv.filter((c) => c.slot == null || !slots.length).map((c) =>
-    one(c, c.slot == null ? (c.state === "queued" || c.state === "waiting" ? "Queued" : "Request") : `Slot ${c.slot + 1}`)).join("");
+  }).join("") + loose.concat(conv.filter((c) => c.slot == null && !solo(c))).map((c) =>
+    one(c, solo(c) ? "Request" : "Queued")).join("");
   if (!slots.length && conv.length) html = conv.map((c) => one(c, c.slot == null ? "Request" : `Slot ${c.slot + 1}`)).join("");
   $("conv-states").innerHTML = html;
 
   // the eight cards; Decode and Prefill: every slot together (the engine's own counts over the last 10 s)
   if (agg && agg.loaded) {
+    // the big numbers: every conversation's own current rate added up, live; the averages over time underneath
     const g = agg.generated_tok_s, p = agg.prompt_read_tok_s;
-    setMetric("speed", fmt(g["10s"], 1), "t/s", `Decode, all slots · 60 s ${fmt(g["60s"], 1)}`);
-    setMetric("prefill", fmt(p["10s"]), "t/s", `Prefill, all slots · 60 s ${fmt(p["60s"])}`);
+    const dec = conv.filter((c) => c.state === "decoding"), rd = conv.filter((c) => c.state === "reading");
+    const decNow = dec.reduce((t, c) => t + (c.tok_s || 0), 0);
+    const rdNow = rd.reduce((t, c) => t + (c.prompt_read && c.reading_s ? c.prompt_read / c.reading_s : 0), 0);
+    setMetric("speed", fmt(decNow, 1), "t/s", `Decode, ${dec.length} conversation${dec.length === 1 ? "" : "s"} · avg 60 s ${fmt(g["60s"], 1)}`);
+    setMetric("prefill", fmt(rdNow), "t/s", `Prefill, ${rd.length} reading · avg 60 s ${fmt(p["60s"])}`);
   } else {
     const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
     setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
