@@ -32,6 +32,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/pinned.hpp"
+#include "strata/platform/numa.hpp"
 #include "strata/core/pin_budget.hpp"
 #include "strata/core/uma_cache.hpp"
 #include "strata/core/remote_experts.hpp"
@@ -6005,6 +6006,17 @@ int main(int argc, char** argv) {
         // engine allocates after it (the verify window's staging: "mapped staging allocation failed", exit 1).  Keep a
         // reserve while the arena pins and hand it back after (pin_budget.hpp).
         strata::core::pin_reserve_take();
+        // STRATA_PARALLEL_LOAD: a layer split across NUMA nodes fills each layer's experts from its card's node
+        if (strata::core::parallel_load_mode() == 1 && !stages.empty() && strata::platform::numa_node_count() > 1) {
+            auto node_of = [](int dev) {
+                char bus[32] = {0};
+                return cudaDeviceGetPCIBusId(bus, sizeof bus, dev) == cudaSuccess ? strata::platform::numa_node_of_pci(bus) : -1;
+            };
+            std::vector<int> nodes((size_t) g.n_layers, node_of(0));
+            for (const auto& st : stages)
+                for (int64_t l = st->lb; l < st->le && l < g.n_layers; ++l) nodes[(size_t) l] = node_of(st->dev);
+            if (std::find(nodes.begin(), nodes.end(), -1) == nodes.end()) arena_src.set_load_layer_nodes(std::move(nodes));
+        }
         const bool arena_ok = arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
                                              o.shared_expert_arena);
         strata::core::pin_note_arena(arena_src.pinned_arena_bytes());
@@ -6637,6 +6649,7 @@ int main(int argc, char** argv) {
         }
     }
 
+    std::vector<std::function<bool(std::string&)>> stage_fills;
     for (auto& stp : stages) {
         GpuStage& st = *stp;
         const auto& lay = strata::kernels::cpu::expert_layout();
@@ -6681,30 +6694,52 @@ int main(int argc, char** argv) {
                          sized.empty() ? "no room" : err.c_str());
             return 1;
         }
-        int64_t filled = 0;
-        for (const auto& pr : st.profile) {
-            if (filled >= st.cache.slots()) break;
-            const int32_t slot = st.cache.admit(pr.first, pr.second);
-            if (slot == strata::core::kNotResident) break;
-            const uint8_t* b = srcp->blob_stable(pr.first, pr.second);
-            if (b == nullptr || !st.cache.fill_slot_blocking(slot, b, err, (int64_t) lay.blob_bytes(pr.first))) {
-                std::fprintf(stderr, "strata generate: layer split, CUDA%d profile fill failed at pair %lld: %s\n",
-                             st.dev, (long long) filled, err.c_str());
-                return 1;
+        // the profile's experts into the card's cache (STRATA_PARALLEL_LOAD: every card at once, after the loop)
+        auto fill_stage = [&st, &lay, srcp](std::string& e) -> bool {
+            const strata::core::OnDevice on_fill(st.dev);
+            int64_t filled = 0;
+            for (const auto& pr : st.profile) {
+                if (filled >= st.cache.slots()) break;
+                const int32_t slot = st.cache.admit(pr.first, pr.second);
+                if (slot == strata::core::kNotResident) break;
+                const uint8_t* b = srcp->blob_stable(pr.first, pr.second);
+                if (b == nullptr || !st.cache.fill_slot_blocking(slot, b, e, (int64_t) lay.blob_bytes(pr.first))) {
+                    std::fprintf(stderr, "strata generate: layer split, CUDA%d profile fill failed at pair %lld: %s\n",
+                                 st.dev, (long long) filled, e.c_str());
+                    return false;
+                }
+                ++filled;
             }
-            ++filled;
-        }
-        if (filled == 0 || !st.cache.verify_slot(st.cache.slot_of(st.profile[0].first, st.profile[0].second),
-                                                 srcp->blob_stable(st.profile[0].first, st.profile[0].second), err,
-                                                 (int64_t) lay.blob_bytes(st.profile[0].first))) {
-            std::fprintf(stderr, "strata generate: layer split, CUDA%d expert cache: %s\n", st.dev,
-                         filled == 0 ? "nothing filled" : err.c_str());
+            if (filled == 0 || !st.cache.verify_slot(st.cache.slot_of(st.profile[0].first, st.profile[0].second),
+                                                     srcp->blob_stable(st.profile[0].first, st.profile[0].second), e,
+                                                     (int64_t) lay.blob_bytes(st.profile[0].first))) {
+                std::fprintf(stderr, "strata generate: layer split, CUDA%d expert cache: %s\n", st.dev,
+                             filled == 0 ? "nothing filled" : e.c_str());
+                return false;
+            }
+            std::fprintf(stderr, "strata generate: layer split: CUDA%d runs layers %lld-%lld, expert cache %lld slots "
+                                 "(%.2f GiB), %lld of its %zu profiled pairs; slot 0 verified\n",
+                         st.dev, (long long) st.lb, (long long) (st.le - 1), (long long) st.cache.slots(), st.cache.gib(),
+                         (long long) filled, st.profile.size());
+            return true;
+        };
+        if (strata::core::parallel_load_mode() == 1 && srcp == &arena_src) {   // (the arena's blobs: plain pointers)
+            stage_fills.push_back(fill_stage);
+        } else if (!fill_stage(err)) {
             return 1;
         }
-        std::fprintf(stderr, "strata generate: layer split: CUDA%d runs layers %lld-%lld, expert cache %lld slots "
-                             "(%.2f GiB), %lld of its %zu profiled pairs; slot 0 verified\n",
-                     st.dev, (long long) st.lb, (long long) (st.le - 1), (long long) st.cache.slots(), st.cache.gib(),
-                     (long long) filled, st.profile.size());
+    }
+    if (!stage_fills.empty()) {
+        const auto tf = Clock::now();
+        std::vector<std::string> errs(stage_fills.size());
+        std::vector<char> ok(stage_fills.size(), 0);
+        std::vector<std::thread> fill_threads;
+        for (size_t i = 0; i < stage_fills.size(); ++i)
+            fill_threads.emplace_back([&, i] { ok[i] = stage_fills[i](errs[i]) ? 1 : 0; });
+        for (auto& t : fill_threads) t.join();
+        if (std::find(ok.begin(), ok.end(), 0) != ok.end()) return 1;
+        std::fprintf(stderr, "strata generate: layer split: %zu stage caches filled at once in %.1f s (STRATA_PARALLEL_LOAD)\n",
+                     stage_fills.size(), std::chrono::duration<double>(Clock::now() - tf).count());
     }
     if (multi_gpu)
         std::fprintf(stderr, "strata generate: layer split: CUDA0 runs layers 0-%lld\n", (long long) (split_at[0] - 1));
