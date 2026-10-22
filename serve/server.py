@@ -416,6 +416,20 @@ class EngineNonFinite(ValueError):
     ends one that had started (as "length").  A ValueError, so a stream that has started reports it as an error event."""
 
 
+class EngineOutOfVram(EngineNonFinite):
+    """A DONE / BDONE that said `vram`: the request's prompt read or batch window found no free VRAM on a card (after the
+    card's expert cache gave what it could).  The engine goes on and the slot dropped its state; handled as #879's
+    non-finite end (sent once more when nothing was produced yet, a 503 otherwise)."""
+
+
+def raise_bad_finish(finish) -> None:
+    """The request's end the engine reported as a failure of its own: #879's non-finite logits, or no VRAM."""
+    if finish == "nonfinite":
+        raise EngineNonFinite("the engine's logits became non-finite (#879)")
+    if finish == "vram":
+        raise EngineOutOfVram("the GPU had no free memory for this request (the engine goes on); try it again")
+
+
 class SessionRefused(ValueError):
     """Disk sessions: the engine refused or failed a SAVE / RESTORE and is still in step (`SERR <kind> <published>
     <reason>`).  `kind` is the engine's category - invalid (400), storage (507), memory (503), io (500); `published`:
@@ -1254,8 +1268,15 @@ class StrataEngine:
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
         slot_q = self.slot_q
+        log = self.log
         line = None
         for line in proc.stdout:
+            if line.startswith("ERR") and hasattr(log, "write"):   # stdout only: the log shows why a request or the engine failed
+                try:
+                    log.write(f"[strata] engine said: {line.rstrip()}\n")
+                    log.flush()
+                except (OSError, ValueError):
+                    pass
             if line.startswith("INFO ") and self._session_note(line):
                 continue                                # a session note: shown and kept, never an answer
             # checked before batch routing: a fatal line is never a slot's own
@@ -1722,7 +1743,7 @@ class StrataEngine:
                     except (IndexError, ValueError):
                         tail = []
                 if line.startswith("BDONE "):
-                    if line.split()[3:4] == ["nonfinite"]:   # #879: the engine dropped the slot's state
+                    if line.split()[3:4] in (["nonfinite"], ["vram"]):   # #879 / no VRAM: the engine dropped the slot's state
                         tail = []
                     break
                 if line.startswith("BRE ") or (line.startswith("BRA ") and line.split()[2:3] == ["0"]):
@@ -1951,8 +1972,7 @@ class StrataEngine:
                         t = pending.pop(0)
                         out.append(t)
                         yield t
-                    if self._done_finish() == "nonfinite":    # #879 (never promoted to a slot)
-                        raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                    raise_bad_finish(self._done_finish())    # #879 / no VRAM (never promoted to a slot)
                     if self._yielded is not None and reserved is not None and self._yielded[0] == reserved:
                         slot, reserved = reserved, None     # gave way: the read goes on in that slot (below)
                     elif reserved is not None:              # it did not give way: the slot is free again
@@ -2120,8 +2140,8 @@ class StrataEngine:
                         t = pending.pop(0)
                         out.append(t)
                         yield t
-                    if not cont and self._done_finish() == "nonfinite":   # #879
-                        raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                    if not cont:
+                        raise_bad_finish(self._done_finish())   # #879 / no VRAM
                     if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
                         continue                            # gave way: again once the shorter request is in
                     break
@@ -2171,9 +2191,9 @@ class StrataEngine:
                         self._apply_bdone(f)
                         # what the slot's sessions hold now: the prompt and every token fed (all but the last one)
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
-                        if f[3:4] == ["nonfinite"]:              # #879: the engine dropped the slot's state
+                        if f[3:4] in (["nonfinite"], ["vram"]):  # #879 / no VRAM: the engine dropped the slot's state
                             self.slot_held[slot] = []
-                            raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                            raise_bad_finish(f[3])
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
                                 and not (out and out[-1] in EOS_IDS)):
                             # the solo path continues it: the engine copies the slot's sessions back (all but the
@@ -2454,8 +2474,7 @@ class StrataEngine:
                 elif line.startswith("DONE"):
                     self._parse_done(line)
                     done = True
-                    if self.last.get("finish") == "nonfinite":   # #879
-                        raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                    raise_bad_finish(self.last.get("finish"))   # #879 / no VRAM
                     return
                 elif line.startswith("ERR"):
                     done = True
@@ -5530,8 +5549,8 @@ class Service:
                                     elif parser.state == "content" and parser.clean and not detok.pending():
                                         opens = True
                                         break
-                        except EngineNonFinite:
-                            nonfinite = True
+                        except EngineNonFinite as e:
+                            nonfinite = e
                         except EngineDied as e:
                             finish = "error"
                             self._say_died(e)
@@ -5560,9 +5579,14 @@ class Service:
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
+                        if isinstance(nonfinite, EngineOutOfVram) and not cancel.is_set() and (n > 0 or nf_retried):
+                            finish = "error"                # no VRAM again, or after tokens went out: an error
+                            print(f"[strata] {nonfinite}", flush=True)
+                            raise nonfinite
                         if nonfinite and not cancel.is_set():
                             # #879: the engine emitted none of the poisoned window's tokens and reads its next prompt
                             # from token 0.  Nothing sent yet: the same request once more, unseen by the client
+                            # (no VRAM: once more too, the card's expert cache has given room meanwhile)
                             if n == 0 and not nf_retried:
                                 nf_retried = True
                                 # the retry reads from token 0: its DONE, not this one's, says what was reused
