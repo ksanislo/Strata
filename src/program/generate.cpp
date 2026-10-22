@@ -96,6 +96,7 @@
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/spec/spec_start.hpp"
 #include "strata/program/batch_groups.hpp"
+#include "strata/program/fast_lane.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/device.hpp"
@@ -5812,8 +5813,22 @@ int main(int argc, char** argv) {
         const int d = v != nullptr && v[0] != '\0' ? std::atoi(v) : o.spec - 1;
         return std::max(1, std::min(d, std::max(o.spec - 1, 1)));
     }();
-    const int pm_group_rows = piped_mtp ? strata::program::batch_groups::piped_mtp_group_rows(
-                                              o.batch / o.batch_groups, pm_drafts, strata::kernels::kVerifyMaxT) : 0;
+    // STRATA_FAST_LANE=1 (pipelined groups with drafts only): a read of at most STRATA_FAST_LANE_MAX (96) tokens goes
+    // through its group's windows, its prompt tokens as rows that are all kept (fast_lane.hpp); a group's hand-off rows
+    // are then a whole window's
+    const int64_t fast_lane_max = [&]() -> int64_t {
+        const char* v = std::getenv("STRATA_FAST_LANE");
+        if (v == nullptr || std::atoi(v) == 0) return 0;
+        if (!piped_mtp) {
+            std::fprintf(stderr, "strata generate: STRATA_FAST_LANE needs STRATA_PIPED_MTP's pipelined groups: off\n");
+            return 0;
+        }
+        const char* m = std::getenv("STRATA_FAST_LANE_MAX");
+        return m != nullptr ? (int64_t) std::max(0, std::atoi(m)) : (int64_t) 96;
+    }();
+    const int pm_group_rows = !piped_mtp ? 0 : fast_lane_max > 0 ? (int) strata::kernels::kVerifyMaxT
+                              : strata::program::batch_groups::piped_mtp_group_rows(
+                                    o.batch / o.batch_groups, pm_drafts, strata::kernels::kVerifyMaxT);
     if (piped_mtp)
         std::fprintf(stderr, "strata generate: STRATA_PIPED_MTP: %d pipelined groups of %d slots keep up to %d MTP "
                              "draft%s per slot (windows of up to %d rows) while at most %d conversation%s decode "
@@ -5822,6 +5837,10 @@ int main(int argc, char** argv) {
                      piped_mtp_max == 1 ? "" : "s");
     else if (piped_mtp_env && batch_mtp && o.batch > 0)
         std::fprintf(stderr, "strata generate: STRATA_PIPED_MTP: one slot group, so --batch-mtp's serial windows\n");
+    if (fast_lane_max > 0)
+        std::fprintf(stderr, "strata generate: STRATA_FAST_LANE: a read of at most %lld tokens beside the slots goes through "
+                             "its group's windows, %d rows a window (STRATA_FAST_LANE_MAX)\n", (long long) fast_lane_max,
+                     pm_group_rows);
     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts.
     // In particular WDDM can refuse the draft weights after mapping tens of GiB of host pages.
     strata::core::MtpDrafter mtp;
@@ -9631,7 +9650,9 @@ int main(int argc, char** argv) {
             const strata::core::OnDevice on_slot_mtp(mtp.device());
             for (int b = 0; b < o.batch; ++b) {
                 float* r = nullptr;
-                const size_t bytes = (size_t) o.spec * (size_t) g.hc * (size_t) g.n_embd * sizeof(float);
+                // (STRATA_FAST_LANE: a whole window's rows, for the drafter's catch-up over a lane window)
+                const size_t rows = fast_lane_max > 0 ? std::max<size_t>((size_t) o.spec, strata::kernels::kVerifyMaxT) : (size_t) o.spec;
+                const size_t bytes = rows * (size_t) g.hc * (size_t) g.n_embd * sizeof(float);
                 if (cudaMalloc((void**) &r, bytes) != cudaSuccess) {
                     std::fprintf(stderr, "strata serve: batch MTP slot %d residual buffer does not fit%s\n",
                                  b, vram_free_note().c_str());
@@ -11968,6 +11989,14 @@ int main(int argc, char** argv) {
             double adm_read_ms = 0.0, adm_wait_ms = 0.0;
             int64_t adm_rows = 0, adm_tokens = 0, adm_reused = 0;
             std::string adm_notes;   ///< where the admission's time went (its line at the first token)
+            // STRATA_FAST_LANE: its prompt `lane_ids` is read through its group's windows from p on (x = lane_ids[p]);
+            // nothing is emitted until the window with the prompt's last token, whose pick is the first token
+            bool lane = false;
+            std::vector<int32_t> lane_ids;
+            Clock::time_point lane_t0{};
+            int64_t lane_rows0 = 0, lane_resume = 0;
+            int lane_windows = 0;
+            double lane_wait_ms = 0.0;
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
         // an admission beside the slots, at its first token: one line with where its time went
@@ -13063,6 +13092,109 @@ int main(int argc, char** argv) {
             }
         }
         auto active_total = [&] { int n = 0; for (const BSlot& x : bs) n += x.active ? 1 : 0; return n; };
+        // STRATA_FAST_LANE: per slot, the drafter's catch-up over a lane window (the rows buffer is read until it lands:
+        // the next copy into it waits for this event on the device)
+        std::vector<cudaEvent_t> lane_cu_ev(bs.size(), nullptr);
+        std::vector<char> lane_cu_live(bs.size(), 0);
+        // STRATA_FAST_LANE_DUMP=<dir> (parity checks): a read's first-token logits, <dir>/<prompt hash>-<lane|path>-<n>.f32
+        static const char* const fl_dump = [] {
+            const char* v = std::getenv("STRATA_FAST_LANE_DUMP");
+            return v != nullptr && v[0] != '\0' ? v : nullptr;
+        }();
+        auto fl_dump_first = [&](strata::core::Verifier& vk, int row, const std::vector<int32_t>& prompt, const char* how) {
+            static int seq = 0;
+            std::vector<float> lg((size_t) std::max<int64_t>(vk.vocab(), 1));
+            const strata::core::OnDevice on(vk.device());
+            if (!vk.copy_logits(row, lg.data())) {
+                std::fprintf(stderr, "strata batch: STRATA_FAST_LANE_DUMP: the logits copy failed\n");
+                return;
+            }
+            const uint64_t h = fnv1a(prompt.data(), prompt.size() * sizeof(int32_t));
+            char path[512];
+            std::snprintf(path, sizeof path, "%s/%016llx-%s-%d.f32", fl_dump, (unsigned long long) h, how, ++seq);
+            if (FILE* f = std::fopen(path, "wb")) {
+                std::fwrite(lg.data(), sizeof(float), lg.size(), f);
+                std::fclose(f);
+                std::fprintf(stderr, "strata batch: STRATA_FAST_LANE_DUMP: %s (%zu prompt tokens)\n", path, prompt.size());
+            }
+        };
+        // STRATA_FAST_LANE: slot b's lane window of `rows` rows from window row i (all kept, the commit queued): the slot
+        // moves on; at the prompt's last token its read is done (BRA) and that row's pick is its first token.  A BSTOP or
+        // non-finite logits during the read end it with BRA 0.  `next`: the tokens its drafter's catch-up pairs the rows with
+        auto fl_verdict = [&](int b, int rows, int i, const int32_t* outb, const int32_t* tok, strata::core::Verifier& vk,
+                              int32_t* next) -> bool {
+            BSlot& sl = bs[(size_t) b];
+            const int64_t n = (int64_t) sl.lane_ids.size();
+            auto end_read = [&](const char* why) {
+                std::printf("BRA %d 0 %s\n", b, why);
+                std::fflush(stdout);
+                sl.active = false;
+                sl.lane = false;
+                sl.cached = false;
+                sl.draft_ready = false;
+                sl.ids.clear();
+                sl.lane_ids.clear();
+            };
+            bool nf = false;
+            for (int r = i; r < i + rows; ++r) nf = nf || vk.nonfinite_in(r);
+            if (nf) {
+                std::fprintf(stderr, "strata batch: non-finite logits (#879) in slot %d's fast-lane read at position %lld: "
+                                     "the read ends (BRA 0)\n", b, (long long) sl.p);
+                nan_flush = true;
+                end_read("nonfinite");
+                return true;
+            }
+            const strata::program::fast_lane::Step st = strata::program::fast_lane::step(rows, sl.p, n);
+            for (int j = 0; j < st.keep; ++j) sl.ids.push_back(tok[i + j]);
+            ++sl.lane_windows;
+            if (sl.stop) {
+                std::fprintf(stderr, "strata batch: slot %d: its fast-lane read was cancelled at %lld of %lld tokens\n", b,
+                             (long long) st.p, (long long) n);
+                end_read("cancel");
+                return true;
+            }
+            const int32_t y = st.done ? outb[i + st.pick_row] : 0;
+            strata::program::fast_lane::catchup_next(sl.lane_ids.data(), n, sl.p, rows, y, next);
+            sl.p = st.p;
+            sl.draft_ready = false;
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.lane_t0).count();
+            if (!st.done) {
+                sl.x = sl.lane_ids[(size_t) sl.p];
+                std::printf("BRP %d %lld %lld %.0f %.1f\n", b, (long long) sl.p, (long long) n, ms,
+                            ms > 0.0 ? 1000.0 * (double) (sl.p - sl.lane_resume) / ms : 0.0);
+                std::fflush(stdout);
+                return true;
+            }
+            // read: the slot decodes from here as one admitted through the prompt path would
+            sl.lane = false;
+            sl.lane_ids.clear();
+            sl.lane_ids.shrink_to_fit();
+            sl.adm_read_ms = ms;
+            sl.adm_rows = pipe_rows - sl.lane_rows0;
+            char nb[200];
+            std::snprintf(nb, sizeof nb, "fast lane: %d windows, %lld rows, set up in %.0f ms",
+                          sl.lane_windows, (long long) (n - sl.lane_resume), sl.lane_wait_ms);
+            sl.adm_notes = nb;
+            sl.t0 = Clock::now();   // (its decode from here, as a read through the prompt path's)
+            std::printf("BRA %d 1 prompt=%lld reused=%lld read_ms=%.1f wait_ms=%.1f\n", b, (long long) n,
+                        (long long) sl.lane_resume, ms, sl.adm_wait_ms);
+            std::printf("BT %d %d\n", b, (int) y);
+            adm_first(b);
+            ++sl.produced;
+            ++bt_rows;
+            ++pipe_rows;
+            const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+            const char* fin = eos ? "stop" : sl.produced >= sl.max_new ? "length" : sl.p + 2 > o.max_context ? "length" : nullptr;
+            if (fin != nullptr) {
+                const double tms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+                std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, tms);
+                sl.active = false;
+                sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
+            } else {
+                sl.x = y;
+            }
+            return true;
+        };
         // STRATA_PIPED_MTP, the last stage's picks of group gi: each slot's accepted prefix, the commit queued on every
         // stage, the drafters started (they finish in pump), the tokens emitted - as batch_step does for one window
         auto pm_verdict = [&](int gi, strata::core::Verifier& vk) -> bool {
@@ -13074,10 +13206,16 @@ int main(int argc, char** argv) {
             pm_rowsum += L.S;
             pm_win_ms += std::chrono::duration<double, std::milli>(G.pm_t1 - G.pm_t0).count();
             std::vector<int> keep(bs.size(), 1);
+            bool lane_w[strata::kernels::kVerifyMaxT] = {};   // STRATA_FAST_LANE: group slot t's rows were prompt rows
             for (int t = 0; t < GS; ++t) {
                 if (L.first[t] < 0) continue;
                 const int b = gi * GS + t, i = L.first[t];
                 const BSlot& sl = bs[(size_t) b];
+                if (sl.lane) {   // every row kept
+                    lane_w[t] = true;
+                    keep[b] = L.n[t];
+                    continue;
+                }
                 bool eos[strata::kernels::kVerifyMaxT] = {};
                 for (int j = 0; j < L.n[t]; ++j)
                     eos[j] = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outb[i + j]) != o.eos_ids.end();
@@ -13086,13 +13224,30 @@ int main(int argc, char** argv) {
                 pm_prop += L.n[t] - 1;
                 pm_acc += keep[b] - 1;
             }
+            if (fl_dump != nullptr)   // (STRATA_FAST_LANE_DUMP: before anything else is queued on this stage)
+                for (int t = 0; t < GS; ++t) {
+                    if (L.first[t] < 0) continue;
+                    const BSlot& sl = bs[(size_t) (gi * GS + t)];
+                    if (lane_w[t] && sl.p + L.n[t] >= (int64_t) sl.lane_ids.size())
+                        fl_dump_first(vk, L.first[t] + L.n[t] - 1, sl.lane_ids, "lane");
+                    else if (!lane_w[t] && sl.adm_log) {   // a read's first window: its row 0 is the prompt's last token
+                        std::vector<int32_t> pr(sl.ids);
+                        pr.push_back(L.tok[L.first[t]]);
+                        fl_dump_first(vk, L.first[t], pr, "path");
+                    }
+                }
             if (L.drafts)
                 for (int k = 0; k < n_pipe; ++k)
                     if (!stage_verifier(k).commit_deferred(G.hbase, keep.data(), err)) { std::printf("ERR %s\n", err.c_str()); return false; }
+            int32_t lane_next[strata::kernels::kVerifyMaxT][strata::kernels::kVerifyMaxT] = {};   // its drafter's catch-up
             for (int t = 0; t < GS; ++t) {
                 if (L.first[t] < 0) continue;
                 const int b = gi * GS + t, i = L.first[t];
                 BSlot& sl = bs[(size_t) b];
+                if (lane_w[t]) {
+                    if (!fl_verdict(b, L.n[t], i, outb, L.tok, vk, lane_next[t])) return false;
+                    continue;
+                }
                 bool nf = false;   // #879: a row of this slot held non-finite logits: the slot ends, nothing emitted
                 for (int r = i; r < i + L.n[t]; ++r) nf = nf || vk.nonfinite_in(r);
                 sl.draft_ready = false;
@@ -13141,6 +13296,11 @@ int main(int argc, char** argv) {
                 for (int t = 0; t < GS; ++t) {
                     const int b = gi * GS + t;
                     if (L.first[t] < 0 || !bs[(size_t) b].active) continue;
+                    // (STRATA_FAST_LANE: the drafter's catch-up over a lane window may still read the buffer)
+                    if (lane_cu_live[(size_t) b] && cudaStreamWaitEvent(vk.stream(), lane_cu_ev[(size_t) b], 0) != cudaSuccess) {
+                        std::printf("ERR batch MTP slot %d: the catch-up wait failed\n", b);
+                        return false;
+                    }
                     if (cudaMemcpyAsync(slot_mtp_rows[(size_t) b].get(), vk.final_R_all() + (size_t) L.first[t] * stride,
                                         (size_t) L.n[t] * stride * sizeof(float), cudaMemcpyDeviceToDevice,
                                         vk.stream()) != cudaSuccess) {
@@ -13159,6 +13319,21 @@ int main(int argc, char** argv) {
                 if (L.first[t] < 0 || !bs[(size_t) b].active) continue;
                 strata::core::MtpDrafter& d = *slot_mtp[(size_t) b];
                 const strata::core::OnDevice on_d(d.device());
+                if (lane_w[t]) {   // STRATA_FAST_LANE: the draft layer's K/V over the prompt rows, no drafts
+                    if (cudaStreamWaitEvent(d.stream(), pm_rows_ev, 0) != cudaSuccess ||
+                        !d.prefill(slot_mtp_rows[(size_t) b].get(), lane_next[t], L.n[t], L.pos[L.first[t]], err, false)) {
+                        std::printf("ERR batch MTP slot %d: %s\n", b, err.empty() ? "the lane catch-up failed" : err.c_str());
+                        return false;
+                    }
+                    cudaEvent_t& ev = lane_cu_ev[(size_t) b];
+                    if ((ev == nullptr && cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) ||
+                        cudaEventRecord(ev, d.stream()) != cudaSuccess) {
+                        std::printf("ERR batch MTP slot %d: the catch-up event failed\n", b);
+                        return false;
+                    }
+                    lane_cu_live[(size_t) b] = 1;
+                    continue;
+                }
                 if (cudaStreamWaitEvent(d.stream(), pm_rows_ev, 0) != cudaSuccess ||
                     !d.draft_launch(L.n[t], outb + L.first[t], L.pos[L.first[t]], keep[b] - 1, err)) {
                     std::printf("ERR batch MTP slot %d: %s\n", b, err.empty() ? "the draft launch failed" : err.c_str());
@@ -13361,8 +13536,15 @@ int main(int argc, char** argv) {
                     if (pick < 0) continue;
                 } else {
                     if (!may_start || share_live) continue;   // (a read holds the pools: STRATA_SHORT_READS)
-                    for (int j = 0; j < (int) pg.size() && pick < 0; ++j) {
+                    // (STRATA_FAST_LANE: a group with a lane read first)
+                    auto lane_in = [&](int gi) {
+                        for (int t = 0; t < GS; ++t)
+                            if (bs[(size_t) (gi * GS + t)].active && bs[(size_t) (gi * GS + t)].lane) return true;
+                        return false;
+                    };
+                    for (int j = 0; j < 2 * (int) pg.size() && pick < 0; ++j) {
                         const int gi = (int) ((rr + j) % (int64_t) pg.size());
+                        if (j < (int) pg.size() && (fast_lane_max <= 0 || !lane_in(gi))) continue;
                         if (!pg[(size_t) gi].inflight && !pg[(size_t) gi].drafting && group_active(gi) && !group_held(gi) &&
                             (!piped_mtp || stage_verifier(0).batch_launch_ready(
                                                strata::program::batch_groups::piped_mtp_hbase(gi, pm_group_rows))))
@@ -13373,8 +13555,10 @@ int main(int argc, char** argv) {
                     if (eslots_on) {   // its rows' slots backed on every stage before the window starts (pad rows: cell 0)
                         bool wait = false;   // (STRATA_PIPED_MTP: a slot's window may also write its drafts' cells)
                         for (int t = 0; t < GS; ++t)
-                            if (bs[(size_t) (pick * GS + t)].active)
-                                wait = slot_grow_or_end(pick * GS + t, bs[(size_t) (pick * GS + t)].p + 2 + (piped_mtp ? pm_drafts : 0),
+                            if (bs[(size_t) (pick * GS + t)].active)   // (STRATA_FAST_LANE: a lane slot's whole window)
+                                wait = slot_grow_or_end(pick * GS + t, bs[(size_t) (pick * GS + t)].p + 2 +
+                                                        (bs[(size_t) (pick * GS + t)].lane ? (int) strata::kernels::kVerifyMaxT
+                                                         : piped_mtp ? pm_drafts : 0),
                                                         stage_quiet) == 2 || wait;
                         if (wait || !group_active(pick)) continue;   // (a card to give room is busy: the group starts later)
                     }
@@ -13390,7 +13574,9 @@ int main(int argc, char** argv) {
                         bool act[MT] = {};
                         int nd[MT] = {};
                         int32_t xs[MT] = {}, dr[MT * 8] = {};
-                        int64_t ps[MT] = {}, left[MT] = {};
+                        int64_t ps[MT] = {}, left[MT] = {}, lane_left[MT] = {};
+                        const int32_t* lane_src[MT] = {};
+                        bool any_lane = false;
                         for (int t = 0; t < GS && t < MT; ++t) {
                             const BSlot& sl = bs[(size_t) (pick * GS + t)];
                             act[t] = sl.active;
@@ -13399,11 +13585,19 @@ int main(int argc, char** argv) {
                             for (int j = 0; j < 8 && j < MT; ++j) dr[t * 8 + j] = sl.draft[(size_t) j];
                             ps[t] = sl.p;
                             left[t] = sl.max_new - sl.produced;
+                            if (sl.active && sl.lane) {   // STRATA_FAST_LANE: its next prompt tokens are its rows
+                                lane_left[t] = (int64_t) sl.lane_ids.size() - sl.p;
+                                lane_src[t] = sl.lane_ids.data() + sl.p;
+                                any_lane = true;
+                            }
                         }
-                        G.lay = strata::program::batch_groups::piped_mtp_layout(
-                            pick * GS, GS, act, nd, xs, dr, ps, left,
-                            strata::program::batch_groups::piped_mtp_on(active_total(), piped_mtp_max), pm_drafts,
-                            pm_group_rows, o.max_context);
+                        const bool pm_on = strata::program::batch_groups::piped_mtp_on(active_total(), piped_mtp_max);
+                        G.lay = any_lane ? strata::program::fast_lane::layout(pick * GS, GS, act, lane_left, lane_src, nd, xs,
+                                                                              dr, ps, left, pm_on, pm_drafts, pm_group_rows,
+                                                                              o.max_context)
+                                         : strata::program::batch_groups::piped_mtp_layout(
+                                               pick * GS, GS, act, nd, xs, dr, ps, left, pm_on, pm_drafts, pm_group_rows,
+                                               o.max_context);
                         G.hbase = strata::program::batch_groups::piped_mtp_hbase(pick, pm_group_rows);
                         G.pm_t0 = Clock::now();
                         G.S = G.lay.S;
@@ -13516,8 +13710,22 @@ int main(int argc, char** argv) {
         // (RAM, written behind) or written straight from the GPU (slot_persist_wanted says when it is not needed).
         // Never while pipelined groups are in flight: the device syncs would wait on windows only this thread serves.
         // `ram`: parked in the conversation cache even without --session-dir (STRATA_ELASTIC_IDLE).  false: not saved
+        // `light` (STRATA_FAST_LANE): the slot is idle and nothing in flight writes it (pipelined groups with drafts: a
+        // window holds live slots only; their doorbells are the stages' threads'), so no drain: the save's device syncs
+        // wait only for the streams that can write it (its stages' window streams, its drafter, the copies)
+        struct LightSync {
+            std::vector<std::pair<int, cudaStream_t>> streams;   // (device, stream)
+            static cudaError_t run(void* self) {
+                int dev = 0;
+                if (cudaGetDevice(&dev) != cudaSuccess) return cudaGetLastError();
+                for (const auto& [d, st] : static_cast<LightSync*>(self)->streams)
+                    if (d == dev)
+                        if (const cudaError_t e = cudaStreamSynchronize(st); e != cudaSuccess) return e;
+                return cudaSuccess;
+            }
+        };
         auto persist_slot = [&](int b, bool from_this_slot, const std::vector<int32_t>& next, bool exiting,
-                                const char* why, bool ram = false) -> bool {
+                                const char* why, bool ram = false, bool light = false) -> bool {
             if (!(sdir || (ram && conversations.enabled())) || b < 0 || b >= (int) bs.size()) return true;
             BSlot& sl = bs[(size_t) b];
             std::vector<const std::vector<int32_t>*> others;   // the slots saved in their turn (at exit: the kept ones)
@@ -13526,8 +13734,14 @@ int main(int argc, char** argv) {
                     others.push_back(&bs[c].ids);
             if (!strata::program::slot_persist_wanted(sl.cached && !sl.active, from_this_slot, sl.ids, next, others))
                 return true;
-            std::string e = pipe_inflight() ? "pipelined groups in flight" : "";
-            for (size_t k = 0; e.empty() && k < bslot_ss.size(); ++k) {
+            std::string e = !light && pipe_inflight() ? "pipelined groups in flight" : "";
+            if (light && (sl.active || sl.reading || !piped_mtp || !stage_serving)) e = "not an idle slot beside served groups";
+            LightSync ls;
+            if (light) {
+                for (int k = 0; k < n_pipe; ++k) ls.streams.emplace_back(stage_verifier(k).device(), stage_verifier(k).stream());
+                if (batch_mtp) ls.streams.emplace_back(slot_mtp[(size_t) b]->device(), slot_mtp[(size_t) b]->stream());
+            }
+            for (size_t k = 0; e.empty() && !light && k < bslot_ss.size(); ++k) {
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (strata::core::device_sync() != cudaSuccess) e = "device sync failed";
             }
@@ -13539,10 +13753,23 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata batch: slot %d's conversation not saved (%s)\n", b, e.c_str());
                 return false;
             }
-            std::fprintf(stderr, "strata batch: saving slot %d's conversation (%zu tokens) before %s\n", b,
-                         sl.ids.size(), why);
+            std::fprintf(stderr, "strata batch: saving slot %d's conversation (%zu tokens) before %s%s\n", b,
+                         sl.ids.size(), why, light ? " (beside the groups in flight)" : "");
             static const std::vector<ImgKey> no_imgs;   // a slot with pictures is never kept
             bool ok = true;
+            struct SyncScope {   // (this thread only, for the save)
+                bool on;
+                SyncScope(bool o_, LightSync* l) : on(o_) {
+                    if (!on) return;
+                    strata::core::device_sync_override() = &LightSync::run;
+                    strata::core::device_sync_override_arg() = l;
+                }
+                ~SyncScope() {
+                    if (!on) return;
+                    strata::core::device_sync_override() = nullptr;
+                    strata::core::device_sync_override_arg() = nullptr;
+                }
+            } sync_scope(light, &ls);
             try {
                 ok = park_body(ParkFrom{sl.ids, no_imgs, sl.checks, sl.cvec, b}, 0);
             } catch (const std::bad_alloc&) {
@@ -14581,6 +14808,106 @@ int main(int argc, char** argv) {
         static std::atomic<bool> br_gate_live{false};
         static std::atomic<int> br_turn{0};   // 0 reads, 1 the stages finish their chunks, 2 the slots decode alone
         static std::atomic<int64_t> br_holds{0};
+        // STRATA_FAST_LANE: a BGEN read beside the slots (its mark taken off) with at most STRATA_FAST_LANE_MAX tokens to
+        // read goes through its group's windows (fast_lane.hpp).  Set up here, on this thread, with nothing waited for but
+        // what writes this idle slot: no drain, no queued read (slot_fit's room-making falls back instead), no device sync
+        // (its old conversation saved beside the groups in flight, persist_slot's `light`).  false: not a lane read, the
+        // line goes the queued way untouched (nothing of the slot changed).
+        auto fl_take = [&](const std::string& l) -> bool {
+            // (STRATA_STAGE_SERVE=split: the stages' threads capture windows themselves; the narrowed syncs of the save
+            // are only safe when this thread is the only one that captures on the windows' streams)
+            if (fast_lane_max <= 0 || !stage_serving || stage_split_only || hold_with_pm) return false;
+            AdmReq r;
+            if (!adm_parse(l, r) || r.slot < 0 || r.slot >= (int) bs.size() || r.img || r.bias || r.ids.empty()) return false;
+            const int b = r.slot;
+            BSlot& sl = bs[(size_t) b];
+            const int64_t n = (int64_t) r.ids.size();
+            if (sl.active || sl.reading || adm_stop_of[(size_t) b] != nullptr || adm_paused[(size_t) b] || adm_reading == b ||
+                adm_cancel[(size_t) b] || (batch_mtp && !adm_mtp_ready[(size_t) b]))
+                return false;
+            if (n + r.max_new + 8 > o.max_context) return false;   // (refused the queued way)
+            for (int64_t t : r.ids)
+                if (t < 0 || t >= n_vocab) return false;
+            const auto t0 = Clock::now();
+            auto pre = [&](const std::vector<int32_t>& p) {
+                const int64_t L = (int64_t) p.size();
+                if (L < 1 || L > n - 1) return false;
+                for (int64_t i = 0; i < L; ++i)
+                    if (p[(size_t) i] != (int32_t) r.ids[(size_t) i]) return false;
+                return true;
+            };
+            int64_t resume = 0;
+            bool from_this = false;
+            if (o.prompt_cache > 0 && !nan_flush && !sl.tainted && !sl.img && sl.cvec == cvec_cached) {
+                if (sl.cached && pre(sl.ids)) resume = (int64_t) sl.ids.size();
+                for (const ConvCheckpoint& c : sl.checks) {
+                    if (!c.imgs.empty() || !pre(c.ids)) continue;
+                    from_this = true;
+                    if ((int64_t) c.ids.size() > resume) return false;   // (a turn checkpoint to restore: the queued way)
+                }
+            }
+            if (!strata::program::fast_lane::eligible_len(n, resume, fast_lane_max)) return false;
+            if (eslots_on) {   // backed for the whole read now, or the queued way (which may make room)
+                const std::function<bool(size_t)> busy = [](size_t) { return false; };
+                if (slot_fit(b, n + 1 + strata::kernels::kVerifyMaxT, false, busy) != 0) return false;
+            }
+            std::vector<int32_t> ids(r.ids.begin(), r.ids.end());
+            if (sdir && sl.cached && !strata::program::slot_ids_continue(ids, sl.ids) && !from_this &&
+                !persist_slot(b, from_this, ids, false, "a fast-lane read takes it", false, true))
+                return false;
+            adm_queued[(size_t) b] = 0;
+            // its state from the held prefix (or zero), queued on its stages' window streams: before its first window there
+            for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                strata::core::Verifier& vk = stage_verifier((int) k);
+                strata::core::SessionState& x = *bslot_ss[k][(size_t) b];
+                if (resume == 0) {
+                    const strata::core::OnDevice on(vk.device());
+                    strata::core::session_zero(x, g, nullptr, (void*) vk.stream());
+                }
+                if (k == 0) {
+                    x.ple_prev[0] = resume >= 2 ? ids[(size_t) resume - 2] : -1;
+                    x.ple_prev[1] = resume >= 1 ? ids[(size_t) resume - 1] : -1;
+                }
+            }
+            if (batch_mtp) {   // the drafter's K/V below `resume` is what it held (stale is allowed), as the set-up thread's
+                strata::core::MtpDrafter& dr = *slot_mtp[(size_t) b];
+                const strata::core::OnDevice on(dr.device());
+                std::string e;
+                if (!dr.idle(e)) {
+                    std::printf("ERR batch MTP slot %d: %s\n", b, e.c_str());
+                    std::fflush(stdout);
+                    return false;
+                }
+                if (resume > 0) dr.kv_restore(resume);
+                dr.set_prompt_len(n);
+            }
+            if (ckpt_pool.on())
+                for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
+            sl = BSlot{};
+            strata::kernels::slot_rope_set(b, nullptr);   // text: the identity
+            sl.active = true;
+            sl.lane = true;
+            sl.lane_ids = std::move(ids);
+            sl.p = resume;
+            sl.x = sl.lane_ids[(size_t) resume];
+            sl.ids.assign(sl.lane_ids.begin(), sl.lane_ids.begin() + resume);
+            sl.max_new = r.max_new;
+            sl.t0 = Clock::now();
+            sl.cvec = cvec_cached;
+            sl.adm_log = true;
+            sl.adm_t0 = adm_queued_at[(size_t) b];
+            sl.adm_wait_ms = std::chrono::duration<double, std::milli>(t0 - sl.adm_t0).count();
+            sl.adm_tokens = n;
+            sl.adm_reused = resume;
+            sl.lane_t0 = sl.t0;
+            sl.lane_rows0 = pipe_rows;
+            sl.lane_resume = resume;
+            sl.lane_wait_ms = std::chrono::duration<double, std::milli>(sl.t0 - t0).count();
+            ver.set_slot_sampling(b, r.sp);
+            std::fprintf(stderr, "strata batch: slot %d: STRATA_FAST_LANE: %lld prompt tokens (%lld held) read through its "
+                                 "group's windows; set up in %.0f ms\n", b, (long long) n, (long long) resume, sl.lane_wait_ms);
+            return true;
+        };
         auto adm_multi_run = [&](const std::string& first, int& n_adm) -> bool {
             read_share_set(false);
             struct Block {
@@ -15085,7 +15412,7 @@ int main(int argc, char** argv) {
                     seen = in_lines.size();
                 }
                 for (const std::string& l : fresh)
-                    if (!take(l)) return false;
+                    if (!fl_take(l) && !take(l)) return false;
                 // yield at the next piece boundary: nothing more fed, the pieces stage 0 has not started taken back
                 // (they never ran), the ones in flight finish; a run that went on from held reads feeds one piece first
                 if (other && !yielding && !live.empty() && (resumed == 0 || cy_fed > 0)) {
@@ -15646,6 +15973,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (adm_direct) {   // STRATA_SLOT_ADMIT: read beside the decoding slots
+                if (fl_take(line)) continue;   // (STRATA_FAST_LANE: through its group's windows)
                 if (!adm_run(line)) return 1;
                 continue;
             }
