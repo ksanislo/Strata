@@ -368,7 +368,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, agg, 
   spark("sp-disk", h.disk_read_mb);
 
   // context memory: what every slot's conversation takes of the cards' slot budget (the engine's KMEM lines); without
-  // that (an engine that does not report it), the running request's context as before
+  // that, the slots' context in tokens, and with no slots the running request's context as before
   const sm = eng.slot_memory;
   let frac = 0, sub = "–";
   if (sm && sm.length) {
@@ -380,6 +380,17 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, agg, 
     frac = lim(hot) ? Math.min(1, use(hot) / lim(hot)) : 0;
     sub = `${gb(used)} of ${gb(total)} GB` + (sm.length > 1 ? ` · fullest GPU ${hot.device}` : "");
     $("ctx-title").textContent = "Context memory";
+  } else if ((live.slots || []).length) {
+    // slots, no memory figure yet (an engine without KMEM lines): every slot's context against all the slots' room
+    const bySlot = new Map((conv || []).filter((c) => c.slot != null).map((c) => [c.slot, c]));
+    const used = live.slots.reduce((t, x) => {
+      const c = bySlot.get(x.slot);
+      return t + (c ? (c.state === "reading" ? c.prompt_tokens || 0 : c.context_tokens || 0) : x.held_tokens || 0);
+    }, 0);
+    const room = live.slots.length * (eng.max_context || 0);
+    frac = room ? Math.min(1, used / room) : 0;
+    sub = room ? `${kfmt(used)} / ${ctxfmt(room)} in ${live.slots.length} slots` : "–";
+    $("ctx-title").textContent = "Context in slots";
   } else {
     const ctx = eng.max_context || 0;
     let used = 0;
