@@ -5969,6 +5969,13 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
 #else
     const bool deferred = false;
 #endif
+    // STRATA_NUMA_PLACE: each layer's bytes on the node of the card that runs it, bound before the registration
+    // faults them in (an anonymous arena only: a shared arena file has one placement for every process)
+    numa_note_.clear();
+    const bool numa = !numa_nodes_.empty() && shared_arena_file.empty() && (int64_t) numa_nodes_.size() == n_layers;
+    if (numa)
+        pinned_arena_numa_plan(strata::platform::numa_spans(padded_ ? pad_.dst_off : loff, numa_nodes_,
+                                                            (padded_ ? arena_bytes : want) + (uint64_t) blob, 2ull << 20));
     // STRATA_PARALLEL_LOAD: the GGUF's experts read by threads on each layer's node; by default into the unregistered
     // arena (the readers fault the pages in, in parallel), registered after (cudaHostRegister faults on one thread)
     const bool par = parallel_load_mode() == 1 && from_gguf && !by_need && !deferred && shared_arena_file.empty() &&
@@ -6050,6 +6057,26 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         delete a;
         err = "ArenaExpertSource: the load read " + std::to_string(st.bytes) + " B of " + std::to_string(want);
         return false;
+    }
+    if (numa) {
+        // read back where the pages are (one sample per 2 MiB) per span of layers on one node
+        const uint64_t total = (padded_ ? arena_bytes : want) + (uint64_t) blob;
+        const auto spans = strata::platform::numa_spans(padded_ ? pad_.dst_off : loff, numa_nodes_, total, 2ull << 20);
+        for (const auto& sp : spans) {
+            const auto got = strata::platform::numa_resident_by_node(a->data() + sp.off, sp.len, 2ull << 20);
+            char buf[160];
+            std::snprintf(buf, sizeof buf, "%s%.1f GiB for node %d:", numa_note_.empty() ? "" : "; ",
+                          (double) sp.len / 1073741824.0, sp.node);
+            numa_note_ += buf;
+            for (size_t i = 0; i < got.size(); ++i) {
+                if (got[i] == 0) continue;
+                if (i + 1 == got.size())
+                    std::snprintf(buf, sizeof buf, " %.1f GiB not resident", (double) got[i] / 1073741824.0);
+                else
+                    std::snprintf(buf, sizeof buf, " %.1f GiB on node %zu", (double) got[i] / 1073741824.0, i);
+                numa_note_ += buf;
+            }
+        }
     }
     if (std::getenv("STRATA_VERIFY_ARENA") != nullptr) {   // tests: the loaded arena's checksum, any loader
         std::fprintf(stderr, "strata generate: expert arena checksum %016llx (%.2f GiB)\n",
