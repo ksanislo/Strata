@@ -17,7 +17,6 @@
 #include "strata/core/weights.hpp"
 
 #include <deque>
-#include <mutex>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -76,9 +75,6 @@ struct PromptJob {
     int64_t taken = 0;   ///< tokens the worker gave stage 0 so far (a prompt a batch sliced stays queued for the rest)
     bool whole = false;  ///< read in one chunk (at most the buffers' tokens), as a batch reads its segments
     bool urgent = false; ///< STRATA_BATCH_READS_FAST: a short read's piece (the whole read fits FAST): the next chunk takes it
-    bool lead = false;   ///< its read's first piece: nothing of its sessions is in flight before it
-    bool overtake = false;   ///< STRATA_BATCH_READS_OVERTAKE: a chunk of lead urgent pieces only, which may pass chunks
-                             ///< waiting at a stage's hand-off (it shares no session with them)
 
     bool failed() const { return failed_.load(); }
     bool done() const { return done_.load(); }
@@ -252,7 +248,6 @@ public:
         std::vector<size_t> at;
         std::vector<int64_t> got;
         bool fast = false;   ///< a latency chunk: urgent reads whole, the others at most `share` each (may be one prompt)
-        bool overtake = false;   ///< (STRATA_BATCH_READS_OVERTAKE) the lead urgent reads only, nothing of the others
     };
     /// STRATA_BATCH_READS_FAST=<tokens> (512; 0 off): an urgent piece of at most that many tokens goes in the next chunk
     /// whole, ahead of everything not started; each other reader gets STRATA_BATCH_READS_FAST_SHARE (128) at most, the
@@ -261,11 +256,7 @@ public:
     /// (set_urgent_wait), the chunks are at most that many tokens, a lone reader's piece sliced too.
     struct BatchFast {
         int64_t tokens = 0, share = 128, chunk = 0, shrink = 0;
-        bool overtake = false;   ///< STRATA_BATCH_READS_OVERTAKE=1
     };
-    /// STRATA_BATCH_READS_OVERTAKE: each stage's own pinned hand-off buffer for overtaking chunks of up to `rows` tokens
-    /// (this stage and the later ones). Call before any read (an allocation takes the driver's lock).
-    bool reserve_overtake(int64_t rows);
     void set_urgent_wait(bool on) { urgent_wait_.store(on, std::memory_order_release); }
     /// Each stage before each queued chunk but one with an urgent read (stage 0: the queue's worker; a later stage: its
     /// hand-off thread), with nothing of the prompt path held: may wait (the decode share,
@@ -297,10 +288,6 @@ public:
     /// earlier stage is a chunk or more ahead of the last one by the time `on_chunk` runs, so this is where a
     /// mid-prompt checkpoint takes each stage's part.  Runs on that stage's thread, with its device current.
     std::function<bool(int64_t done, std::string& err)> on_stage_chunk;
-    /// STRATA_READ_INTERLEAVE_LAYERS: a queued prompt's (PromptJob) read calls this on its stage's thread before every
-    /// `layer_gap_every`-th layer of a chunk but the first, with its stream (cudaStream_t); it may wait, never compute.
-    std::function<void(int64_t layer, void* stream)> on_layer_gap;
-    int layer_gap_every = 0;
 
     /// Checked before every chunk: true stops the prompt early (`run` returns false with err "cancelled").
     std::function<bool()> should_stop;
@@ -379,7 +366,7 @@ private:
                   const std::shared_ptr<PromptJob>& job = nullptr, size_t depth = 0, bool job_last = false);
     struct JobQueue;
     std::unique_ptr<JobQueue> jobs_;
-    std::shared_ptr<PromptJob> take_batch(std::deque<std::shared_ptr<PromptJob>>& q, bool overtake_only = false);
+    std::shared_ptr<PromptJob> take_batch(std::deque<std::shared_ptr<PromptJob>>& q);
     std::atomic<bool> urgent_wait_{false};
     bool drain_pipeline(std::string& err);
 
@@ -403,30 +390,6 @@ private:
     std::string next_err_;
     std::future<bool> next_run_;
     int hand_buf_ = 0;
-
-    // STRATA_BATCH_READS_OVERTAKE: an overtaking chunk handed to this stage while it reads another one waits in `ubox_`
-    // (only while `ubox_open_`: this stage's run of a queued prompt is under way); the stage runs it at its next
-    // hand-off wait or before its run returns.  Each stage hands its own overtaking chunk through `hand_urg_`.
-    struct UrgentEntry {
-        std::shared_ptr<PromptJob> job;
-        const int64_t* tokens = nullptr;
-        int64_t T = 0, p0 = 0;
-        size_t depth = 0;
-        const float* h = nullptr;
-        std::atomic<bool>* src_busy = nullptr;   ///< the sender's hand_urg_ in use until this entry ran
-    };
-    std::mutex ubox_mu_;
-    std::deque<UrgentEntry> ubox_;
-    bool ubox_open_ = false;
-    float* hand_urg_ = nullptr;
-    int64_t hand_urg_rows_ = 0;
-    std::atomic<bool> hand_urg_busy_{false};
-    bool nested_ = false;
-    bool ot_ready_ = false;   ///< reserve_overtake gave every stage its buffer
-    bool run_urgent(const UrgentEntry& e, bool nested);            // one entry, on this stage (members saved)
-    bool overtake_here(bool can_nest);                             // at a hand-off wait: an overtaking chunk to run
-    void ubox_close(bool run);                                     // the run ends: run (or fail) what waits
-    std::shared_ptr<PromptJob> take_overtake();                    // stage 0: the queue's overtaking chunk, if any
 
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     void release();                          // the destructor's cleanup (also `reset`'s)

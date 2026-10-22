@@ -2,6 +2,7 @@
 #include "strata/core/capture_lock.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "strata/prefill/warm_policy.hpp"
 #include <atomic>
 #if defined(__cpp_lib_atomic_wait)
 #define STRATA_ATOMIC_WAIT 1   // #1488: std::atomic::wait / notify_all are a GCC 11 library feature; GCC 10 spins instead
@@ -420,6 +421,7 @@ struct HandWorker {
     std::thread th;
     HandWorker() {
         th = std::thread([this] {
+            strata::platform::name_this_thread("strata-hand");
             strata::aux_cpus::pin_current_thread();
             for (;;) {
                 std::packaged_task<bool()> job;
@@ -504,7 +506,16 @@ inline bool cvec_fuse() {
 inline bool pf_pad() {
     static const bool v = [] {
         const char* p = std::getenv("STRATA_PF_PAD"); const char* g = std::getenv("STRATA_PF_GEMM");
-        return p && p[0] == '1' && g && g[0] == '1';
+        if (!(p && p[0] == '1' && g && g[0] == '1')) return false;
+        // The padded stride pays only for strata_pf_gemm_f16_ld, which is built for the gfx11 matrix cores.  On another
+        // card nothing takes a padded X (it used to end the engine: "a padded X ... needs STRATA_PF_PAD's path", #1237):
+        // do not pad, and say so once.
+        if (!strata_pf_padded_gemm_available()) {
+            std::fprintf(stderr, "prefill gemm: STRATA_PF_PAD needs the padded gfx11 product, which this card does not run; "
+                                 "not padding\n");
+            return false;
+        }
+        return true;
     }();
     return v;
 }
@@ -606,6 +617,7 @@ struct Stager {
             threads.emplace_back([this] {
                 // --aux-cpus: the copy threads go to the spare CPUs with the other helpers; STRATA_AUX_STAGER=0 leaves them where
                 // they were created (a small spare set would then hold all of them: it limits the copy rate of a long read)
+                strata::platform::name_this_thread("strata-stage");
                 static const bool keep = [] { const char* v = std::getenv("STRATA_AUX_STAGER"); return v != nullptr && std::atoi(v) == 0; }();
                 if (keep) strata::aux_cpus::note_owned_thread();
                 else strata::aux_cpus::pin_current_thread();
@@ -1087,10 +1099,7 @@ struct Prefill::JobQueue {
 };
 
 Prefill::Prefill() : impl_(new Impl) {}
-Prefill::~Prefill() {
-    release();
-    if (hand_urg_ != nullptr) cudaFreeHost(hand_urg_);   // (kept over reset: reserved once, before any read)
-}
+Prefill::~Prefill() { release(); }
 
 void Prefill::reset() {
     release();
@@ -1373,6 +1382,24 @@ void warm_gemm_libraries(int device) {
     static const bool off = [] { const char* e = std::getenv("STRATA_PREFILL_WARM"); return e != nullptr && e[0] == '0'; }();
     if (off) return;
 #if defined(STRATA_USE_HIP)
+    // #3204: not when the process sees cards of more than one architecture (gfx1151 + gfx1201: prompts -25%); see
+    // warm_policy.hpp.  STRATA_PREFILL_WARM=1 asks for it anyway.
+    static const bool arch_ok = [] {
+        std::vector<std::string> archs;
+        int n = 0;
+        if (cudaGetDeviceCount(&n) != cudaSuccess) { (void) cudaGetLastError(); return true; }
+        for (int i = 0; i < n && i < 32; ++i) {
+            cudaDeviceProp p{};
+            if (cudaGetDeviceProperties(&p, i) == cudaSuccess) archs.emplace_back(p.gcnArchName);
+            else (void) cudaGetLastError();
+        }
+        const bool wanted = warm_gemm_wanted(archs, std::getenv("STRATA_PREFILL_WARM"));
+        if (!wanted)
+            std::fprintf(stderr, "strata prefill: no hipBLAS warm-up: the cards are of more than one architecture "
+                                 "(it slows prompts there, #3204); the first prompt loads the libraries (STRATA_PREFILL_WARM=1 asks for it)\n");
+        return wanted;
+    }();
+    if (!arch_ok) return;
     static std::mutex mu;
     static unsigned done_mask = 0;   // per device: each card loads its own code objects
     if (device < 0 || device >= 32) return;
@@ -2706,19 +2733,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             return false;
         }
     }
-    // STRATA_BATCH_READS_OVERTAKE: while this later stage reads a queued prompt, an overtaking chunk may be handed in
-    // beside it (ubox_); what waits there when the run ends runs then (or fails with it)
-    static const bool overtake_on = batch_fast().overtake;
-    struct UboxScope {
-        Prefill* p = nullptr;
-        bool ok = false;
-        ~UboxScope() { if (p) p->ubox_close(ok); }
-    } ubox_scope;
-    if (overtake_on && job && hand_in_ != nullptr && !nested_ && ot_ready_) {
-        std::lock_guard<std::mutex> lk(ubox_mu_);
-        ubox_open_ = true;
-        ubox_scope.p = this;
-    }
     static const std::function<bool(int64_t, std::string&)> no_stage_cb;
     const auto& stage_cb = !job ? on_stage_chunk : depth < job->on_stage_chunk.size() ? job->on_stage_chunk[depth] : no_stage_cb;
     const auto& chunk_cb = job ? job->on_chunk : on_chunk;
@@ -3197,6 +3211,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         const bool threaded_issue = stream_all && issuer_on;
         if (threaded_issue) {
             issuer = std::thread([&] {
+                strata::platform::name_this_thread("strata-issue");
                 strata::aux_cpus::pin_current_thread();
                 const core::OnDevice od(m.device);
                 for (size_t idx = 0; idx < seq.size(); ++idx) {
@@ -3261,9 +3276,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         };
         for (int64_t l = LB; l < LE; ++l) {
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
-            // STRATA_READ_INTERLEAVE_LAYERS: the slots' windows on this card may run between layer blocks of a read
-            if (job && on_layer_gap && layer_gap_every > 0 && l > LB && (l - LB) % layer_gap_every == 0)
-                on_layer_gap(l, (void*) cs);
             if (l > LB) pf_step("reading the prompt (batched, step sync): the experts and the rest of layer", l - 1);
             core::progress_at("reading the prompt (batched): layer", l, p0);   // #251: a stall names layer and chunk
             const core::LayerView v(*m.wt, l);
@@ -5068,57 +5080,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         stats_.tokens += T;
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         pt.mark(kPfStart, cs);
-        // STRATA_BATCH_READS_OVERTAKE: an overtaking chunk leaves through this stage's own buffer, into the next stage's
-        // ubox_ when that stage is busy reading (it runs there at its next hand-off wait, ahead of what this stage
-        // holds), else as the next step; it never waits for a chunk it passes and never toggles hand_buf_
-        if (next_ != nullptr && job && job->overtake && ot_ready_ && T <= hand_urg_rows_) {
-            while (hand_urg_busy_.load(std::memory_order_acquire))   // (the last one still waits downstream: it moves on)
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
-            if (cudaMemcpyAsync(hand_urg_, m.R, (size_t) T * D * 4, cudaMemcpyDefault, m.cs) != cudaSuccess ||
-                cudaStreamSynchronize(m.cs) != cudaSuccess) {
-                err = std::string("prefill: the overtaking hand-off: ") + cudaGetErrorString(cudaGetLastError());
-                return false;
-            }
-            if (stage_cb && !stage_cb(p0 + T, err)) return false;
-            if (bat) seg_report(false);
-            job_busy_.store(false, std::memory_order_release);
-            UrgentEntry e;
-            e.job = job;
-            e.tokens = tokens + c0;
-            e.T = T;
-            e.p0 = p0;
-            e.depth = depth + 1;
-            e.h = hand_urg_;
-            e.src_busy = &hand_urg_busy_;
-            bool pushed = false;
-            if (next_run_.valid() && next_run_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
-                std::lock_guard<std::mutex> lk(next_->ubox_mu_);
-                if (next_->ubox_open_) {
-                    hand_urg_busy_.store(true, std::memory_order_release);
-                    next_->ubox_.push_back(e);
-                    pushed = true;
-                }
-            }
-            if (!pushed) {   // the next stage is idle (or not taking): the next step, as usual, from this buffer
-                if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
-                next_err_.clear();
-                hand_urg_busy_.store(true, std::memory_order_release);
-                Prefill* nx = next_;
-                std::atomic<bool>* busy = &hand_urg_busy_;
-                auto ustep = [nx, e, busy]() -> bool {
-                    const bool r = nx->run_urgent(e, false);
-                    busy->store(false, std::memory_order_release);
-                    return r;
-                };
-                if (!m.hand_worker) m.hand_worker = std::make_unique<HandWorker>();
-                next_run_ = m.hand_worker->submit(std::packaged_task<bool()>([ustep] {
-                    const bool r = ustep();
-                    (void) cudaGetLastError();
-                    return r;
-                }));
-            }
-            continue;
-        }
         if (next_ != nullptr) {
             // The current hand-off slot was used two chunks ago.
             const bool peer = m.hand_peer[hand_buf_] != nullptr;
@@ -5151,12 +5112,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (stage_cb && !stage_cb(p0 + T, err)) return false;
             if (bat) seg_report(false);
             job_busy_.store(false, std::memory_order_release);   // (this card's part of the chunk is done)
-            // STRATA_BATCH_READS_OVERTAKE: while this chunk waits for the next stage, an overtaking chunk for this stage
-            // runs (this card is done with this one; its rows wait in hand[hand_buf_], the other's use hand_urg_)
-            if (overtake_on && job && !nested_ && ot_ready_)
-                while (next_run_.valid() && next_run_.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
-                    if (!overtake_here(!ple_next.valid()))
-                        std::this_thread::sleep_for(std::chrono::microseconds(200));
             if (next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
             next_err_.clear();
             next_->hand_in_ = h;
@@ -5378,7 +5333,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (sg.last) sg.job->finish(true, std::string());
         job->finish(true, std::string());
     }
-    ubox_scope.ok = true;
     return true;
 }
 
@@ -5537,7 +5491,6 @@ Prefill::BatchFast Prefill::batch_fast() {
         x.share = num("STRATA_BATCH_READS_FAST_SHARE", 128);
         x.chunk = num("STRATA_BATCH_READS_FAST_CHUNK", 0);
         x.shrink = num("STRATA_BATCH_READS_FAST_SHRINK", 512);
-        x.overtake = x.tokens > 0 && num("STRATA_BATCH_READS_OVERTAKE", 0) != 0;
         return x;
     }();
     return f;
@@ -5564,26 +5517,6 @@ Prefill::BatchPlan Prefill::plan_batch(const std::deque<std::shared_ptr<PromptJo
     auto left_of = [&](size_t i) { return (int64_t) q[i]->tokens.size() - q[i]->taken; };
     // STRATA_BATCH_READS_FAST: a short read waiting for its first tokens goes in the next chunk, whole, wherever it
     // is queued; the other readers get a small share each so the chunk stays short (below the stream-all size)
-    if (fast.tokens > 0 && fast.overtake) {   // the lead urgent reads alone: such a chunk may pass others
-        std::vector<size_t> lead;
-        for (size_t i : cand)
-            if (q[i]->urgent && q[i]->lead && q[i]->taken == 0 && left_of(i) <= fast.tokens && (int) lead.size() < max_segs)
-                lead.push_back(i);
-        if (!lead.empty()) {
-            std::vector<int64_t> ll;
-            for (size_t i : lead) ll.push_back(left_of(i));
-            const std::vector<int64_t> lg = batch_shares(ll, budget);
-            for (size_t k = 0; k < lead.size(); ++k)
-                if (lg[k] == ll[k]) {   // (whole: a sliced one could not pass its own rest)
-                    p.at.push_back(lead[k]);
-                    p.got.push_back(lg[k]);
-                }
-            if (!p.at.empty()) {
-                p.fast = p.overtake = true;
-                return p;
-            }
-        }
-    }
     if (fast.tokens > 0) {
         std::vector<size_t> urg, oth;
         for (size_t i : cand) {
@@ -5626,17 +5559,15 @@ Prefill::BatchPlan Prefill::plan_batch(const std::deque<std::shared_ptr<PromptJo
 
 // (queue lock held) STRATA_BATCH_READS: the first queued prompt of up to batch_reads_max() sessions, in queue order, as
 // one chunk of at most the buffers' tokens; null when fewer than two can go (the front one is read the usual way)
-std::shared_ptr<PromptJob> Prefill::take_batch(std::deque<std::shared_ptr<PromptJob>>& q, bool overtake_only) {
+std::shared_ptr<PromptJob> Prefill::take_batch(std::deque<std::shared_ptr<PromptJob>>& q) {
     const BatchFast fast = batch_fast();
     const int64_t fast_cap = fast.chunk > 0 ? fast.chunk : std::max<int64_t>(fast.tokens, stream_all_min() - 1);
     // a short read admitted but not queued yet (its set-up runs): the chunks before it stay short, so the stages ahead
     // of it drain sooner (STRATA_BATCH_READS_FAST_SHRINK)
     const bool shrink = fast.tokens > 0 && fast.shrink > 0 && urgent_wait_.load(std::memory_order_acquire);
     const int64_t budget = shrink ? std::min(batch_budget(), fast.shrink) : batch_budget();
-    // (an overtaking chunk run beside a waiting one must fit this stage's own hand-off buffer)
-    const BatchPlan pl = plan_batch(q, batch_reads_max(), overtake_only ? std::min(budget, hand_urg_rows_) : budget, fast,
-                                    fast_cap, shrink);
-    if (pl.at.empty() || (overtake_only && !pl.overtake)) return nullptr;
+    const BatchPlan pl = plan_batch(q, batch_reads_max(), budget, fast, fast_cap, shrink);
+    if (pl.at.empty()) return nullptr;
     auto b = std::make_shared<PromptJob>();
     std::vector<size_t> gone;
     for (size_t k = 0; k < pl.at.size(); ++k) {
@@ -5664,8 +5595,7 @@ std::shared_ptr<PromptJob> Prefill::take_batch(std::deque<std::shared_ptr<Prompt
         urgent_in = urgent_in || sg.job->urgent;
     }
     std::fprintf(stderr, "strata prefill: STRATA_BATCH_READS: one %schunk of %zu prompts (%s tokens)\n",
-                 pl.overtake ? "overtaking " : urgent_in ? "fast " : shrink ? "short " : "", b->segs.size(), parts.c_str());
-    b->overtake = pl.overtake;
+                 urgent_in ? "fast " : shrink ? "short " : "", b->segs.size(), parts.c_str());
     // a stage that fails the chunk fails every prompt in it; each prompt's own end is reported by the last stage
     b->on_done = [segs = b->segs](bool ok, const std::string& e) {
         if (ok) return;
@@ -5686,112 +5616,6 @@ bool Prefill::batchable(const PromptJob& j) {
         return e != nullptr && std::atoi(e) != 0;
     }();
     return !kv_prefetch;
-}
-
-bool Prefill::reserve_overtake(int64_t rows) {
-    bool ok = true;
-    for (Prefill* p = this; p != nullptr; p = p->next_) p->ot_ready_ = false;
-    for (Prefill* p = this; p != nullptr && p->next_ != nullptr; p = p->next_) {
-        if (p->hand_urg_ != nullptr && p->hand_urg_rows_ >= rows) continue;
-        if (p->hand_urg_ != nullptr) cudaFreeHost(p->hand_urg_);
-        p->hand_urg_ = nullptr;
-        p->hand_urg_rows_ = 0;
-        void* h = nullptr;
-        if (cudaHostAlloc(&h, (size_t) rows * D * 4, cudaHostAllocPortable) != cudaSuccess) {
-            (void) cudaGetLastError();
-            ok = false;
-            continue;
-        }
-        p->hand_urg_ = (float*) h;
-        p->hand_urg_rows_ = rows;
-    }
-    for (Prefill* p = this; ok && p != nullptr; p = p->next_) p->ot_ready_ = true;   // (all or none)
-    return ok;
-}
-
-// STRATA_BATCH_READS_OVERTAKE: one overtaking chunk on this stage, from the stage before's own buffer; `nested`: inside
-// a run of this stage that waits at its hand-off or ends (its members are put back after)
-bool Prefill::run_urgent(const UrgentEntry& e, bool nested) {
-    const float* in = hand_in_;
-    const bool in_peer = hand_in_peer_, single = single_chunk_, piped = pipe_chunked_, was_nested = nested_;
-    const void* ev = hand_ev_;
-    const int pieces = hand_pieces_;
-    const int64_t stopped = stopped_at_;
-    hand_in_ = e.h;
-    hand_in_peer_ = false;
-    hand_ev_ = nullptr;
-    hand_pieces_ = 0;
-    single_chunk_ = true;
-    pipe_chunked_ = false;
-    nested_ = nested;
-    std::string err;
-    const bool r = run_impl(e.tokens, e.T, e.p0, err, e.job, e.depth, true);
-    hand_in_ = in;
-    hand_in_peer_ = in_peer;
-    hand_ev_ = ev;
-    hand_pieces_ = pieces;
-    single_chunk_ = single;
-    pipe_chunked_ = piped;
-    stopped_at_ = stopped;
-    nested_ = was_nested;
-    if (!r) e.job->finish(false, err.empty() ? std::string("prefill: an overtaking chunk failed") : err);
-    (void) cudaGetLastError();
-    return true;   // (a prompt's error ends that prompt only)
-}
-
-std::shared_ptr<PromptJob> Prefill::take_overtake() {
-    if (!jobs_) return nullptr;
-    std::lock_guard<std::mutex> lk(jobs_->mu);
-    return take_batch(jobs_->q, true);
-}
-
-// a run of this stage waits at its hand-off: an overtaking chunk for this stage runs now (stage 0: from the queue, when
-// the waiting run has no PLE rows of a next chunk in flight; a later stage: what the stage before handed in)
-bool Prefill::overtake_here(bool can_nest) {
-    if (hand_in_ == nullptr) {
-        if (!can_nest) return false;
-        std::shared_ptr<PromptJob> b = take_overtake();
-        if (!b) return false;
-        const int64_t stopped = stopped_at_;
-        const bool was_nested = nested_;
-        nested_ = true;
-        std::string err;
-        const bool r = run_impl(b->tokens.data(), (int64_t) b->tokens.size(), b->pos0, err, b, 0, true);
-        nested_ = was_nested;
-        stopped_at_ = stopped;
-        if (!r) b->finish(false, err.empty() ? std::string("prefill: an overtaking chunk failed") : err);
-        (void) cudaGetLastError();
-        return true;
-    }
-    UrgentEntry e;
-    {
-        std::lock_guard<std::mutex> lk(ubox_mu_);
-        if (ubox_.empty()) return false;
-        e = ubox_.front();
-        ubox_.pop_front();
-    }
-    run_urgent(e, true);
-    e.src_busy->store(false, std::memory_order_release);
-    return true;
-}
-
-// this stage's run of a queued prompt ends: what was handed into ubox_ runs now (`run`), or fails with the run
-void Prefill::ubox_close(bool run) {
-    for (;;) {
-        UrgentEntry e;
-        {
-            std::lock_guard<std::mutex> lk(ubox_mu_);
-            if (ubox_.empty()) {
-                ubox_open_ = false;
-                return;
-            }
-            e = ubox_.front();
-            ubox_.pop_front();
-        }
-        if (run) run_urgent(e, true);
-        else e.job->finish(false, "prefill: a stage's read failed while an overtaking chunk waited on it");
-        e.src_busy->store(false, std::memory_order_release);
-    }
 }
 
 std::vector<std::shared_ptr<PromptJob>> Prefill::withdraw(const std::function<bool(const PromptJob&)>& pred) {

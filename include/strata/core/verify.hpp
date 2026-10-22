@@ -253,9 +253,6 @@ public:
     /// The group at `hbase` can be launched here without waiting: its last deferred commit has run.
     bool batch_launch_ready(int hbase);
     bool batch_busy() const { return b_running_.load(std::memory_order_acquire); }
-    /// Batch windows launched here so far, and when a layer of one was last launched or served (any thread may read).
-    int64_t batch_launches() const { return b_launches_.load(std::memory_order_acquire); }
-    std::chrono::steady_clock::time_point batch_last_activity() const { return last_ring(); }
     /// Serves the layers of this stage's window that have rung (the CPU pool and the flags), with no CUDA call: 1 once
     /// every layer is served (or the window raises no host doorbells), 0 while one is still to ring.  batch_poll
     /// calls it, unless set_external_serve(true) moved it to a thread of its own (STRATA_PIPED_CONCURRENT: a CUDA
@@ -423,7 +420,6 @@ private:
     // batch_launch / batch_poll (with external serving, batch_serve runs on another thread: running and the served
     // layer count are atomics, set by batch_launch before running)
     std::atomic<bool> b_running_{false};
-    std::atomic<int64_t> b_launches_{0};
     std::atomic<int64_t> b_k_{0};
     int64_t b_steps_ = 0;
     std::atomic<bool> ext_serve_{false};
@@ -610,6 +606,7 @@ private:
     cudaEvent_t df_join_[2] = {};
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t exec_nr_[9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
+    bool launched_[9] = {}, launched_nr_[9] = {};   ///< this graph has been launched once (early_ple_flag: a cold first launch raises the PLE flag first)
     // fork 34a35db (STRATA_SIDE_MIXER=1): the GDN gates and the QSA indexer on a branch of the window's graph beside the
     // mixer's projections, joined before the recurrence / the attention
     cudaStream_t side_ = nullptr;

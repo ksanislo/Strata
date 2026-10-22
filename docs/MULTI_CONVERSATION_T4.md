@@ -36,13 +36,15 @@ Args added to the usual ones: `--conversation-cache-mib 16384 --conversation-cac
   "STRATA_BATCH_READS_FAST": "512",
   "STRATA_BATCH_READS_FAST_SHRINK": "512",
   "STRATA_BATCH_READS_DECODE_WINDOWS": "0",
-  "STRATA_BATCH_READS_OVERTAKE": "0",
   "STRATA_FAST_LANE": "1",
-  "STRATA_FAST_LANE_MAX": "96"
+  "STRATA_FAST_LANE_MAX": "96",
+  "STRATA_NUMA_POOL": "0"
 }
 ```
 
-This box also needs `STRATA_NO_LARGEPAGES=1` (no large pages configured).
+This box also needs `STRATA_NO_LARGEPAGES=1` (no large pages configured). `STRATA_NUMA_POOL=0` keeps upstream
+0.2.2's automatic two-socket split off the engine's main pool: with STRATA_STAGE_SERVE every stage already has a pool on
+its card's node, and the measurements below were taken that way.
 
 Turing (sm_75) only, exact or within rounding: `STRATA_SM75_PERF=1 STRATA_SM75_STACK=1 STRATA_KQL=3
 STRATA_SM75_Q8G=1 STRATA_GDN_KEYHEAD=1 STRATA_ARGMAX_ROWS_SM70=1 STRATA_BF16_TC=1
@@ -74,8 +76,6 @@ Soak: 6 coding agents + a chat every 45 s, 22 min: 0 failures, 0 stalls, 0 engin
 
 ## Known limits
 
-- `STRATA_PARK_STAGING_MIB` is unfinished and off by default: in its first test a staged copy differed from its
-  source. Leave it unset.
 - Fast-lane first-token logits differ from the prompt path's by more than chunk-size rounding (decode kernels vs
   prompt kernels); answers were coherent in every check.
 - A browser over HTTP/1.1 opens at most 6 connections to one host: a reverse proxy in front should speak HTTP/2,

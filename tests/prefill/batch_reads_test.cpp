@@ -135,28 +135,6 @@ int main() {
         const Prefill::BatchPlan s2 = Prefill::plan_batch(two, 8, 512, f, 1023, true);
         expect(!s2.fast && s2.got == v({256, 256}), "shrink: two readers share 512");
     }
-    {   // STRATA_BATCH_READS_OVERTAKE: the lead urgent reads alone (whole), nothing of the others; a later piece of a
-        // short read (not its lead) rides a usual fast chunk
-        Prefill::BatchFast f;
-        f.tokens = 512;
-        f.share = 128;
-        f.overtake = true;
-        std::deque<std::shared_ptr<PromptJob>> q;
-        q.push_back(job(&sa, 2048, 500));
-        q.push_back(job(&sb, 46));
-        q.back()->urgent = q.back()->lead = true;
-        q.push_back(job(&sc, 2048));
-        q.push_back(job(&sd, 300));
-        q.back()->urgent = q.back()->lead = true;
-        const Prefill::BatchPlan p = Prefill::plan_batch(q, 8, 2048, f, 1023);
-        expect(p.overtake && p.at == std::vector<size_t>({1, 3}) && p.got == v({46, 300}), "overtake: the leads only");
-        const Prefill::BatchPlan p2 = Prefill::plan_batch(q, 8, 200, f, 1023);
-        expect(p2.overtake && p2.at == std::vector<size_t>({1}) && p2.got == v({46}), "overtake: only whole leads");
-        q[1]->lead = false;
-        q[3]->lead = false;
-        const Prefill::BatchPlan p3 = Prefill::plan_batch(q, 8, 2048, f, 1023);
-        expect(!p3.overtake && p3.fast, "no lead: the usual fast chunk");
-    }
     if (fails == 0) std::printf("batch_reads_test: ok\n");
     return fails == 0 ? 0 : 1;
 }
