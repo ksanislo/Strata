@@ -1,7 +1,9 @@
 // On-disk persistence of a conversation's state (SavedConversation): one file holding the running state, the
 // checkpoints the caller passes (the engine passes only the deepest one), every QSA layer's authoritative K/V and
 // the draft layer's K/V.  Pure host code: no CUDA.  Format v1 and the fail-closed read order are in
-// docs/DETAILS.md (Session files).
+// docs/DETAILS.md (Session files).  Format v2 (a layer split) is v1's payload for the first stage followed by a stage
+// count and each later stage's payload in the same encoding (SavedConversation::stage_images); a single-stage image is
+// still written as v1.
 //
 // Format v1 is little-endian, with fixed-width integers and IEEE-754 floats; a big-endian build is refused at
 // compile time.  The hashes detect accidental corruption; they do not authenticate a file: restore trusted files only.
@@ -146,6 +148,9 @@ struct SessionWriteOptions {
     // write starts.  Not a reservation: other writers can take the space afterwards.
     uint64_t min_free_bytes = 0;
     bool durable = true;            // flush the file before the rename and (POSIX) the folder after it
+    // write only the deepest checkpoint (by token count) of the image, and the same one of every stage image; none
+    // when the stages' checkpoint lists do not line up.  A parked image holds its whole chain; a file needs one.
+    bool deepest_checkpoint_only = false;
     SessionProgress progress;
     // "flush" (the file's flush, `bytes` = the file) and "publish" (rename and folder flush), before each starts
     SessionPhase phase;
@@ -178,6 +183,12 @@ struct SessionKvSource {
 bool session_file_write(const std::string& path, const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
                         const SessionFileIdentity& id, size_t& bytes, std::string& error,
                         const SessionWriteOptions& options = {}, SessionStatus* status = nullptr);
+// Layer split (format v2): `meta.stage_images` holds the later stages' images (K/V empty, each with its share of the
+// checkpoints, NOT checkpoint stage_parts), `stage_kv[k]` the sources of stage k + 1 (one list per stage image).
+bool session_file_write(const std::string& path, const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
+                        const std::vector<std::vector<SessionKvSource>>& stage_kv, const SessionFileIdentity& id,
+                        size_t& bytes, std::string& error, const SessionWriteOptions& options = {},
+                        SessionStatus* status = nullptr);
 
 // The checkpoints worth a disk write: the deepest one (the next turn's resume point when the live tail was
 // rewritten).  Earlier checkpoints only serve edits further back and cost ~118 MB each at this geometry.
@@ -222,6 +233,10 @@ struct SessionReadLimits {
     // parse holds at its peak (session_read_peak_bytes); false refuses the file.  Not a reservation.
     std::function<bool(uint64_t need_bytes, std::string& why)> admit;
     SessionProgress progress;
+    // Layer split: the bounds of each later stage's image, in stage order (their admit / progress are not used).
+    // Empty: the runtime has one stage and only a single-stage file (v1) is accepted; otherwise only a v2 file with
+    // exactly this many later stages, each checked against its own bounds.
+    std::vector<SessionReadLimits> stages;
 };
 // The largest file these limits admit (UINT64_MAX when one of them is open); session_file_read applies it.
 uint64_t session_read_max_file_bytes(const SessionReadLimits& limits);
@@ -234,6 +249,26 @@ uint64_t session_read_peak_bytes(uint64_t file_bytes);
 bool session_file_read(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
                        size_t& bytes, std::string& error, const SessionReadLimits& limits = {},
                        SessionStatus* status = nullptr);
+
+// The same checks as session_file_read, through a read-only mapping of the file: the small arrays are copied, every
+// K/V buffer is a VIEW into the mapping (ConversationBuffer::view) - the bulk of a file never becomes this process's
+// RAM, only the OS file cache's, which it can give back.  The checksum pass reads every page before the image is
+// returned, as the copying read does.  For machines whose RAM cannot hold a conversation twice.  Off Linux it is
+// session_file_read.  `limits.admit` is asked for the copied part only (the file minus its K/V).
+bool session_file_map(const std::string& path, const SessionFileIdentity& id, SavedConversation& image, size_t& bytes,
+                      std::string& error, const SessionReadLimits& limits = {}, SessionStatus* status = nullptr);
+
+// What a session-folder index needs without reading the payload: the header and identity are checked (magic,
+// header hash, version, fingerprints - a foreign file is refused), then the first stage's live token ids and images
+// and its deepest checkpoint's are read; every state array and the K/V are skipped (not hashed: the full read checks
+// them).  `deepest` is empty when the file holds no checkpoint.
+struct SessionPeek {
+    ConversationCheckpoint live, deepest;   // ids and imgs only
+    bool cvec = false;
+    uint64_t bytes = 0;
+    uint32_t version = 0;
+};
+bool session_file_peek(const std::string& path, const SessionFileIdentity& id, SessionPeek& out, std::string& error);
 
 // The folder the free-space preflight asks about for `path`, by the rules of Windows or of POSIX (exposed so both can
 // be tested anywhere).  Windows: backslashes and a trailing backslash, as GetDiskFreeSpaceExW requires for a UNC
