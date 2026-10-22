@@ -13299,6 +13299,94 @@ int main(int argc, char** argv) {
                 if (!pump(false)) return false;
             return true;
         };
+        // --session-dir: slot b's kept conversation, before `next` overwrites the slot - parked like the main sessions'
+        // (RAM, written behind) or written straight from the GPU (slot_persist_wanted says when it is not needed).
+        // Never while pipelined groups are in flight: the device syncs would wait on windows only this thread serves.
+        auto persist_slot = [&](int b, bool from_this_slot, const std::vector<int32_t>& next, bool exiting,
+                                const char* why) {
+            if (!sdir || b < 0 || b >= (int) bs.size()) return;
+            BSlot& sl = bs[(size_t) b];
+            std::vector<const std::vector<int32_t>*> others;   // the slots saved in their turn (at exit: the kept ones)
+            for (size_t c = 0; c < bs.size(); ++c)
+                if ((int) c != b && (bs[c].cached || (!exiting && bs[c].active && !bs[c].tainted && !bs[c].img)))
+                    others.push_back(&bs[c].ids);
+            if (!strata::program::slot_persist_wanted(sl.cached && !sl.active, from_this_slot, sl.ids, next, others))
+                return;
+            std::string e = pipe_inflight() ? "pipelined groups in flight" : "";
+            for (size_t k = 0; e.empty() && k < bslot_ss.size(); ++k) {
+                const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
+                if (strata::core::device_sync() != cudaSuccess) e = "device sync failed";
+            }
+            if (e.empty() && use_mtp) {
+                const strata::core::OnDevice on_mtp(mtp.device());
+                if (!(batch_mtp ? slot_mtp[(size_t) b]->idle(e) : mtp.idle(e)) && e.empty()) e = "the drafter is busy";
+            }
+            if (!e.empty()) {
+                std::fprintf(stderr, "strata batch: slot %d's conversation not saved (%s)\n", b, e.c_str());
+                return;
+            }
+            std::fprintf(stderr, "strata batch: saving slot %d's conversation (%zu tokens) before %s\n", b,
+                         sl.ids.size(), why);
+            static const std::vector<ImgKey> no_imgs;   // a slot with pictures is never kept
+            bool ok = true;
+            try {
+                ok = park_body(ParkFrom{sl.ids, no_imgs, sl.checks, sl.cvec, b}, 0);
+            } catch (const std::bad_alloc&) {
+                err = "allocation failed";
+                ok = false;
+            }
+            if (!ok) std::fprintf(stderr, "strata batch: slot %d's conversation not saved (%s)\n", b, err.c_str());
+            err.clear();
+        };
+        if (!o.session_dir.empty()) {
+            std::string why;
+            if (o.prompt_cache <= 0) why = "needs --prompt-cache > 0";   // parking optional: without it, disk only
+            else if (o.peer_device >= 1) why = "does not support --peer-device";
+            else if (multi_gpu && stages.empty()) why = "does not support this multi-GPU mode";
+            strata::core::SessionDir::Options so;
+            if (why.empty() && !session_identity(so.id, why, {})) why = "session identity: " + why;
+            // this runtime's bounds, as a parked image holds them: the draft K/V with the last stage (or the only one)
+            const size_t n_st = stages.size();
+            if (why.empty() && !strata::core::conversation_session_read_limits(
+                    so.limits, ss, g, use_mtp && n_st == 0 ? &mtp.kv_state() : nullptr, (uint64_t) o.max_context,
+                    (uint64_t) std::max(o.prompt_cache, 1), why)) why = "read limits: " + why;
+            for (size_t k = 0; why.empty() && k < n_st; ++k) {
+                strata::core::SessionReadLimits sl;
+                if (!strata::core::conversation_session_read_limits(
+                        sl, stages[k]->ss, g, use_mtp && k + 1 == n_st ? &mtp.kv_state() : nullptr,
+                        (uint64_t) o.max_context, (uint64_t) std::max(o.prompt_cache, 1), why)) {
+                    why = "read limits (stage CUDA" + std::to_string(stages[k]->dev) + "): " + why;
+                    break;
+                }
+                so.limits.stages.push_back(std::move(sl));
+            }
+            if (why.empty()) {
+                const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                so.limits.admit = [floor](uint64_t need, std::string& w) {
+                    const auto avail = strata::core::available_host_bytes();
+                    if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+                    w = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB needed)";
+                    return false;
+                };
+                so.dir = o.session_dir;
+                so.max_files = (size_t) o.session_dir_files;
+                so.max_bytes = (uint64_t) o.session_dir_gib << 30;
+                so.max_age = std::chrono::hours(24 * o.session_dir_days);
+                // the background preload (opt-in): never more than the cache's budget
+                so.preload_bytes = (uint64_t) std::min(o.session_dir_preload_mib, o.conversation_cache_mib) << 20;
+                so.preload_files = (size_t) o.conversation_cache_slots;
+                so.write_delay = std::chrono::milliseconds((int64_t) (o.session_dir_delay_s * 1000.0));
+                so.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+                so.log = [](const std::string& m) { std::fprintf(stderr, "strata serve: session dir: %s\n", m.c_str()); };
+                // the server's notes (any thread; one whole line per call, so stdout never interleaves inside one)
+                so.event = [](const std::string& m) { std::printf("INFO %s\n", m.c_str()); std::fflush(stdout); };
+                sdir = std::make_unique<strata::core::SessionDir>(std::move(so));
+                sdir->open();
+                sdir->start_preload();
+            } else {
+                std::fprintf(stderr, "strata serve: --session-dir off: %s\n", why.c_str());
+            }
+        }
         // the prompt path's loans (defined once, outside a request: a read beside the slots uses them too)
         // the batched path's slots are lent just before its first run and given back (refilled) before a window
         // reads - so the windows always see the whole expert cache - or once the prompt is read
@@ -14194,94 +14282,6 @@ int main(int argc, char** argv) {
                          std::chrono::duration<double, std::milli>(Clock::now() - t_run).count(), adm_fence_ms);
             return true;
         };
-        // --session-dir: slot b's kept conversation, before `next` overwrites the slot - parked like the main sessions'
-        // (RAM, written behind) or written straight from the GPU (slot_persist_wanted says when it is not needed).
-        // Never while pipelined groups are in flight: the device syncs would wait on windows only this thread serves.
-        auto persist_slot = [&](int b, bool from_this_slot, const std::vector<int32_t>& next, bool exiting,
-                                const char* why) {
-            if (!sdir || b < 0 || b >= (int) bs.size()) return;
-            BSlot& sl = bs[(size_t) b];
-            std::vector<const std::vector<int32_t>*> others;   // the slots saved in their turn (at exit: the kept ones)
-            for (size_t c = 0; c < bs.size(); ++c)
-                if ((int) c != b && (bs[c].cached || (!exiting && bs[c].active && !bs[c].tainted && !bs[c].img)))
-                    others.push_back(&bs[c].ids);
-            if (!strata::program::slot_persist_wanted(sl.cached && !sl.active, from_this_slot, sl.ids, next, others))
-                return;
-            std::string e = pipe_inflight() ? "pipelined groups in flight" : "";
-            for (size_t k = 0; e.empty() && k < bslot_ss.size(); ++k) {
-                const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
-                if (strata::core::device_sync() != cudaSuccess) e = "device sync failed";
-            }
-            if (e.empty() && use_mtp) {
-                const strata::core::OnDevice on_mtp(mtp.device());
-                if (!(batch_mtp ? slot_mtp[(size_t) b]->idle(e) : mtp.idle(e)) && e.empty()) e = "the drafter is busy";
-            }
-            if (!e.empty()) {
-                std::fprintf(stderr, "strata batch: slot %d's conversation not saved (%s)\n", b, e.c_str());
-                return;
-            }
-            std::fprintf(stderr, "strata batch: saving slot %d's conversation (%zu tokens) before %s\n", b,
-                         sl.ids.size(), why);
-            static const std::vector<ImgKey> no_imgs;   // a slot with pictures is never kept
-            bool ok = true;
-            try {
-                ok = park_body(ParkFrom{sl.ids, no_imgs, sl.checks, sl.cvec, b}, 0);
-            } catch (const std::bad_alloc&) {
-                err = "allocation failed";
-                ok = false;
-            }
-            if (!ok) std::fprintf(stderr, "strata batch: slot %d's conversation not saved (%s)\n", b, err.c_str());
-            err.clear();
-        };
-        if (!o.session_dir.empty()) {
-            std::string why;
-            if (o.prompt_cache <= 0) why = "needs --prompt-cache > 0";   // parking optional: without it, disk only
-            else if (o.peer_device >= 1) why = "does not support --peer-device";
-            else if (multi_gpu && stages.empty()) why = "does not support this multi-GPU mode";
-            strata::core::SessionDir::Options so;
-            if (why.empty() && !session_identity(so.id, why, {})) why = "session identity: " + why;
-            // this runtime's bounds, as a parked image holds them: the draft K/V with the last stage (or the only one)
-            const size_t n_st = stages.size();
-            if (why.empty() && !strata::core::conversation_session_read_limits(
-                    so.limits, ss, g, use_mtp && n_st == 0 ? &mtp.kv_state() : nullptr, (uint64_t) o.max_context,
-                    (uint64_t) std::max(o.prompt_cache, 1), why)) why = "read limits: " + why;
-            for (size_t k = 0; why.empty() && k < n_st; ++k) {
-                strata::core::SessionReadLimits sl;
-                if (!strata::core::conversation_session_read_limits(
-                        sl, stages[k]->ss, g, use_mtp && k + 1 == n_st ? &mtp.kv_state() : nullptr,
-                        (uint64_t) o.max_context, (uint64_t) std::max(o.prompt_cache, 1), why)) {
-                    why = "read limits (stage CUDA" + std::to_string(stages[k]->dev) + "): " + why;
-                    break;
-                }
-                so.limits.stages.push_back(std::move(sl));
-            }
-            if (why.empty()) {
-                const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
-                so.limits.admit = [floor](uint64_t need, std::string& w) {
-                    const auto avail = strata::core::available_host_bytes();
-                    if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
-                    w = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB needed)";
-                    return false;
-                };
-                so.dir = o.session_dir;
-                so.max_files = (size_t) o.session_dir_files;
-                so.max_bytes = (uint64_t) o.session_dir_gib << 30;
-                so.max_age = std::chrono::hours(24 * o.session_dir_days);
-                // the background preload (opt-in): never more than the cache's budget
-                so.preload_bytes = (uint64_t) std::min(o.session_dir_preload_mib, o.conversation_cache_mib) << 20;
-                so.preload_files = (size_t) o.conversation_cache_slots;
-                so.write_delay = std::chrono::milliseconds((int64_t) (o.session_dir_delay_s * 1000.0));
-                so.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
-                so.log = [](const std::string& m) { std::fprintf(stderr, "strata serve: session dir: %s\n", m.c_str()); };
-                // the server's notes (any thread; one whole line per call, so stdout never interleaves inside one)
-                so.event = [](const std::string& m) { std::printf("INFO %s\n", m.c_str()); std::fflush(stdout); };
-                sdir = std::make_unique<strata::core::SessionDir>(std::move(so));
-                sdir->open();
-                sdir->start_preload();
-            } else {
-                std::fprintf(stderr, "strata serve: --session-dir off: %s\n", why.c_str());
-            }
-        }
         for (;;) {
             line_drain_ms = 0.0;
             bool adm_direct = false;   // STRATA_SLOT_ADMIT: this BGEN is read beside the slots (adm_run)
