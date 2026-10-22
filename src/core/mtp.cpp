@@ -22,6 +22,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_rope.hpp"
+#include "strata/kernels/mrope.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
@@ -36,6 +37,7 @@
 #include "strata/kernels/gfx_arch.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -1277,6 +1279,8 @@ bool MtpDrafter::capture_prefill_dev(int T, std::string& err) {
 bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
     cudaGraphExec_t& exec = coupled ? round_exec_c_[T] : round_exec_[T];
     if (exec) return true;
+    std::optional<strata::kernels::MropeScope> no_table;   // a slot's rounds: positions staged resolved
+    if (rope_slot_ >= 0 && strata::kernels::slot_rope_enabled()) no_table.emplace(nullptr);
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
     g_mp.init();   // (its allocation before the capture)
@@ -1327,6 +1331,8 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
 bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     cudaGraphExec_t& exec = coupled ? step_exec_c_[j] : step_exec_[j];
     if (exec) return true;
+    std::optional<strata::kernels::MropeScope> no_table;   // a slot's rounds: positions staged resolved
+    if (rope_slot_ >= 0 && strata::kernels::slot_rope_enabled()) no_table.emplace(nullptr);
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
     const int row = max_t_ + j - 1;
@@ -1580,12 +1586,16 @@ bool MtpDrafter::stage_round(int& T, const int32_t* tokens, int64_t p, int a, bo
     for (int j = 1; j < max_steps; ++j)
         if (!capture_step(j, cp, err)) return false;
     const int64_t NH = g_->n_head;
+    const auto rr = rope_slot_ >= 0 && strata::kernels::slot_rope_enabled() ? strata::kernels::slot_rope_get(rope_slot_)
+                                                                             : nullptr;
     auto put = [&](int row, int64_t cell) {
         h_step_[row * 4 + 0] = (int32_t) cell;
         h_step_[row * 4 + 1] = (int32_t) (cell + 1);
         h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
         h_step_[row * 4 + 3] = (int32_t) (cell + 1);
-        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) cell;
+        int32_t c[3] = {(int32_t) cell, (int32_t) cell, (int32_t) cell};
+        if (rr) rr->at(cell, c);
+        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = c[0];
     };
     for (int t = 0; t < T; ++t) {
         h_tok_[t] = tokens[t];
@@ -1856,12 +1866,16 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
         if (step_exec_[j] == nullptr) { err = "mtp: chain graphs not prepared"; return false; }
     const Clock::time_point t0 = Clock::now();
     const int64_t NH = g_->n_head;
+    const auto rr = rope_slot_ >= 0 && strata::kernels::slot_rope_enabled() ? strata::kernels::slot_rope_get(rope_slot_)
+                                                                             : nullptr;
     auto put = [&](int row, int64_t cell) {
         h_step_[row * 4 + 0] = (int32_t) cell;
         h_step_[row * 4 + 1] = (int32_t) (cell + 1);
         h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
         h_step_[row * 4 + 3] = (int32_t) (cell + 1);
-        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) cell;
+        int32_t c[3] = {(int32_t) cell, (int32_t) cell, (int32_t) cell};
+        if (rr) rr->at(cell, c);
+        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = c[0];
     };
     for (int t = 0; t < T; ++t) {
         h_tok_[t] = tokens[t];

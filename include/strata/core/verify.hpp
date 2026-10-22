@@ -253,6 +253,9 @@ public:
     /// The group at `hbase` can be launched here without waiting: its last deferred commit has run.
     bool batch_launch_ready(int hbase);
     bool batch_busy() const { return b_running_.load(std::memory_order_acquire); }
+    /// Batch windows launched here so far, and when a layer of one was last launched or served (any thread may read).
+    int64_t batch_launches() const { return b_launches_.load(std::memory_order_acquire); }
+    std::chrono::steady_clock::time_point batch_last_activity() const { return last_ring(); }
     /// Serves the layers of this stage's window that have rung (the CPU pool and the flags), with no CUDA call: 1 once
     /// every layer is served (or the window raises no host doorbells), 0 while one is still to ring.  batch_poll
     /// calls it, unless set_external_serve(true) moved it to a thread of its own (STRATA_PIPED_CONCURRENT: a CUDA
@@ -420,6 +423,7 @@ private:
     // batch_launch / batch_poll (with external serving, batch_serve runs on another thread: running and the served
     // layer count are atomics, set by batch_launch before running)
     std::atomic<bool> b_running_{false};
+    std::atomic<int64_t> b_launches_{0};
     std::atomic<int64_t> b_k_{0};
     int64_t b_steps_ = 0;
     std::atomic<bool> ext_serve_{false};
@@ -588,6 +592,7 @@ private:
     VerifyHits hits_;
     const NativeHead* head_ = nullptr;
     int max_t_ = 0;
+    int64_t cb_ = 0;                       ///< a slot's batch commit record (init_slots)
     float* ple_key_ = nullptr;   ///< STRATA_PLE_BATCH: the window rows' PLE key / value projections
     float* ple_val_ = nullptr;
     int last_t_ = 0;

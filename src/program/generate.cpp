@@ -4105,6 +4105,13 @@ int main(int argc, char** argv) {
         }
         strata::kernels::mrope_table_set(d_mrope);
     }
+    // --batch: each slot decodes at its own conversation's positions (batch windows and slot drafters never read the
+    // table above), so a picture conversation runs beside text ones; STRATA_PICTURE_SERIAL=1: one table, kept apart
+    const bool picture_serial = [] {
+        const char* e = std::getenv("STRATA_PICTURE_SERIAL");
+        return e != nullptr && e[0] == '1';
+    }();
+    strata::kernels::slot_rope_enable(o.vision && o.batch > 0 && !picture_serial);
     strata::kernels::ple_set_native_postops(o.native_ple_postops);
     // before session_init: every graph captured from here on has the vector's kernels where it applies
     std::string cvec_summary = "0";
@@ -9444,6 +9451,7 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 slot_mtp_rows.emplace_back(r, free_slot_mtp_rows);
+                slot_mtp[(size_t) b]->set_rope_slot(b);
                 if (!slot_mtp[(size_t) b]->bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, r, err,
                                                 &mtp)) {
                     std::fprintf(stderr, "strata serve: batch MTP slot %d: %s%s\n", b, err.c_str(),
@@ -13778,7 +13786,7 @@ int main(int argc, char** argv) {
         auto adm_decide = [&](std::string& l) -> bool {
             AdmReq r;
             bool direct = false;
-            const bool ok = adm_parse(l, r) && !r.bias && (mrope_identity || !img_decoding()) && r.slot >= 0 && r.slot < (int) bs.size() &&
+            const bool ok = adm_parse(l, r) && !r.bias && (!picture_serial || mrope_identity || !img_decoding()) && r.slot >= 0 && r.slot < (int) bs.size() &&
                             !bs[(size_t) r.slot].active && !adm_queued[(size_t) r.slot] && !adm_paused[(size_t) r.slot] && adm_reading != r.slot && adm_stop_of[(size_t) r.slot] == nullptr &&
                             r.max_new >= 1 && !r.ids.empty();
             if (ok) {
@@ -13900,6 +13908,51 @@ int main(int argc, char** argv) {
         auto stage_prefill = [&](size_t k) -> strata::prefill::Prefill& { return k == 0 ? sp : stages[k - 1]->sp; };
         auto stage_ss = [&](size_t k) -> strata::core::SessionState& { return k == 0 ? ss : stages[k - 1]->ss; };
         auto stage_stream = [&](size_t k) -> cudaStream_t { return k == 0 ? main_stream : (cudaStream_t) stages[k - 1]->stream; };
+        // STRATA_READ_INTERLEAVE_LAYERS=L (0: off): a read beside the slots stops every L layers of a piece while this card
+        // ran a slot window lately (its queued layers finish first) and lets the window in flight run alone (at most
+        // STRATA_READ_INTERLEAVE_WAIT_MS, 50), so a window waits for at most L layers of the piece, not the whole piece.
+        // Only the order of independent work on the card changes.
+        struct RiStat { std::atomic<int64_t> gaps{0}, waits{0}, wait_us{0}; };
+        static const int ri_layers = [] {
+            const char* v = std::getenv("STRATA_READ_INTERLEAVE_LAYERS");
+            return v != nullptr ? std::max(0, std::atoi(v)) : 0;
+        }();
+        auto ri_stat = std::make_shared<std::vector<RiStat>>((size_t) n_pipe);
+        struct RiScope {
+            std::vector<strata::prefill::Prefill*> sps;
+            ~RiScope() { for (auto* p : sps) { p->on_layer_gap = nullptr; p->layer_gap_every = 0; } }
+        } ri_scope;
+        if (ri_layers > 0) {
+            auto ms_env = [](const char* k, double d) {
+                const char* v = std::getenv(k);
+                return v != nullptr ? std::max(0.0, std::atof(v)) : d;
+            };
+            const auto wait_cap = std::chrono::microseconds((int64_t) (ms_env("STRATA_READ_INTERLEAVE_WAIT_MS", 50.0) * 1000.0));
+            const auto recent = std::chrono::microseconds((int64_t) (ms_env("STRATA_READ_INTERLEAVE_RECENT_MS", 250.0) * 1000.0));
+            for (int k = 0; k < n_pipe; ++k) {
+                strata::prefill::Prefill& pk = stage_prefill((size_t) k);
+                strata::core::Verifier* vk = &stage_verifier(k);
+                RiStat* st = &(*ri_stat)[(size_t) k];
+                pk.layer_gap_every = ri_layers;
+                pk.on_layer_gap = [vk, st, ri_stat, wait_cap, recent](int64_t, void* stream) {
+                    if (!vk->batch_busy() && Clock::now() - vk->batch_last_activity() > recent) return;
+                    st->gaps.fetch_add(1, std::memory_order_relaxed);
+                    cudaStreamSynchronize((cudaStream_t) stream);   // (an error stays for the read's next call to report)
+                    if (!vk->batch_busy()) return;
+                    const int64_t c = vk->batch_launches();
+                    const auto t0 = Clock::now();
+                    while (vk->batch_busy() && vk->batch_launches() == c && Clock::now() - t0 < wait_cap)
+                        std::this_thread::sleep_for(std::chrono::microseconds(50));
+                    st->waits.fetch_add(1, std::memory_order_relaxed);
+                    st->wait_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count(),
+                                          std::memory_order_relaxed);
+                };
+                ri_scope.sps.push_back(&pk);
+            }
+            std::fprintf(stderr, "strata batch: STRATA_READ_INTERLEAVE_LAYERS=%d: reads beside the slots stop every %d "
+                                 "layers for the windows on their card (at most %.0f ms each)\n", ri_layers, ri_layers,
+                         std::chrono::duration<double, std::milli>(wait_cap).count());
+        }
         auto adm_thread_cpus = [] {
             strata::aux_cpus::pin_current_thread();
 #if !defined(_WIN32)
@@ -14307,6 +14360,7 @@ int main(int argc, char** argv) {
             if (ckpt_pool.on())
                 for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
             sl = BSlot{};
+            strata::kernels::slot_rope_set(b, nullptr);   // text: the identity
             sl.active = true;
             sl.x = (int32_t) ids[(size_t) n - 1];
             sl.p = n - 1;
@@ -14622,6 +14676,7 @@ int main(int argc, char** argv) {
                 if (ckpt_pool.on())
                     for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
                 sl = BSlot{};
+                strata::kernels::slot_rope_set(b, nullptr);   // text: the identity
                 sl.active = true;
                 sl.x = (int32_t) ids[(size_t) n - 1];
                 sl.p = n - 1;
@@ -14915,7 +14970,7 @@ int main(int argc, char** argv) {
         auto adm_run = [&](std::string first) -> bool {
             const auto t_run = Clock::now();
             cudaGetDevice(&adm_main_dev);
-            while (img_decoding()) {   // (the position table is the picture conversation's until it ends: see the main loop)
+            while (picture_serial && img_decoding()) {   // (STRATA_PICTURE_SERIAL: the table is the picture's until it ends)
                 {
                     std::lock_guard<std::mutex> lk(in_mu);
                     adm_lines();
@@ -14989,8 +15044,8 @@ int main(int argc, char** argv) {
                     bell_waiting.store(false, std::memory_order_relaxed);
                 }
             });
-            // text reads after a picture request: the position table back to the identity (no picture slot decodes:
-            // adm_decide), as the request path does for a text request
+            // text reads after a picture request: the position table back to the identity, as the request path does for
+            // a text request (slots decoding a picture conversation read their own positions, not this table)
             if (!mrope_identity && !mrope_host.empty()) {
                 const int64_t cells = (int64_t) mrope_host.size() / 3;
                 for (int64_t c = 0; c < cells; ++c)
@@ -15027,6 +15082,11 @@ int main(int argc, char** argv) {
             // the windows during these reads, per stage (the run's line): how many, and their doorbells' pool time
             std::vector<std::pair<int64_t, double>> w0((size_t) n_pipe);
             for (int k = 0; k < n_pipe; ++k) w0[(size_t) k] = {stage_verifier(k).windows, stage_verifier(k).ms_pool};
+            std::vector<std::array<int64_t, 3>> ri0((size_t) n_pipe);
+            for (int k = 0; k < n_pipe; ++k) {
+                const RiStat& r = (*ri_stat)[(size_t) k];
+                ri0[(size_t) k] = {r.gaps.load(), r.waits.load(), r.wait_us.load()};
+            }
             const int64_t rows_run0 = pipe_rows;
             auto window_note = [&] {
                 std::string s;
@@ -15037,6 +15097,14 @@ int main(int argc, char** argv) {
                     std::snprintf(b, sizeof b, "%sstage %d: %lld windows, pool %.1f ms each", k ? "; " : "", k + 1,
                                   (long long) w, w > 0 ? (v.ms_pool - w0[(size_t) k].second) / (double) w : 0.0);
                     s += b;
+                    if (ri_layers > 0) {   // STRATA_READ_INTERLEAVE_LAYERS: the read's stops, the windows let through
+                        const RiStat& r = (*ri_stat)[(size_t) k];
+                        std::snprintf(b, sizeof b, ", read stopped %lld times, %lld windows let through in %.0f ms",
+                                      (long long) (r.gaps.load() - ri0[(size_t) k][0]),
+                                      (long long) (r.waits.load() - ri0[(size_t) k][1]),
+                                      (double) (r.wait_us.load() - ri0[(size_t) k][2]) / 1000.0);
+                        s += b;
+                    }
                 }
                 return s;
             };
@@ -15310,11 +15378,9 @@ int main(int argc, char** argv) {
                 adm_bstop(std::atoi(line.c_str() + 6));
                 continue;
             }
-            // --vision beside the slots: every rope kernel reads a cell's position from ONE table, which a picture request
-            // rewrites (and a text request puts back), so a slot decoding meanwhile reads shifted positions - non-finite
-            // logits in the soak right after a picture admission.  A picture request starts when no slot decodes, a
-            // text one when no picture conversation does (the slots decode on meanwhile; BSTOPs are taken)
-            if (slot_admit && o.vision && !adm_direct) {
+            // STRATA_PICTURE_SERIAL=1 (the old way: one position table for every slot, which a picture request rewrites):
+            // a picture request starts when no slot decodes, a text one when no picture conversation does
+            if (picture_serial && slot_admit && o.vision && !adm_direct) {
                 const bool img_line = line.rfind("BGENI ", 0) == 0 || line.rfind("GENI ", 0) == 0;
                 const bool req = img_line || line.rfind("BGEN ", 0) == 0 || line.rfind("GEN ", 0) == 0;
                 bool waited = false;
@@ -18991,6 +19057,15 @@ int main(int argc, char** argv) {
                     if (ckpt_pool.on())
                         for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
                     sl = BSlot{};
+                    if (strata::kernels::slot_rope_enabled()) {   // the slot's own positions, before its first draft
+                        std::shared_ptr<strata::kernels::SlotRope> rr;
+                        if (!live_imgs.empty() && (size_t) p * 3 + 2 < mrope_host.size()) {
+                            rr = std::make_shared<strata::kernels::SlotRope>();
+                            rr->thw.assign(mrope_host.begin(), mrope_host.begin() + (std::ptrdiff_t) p * 3);
+                            rr->delta = mrope_host[(size_t) p * 3] - (int32_t) p;
+                        }
+                        strata::kernels::slot_rope_set(admit_slot, std::move(rr));
+                    }
                     const auto tc2 = Clock::now();   // (the slot's old checkpoints freed)
                     sl.active = true;
                     sl.x = x;

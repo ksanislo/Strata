@@ -192,7 +192,11 @@ function render(m) {
   } else {
     setPill("idle", "Idle");
   }
-  const conv = m.conversations || [], agg = m.aggregate;
+  // a server without "conversations" (started before this page was installed): one row per busy slot from live.slots
+  const conv = m.conversations || (live.slots || []).filter((x) => x.state !== "idle").map((x) => ({
+    slot: x.slot, state: x.state, prompt_tokens: x.prompt_tokens, prompt_read: x.prompt_read, generated: x.generated,
+    context_tokens: (x.prompt_tokens || 0) + (x.generated || 0), age_s: x.elapsed_s, tok_s: x.tok_s}));
+  const agg = m.aggregate;
   if (conv.length > 1) {
     const n = (s) => conv.filter((c) => c.state === s).length;
     const parts = [[n("decoding"), "decoding"], [n("reading"), "reading"]].filter((x) => x[0]).map((x) => `${x[0]} ${x[1]}`);
@@ -202,7 +206,6 @@ function render(m) {
   const waitingN = agg ? agg.queue.waiting : live.queued;
   if (waitingN > 0) setPill("queued", `${waitingN} queued`);
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, agg, conv);
-  if (tab === "monitor") renderEngine(agg);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
   if (tab === "about") renderAbout(eng, hw, st);
 }
@@ -252,42 +255,47 @@ function renderTotals(t) {
 const CONV_STATE = {decoding: ["st-badge--generating", "Decoding"], reading: ["st-badge--reading", "Reading"],
                     queued: ["st-badge--queued", "Queued"], waiting: ["st-badge--queued", "Waiting for a slot"]};
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, agg, conv) {
-  // model state: one row per conversation in flight (queued ones too)
+  // model state: one block per conversation in flight, each with its own state badges and progress bar
   conv = conv || [];
-  const any = (s) => conv.some((c) => c.state === s);
-  const on = new Set([any("queued") || any("waiting") || live.queued > 0 ? "queued" : null,
-                      any("reading") || live.state === "reading" ? "reading" : null,
-                      any("decoding") || live.state === "generating" ? "generating" : null]);
-  if (!on.has("reading") && !on.has("generating") && !on.has("queued")) on.add(live.state);
-  for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", on.has(b.dataset.s));
-  let label = "Waiting for a request", detail = "";
-  if (conv.length) {
-    const n = (s) => conv.filter((c) => c.state === s).length;
-    label = `${conv.length} conversation${conv.length > 1 ? "s" : ""} in flight`;
-    detail = [[n("decoding"), "decoding"], [n("reading"), "reading"], [n("queued") + n("waiting"), "waiting"]]
-      .filter((x) => x[0]).map((x) => `${x[0]} ${x[1]}`).join(" · ");
-  } else if (live.state === "reading" || live.state === "generating") {
-    label = live.state === "reading" ? "Reading prompt" : "Generating";
-  } else if (last) {
-    detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
-  }
-  $("state-label").textContent = label;
-  $("state-detail").textContent = detail;
-  $("conv-wrap").hidden = !conv.length;
-  $("conv-body").innerHTML = conv.map((c) => {
-    const [cls, text] = CONV_STATE[c.state] || ["", c.state];
-    const pct = c.prompt_read != null && c.prompt_tokens ? Math.min(100, (100 * c.prompt_read) / c.prompt_tokens) : null;
-    const read = c.state === "reading"
-      ? `<div class="conv-read"><div class="st-progress" data-tone="info"><div class="st-progress__bar" style="width:${pct || 0}%"></div></div>` +
-        `<span class="muted small">${c.prompt_read == null ? "–" : `${kfmt(c.prompt_read)} · ${fmt(pct)}%`}</span></div>`
-      : c.state === "decoding" ? `<span class="muted small">done</span>` : "–";
-    const ttft = c.ttft_s != null ? `${fmt(c.ttft_s, 1)} s` : c.reading_s != null ? `<span class="muted">${fmt(c.reading_s)} s…</span>` : "–";
-    const slot = c.slot == null ? (c.state === "reading" || c.state === "decoding" ? "solo" : "–") : `${c.replica != null ? `${c.replica}:` : ""}${c.slot}`;
-    return `<tr title="${esc(c.id || "")}${c.phase ? ` · ${esc(c.phase)}` : ""}"><td>${esc(slot)}</td><td><span class="st-badge ${cls}">${esc(text)}</span></td>
-      <td class="num">${fmt(c.prompt_tokens)}</td><td>${read}</td><td class="num">${fmt(c.generated)}${c.max_tokens ? `<span class="muted small"> / ${kfmt(c.max_tokens)}</span>` : ""}</td>
-      <td class="num">${kfmt(c.context_tokens)}</td><td class="num">${c.queued_s == null ? "–" : `${fmt(c.queued_s, 1)} s`}</td>
-      <td class="num">${ttft}</td><td class="num">${fmt(c.tok_s, 1)}</td><td class="num">${fmt(c.age_s)} s</td></tr>`;
-  }).join("");
+  const BADGES = [["idle", "", "Idle"], ["reading", "st-badge--reading", "Reading"],
+                  ["generating", "st-badge--generating", "Generating"], ["queued", "st-badge--queued", "Queued"],
+                  ["error", "st-badge--error", "Error"]];
+  const block = (title, s, detail, pct) =>
+    `<div class="conv-state"><div class="state-card__head"><span>${esc(title)}</span><span class="badges">` +
+    BADGES.map(([k, cls, t]) => `<span class="st-badge ${cls}${k === s ? " on" : ""}">${t}</span>`).join("") +
+    `</span></div><div class="state-card__row"><span class="muted">${detail}</span></div>` +
+    `<div class="st-progress"${s === "reading" ? ' data-tone="info"' : ""}><div class="st-progress__bar" style="width:${pct || 0}%"></div></div></div>`;
+  const STATE = {decoding: "generating", reading: "reading", queued: "queued", waiting: "queued"};
+  const one = (c, title) => {
+    const s = STATE[c.state] || c.state;
+    let detail, pct = 0;
+    if (s === "reading") {
+      pct = c.prompt_read != null && c.prompt_tokens ? Math.min(100, (100 * c.prompt_read) / c.prompt_tokens) : 0;
+      detail = `Reading ${c.prompt_read == null ? "–" : kfmt(c.prompt_read)} of ${kfmt(c.prompt_tokens)} prompt tokens` +
+               (c.reading_s != null ? ` · ${fmt(c.reading_s)} s` : "");
+    } else if (s === "generating") {
+      pct = c.max_tokens ? Math.min(100, (100 * (c.generated || 0)) / c.max_tokens) : 0;
+      detail = `${fmt(c.generated)}${c.max_tokens ? ` / ${kfmt(c.max_tokens)}` : ""} tokens · ${fmt(c.tok_s, 1)} tok/s` +
+               ` · context ${kfmt(c.context_tokens)}${c.ttft_s != null ? ` · TTFT ${fmt(c.ttft_s, 1)} s` : ""}`;
+    } else if (s === "idle") {
+      detail = c.held_tokens ? `Idle · holds a conversation of ${kfmt(c.held_tokens)} tokens` : "Idle";
+    } else {
+      detail = `Waiting${c.queued_s != null ? ` ${fmt(c.queued_s, 1)} s` : ""} · ${kfmt(c.prompt_tokens)} prompt tokens`;
+    }
+    return block(title, s, detail, pct);
+  };
+  // every configured slot, in order and numbered from 1, so a conversation keeps its place; requests outside the
+  // slots (queued, or on the single-request path) follow
+  const bySlot = new Map(conv.filter((c) => c.slot != null).map((c) => [c.slot, c]));
+  const slots = (live.slots || []).slice().sort((x, y) => x.slot - y.slot);
+  let html = slots.map((x) => {
+    const c = bySlot.get(x.slot);
+    return one(c ? {...c, held_tokens: x.held_tokens} : {...x, context_tokens: (x.prompt_tokens || 0) + (x.generated || 0)},
+               `Slot ${x.slot + 1}`);
+  }).join("") + conv.filter((c) => c.slot == null || !slots.length).map((c) =>
+    one(c, c.slot == null ? (c.state === "queued" || c.state === "waiting" ? "Queued" : "Request") : `Slot ${c.slot + 1}`)).join("");
+  if (!slots.length && conv.length) html = conv.map((c) => one(c, c.slot == null ? "Request" : `Slot ${c.slot + 1}`)).join("");
+  $("conv-states").innerHTML = html;
 
   // the eight cards; Decode and Prefill: every slot together (the engine's own counts over the last 10 s)
   if (agg && agg.loaded) {
@@ -386,40 +394,6 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, agg, 
   $("req-totals").textContent = renderTotals(totals);
 }
 
-// the engine-wide figures (GET /metrics "aggregate"): queue, slots, rates, and what the engine's log reports
-function renderEngine(a) {
-  $("engine-card").hidden = !a || !a.loaded;
-  if (!a || !a.loaded) return;
-  const r = (x) => `${fmt(x["10s"], 1)} / ${fmt(x["60s"], 1)} tok/s`;
-  const s = a.slots, q = a.queue, t = a.totals || {}, lg = a.engine_log || {}, c = lg.counts || {}, lt = lg.latest || {};
-  const ago = (o) => (o && o.at ? ` · ${since(o.at)}` : "");
-  $("engine-sum").textContent = t.since ? `since ${new Date(t.since * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"})}` : "";
-  const hit = lt.hit_rate;
-  const pipe = lt.pipelined, mtp = lt.pipelined_mtp, th = lt.thread_read, bs = lt.beside;
-  const vram = Object.entries(lt.vram_free_mib || {}).sort().map(([k, v]) => `${k} ${fmt(v.mib)} MiB (${v.what})`).join(" · ");
-  facts($("engine-facts"), [
-    ["Decode 10 s / 60 s", r(a.generated_tok_s)],
-    ["Prompt read 10 s / 60 s", r(a.prompt_read_tok_s)],
-    ["Reused 10 s / 60 s", r(a.reused_tok_s)],
-    ["Slots", a.parallel ? `${fmt(s.decoding)} decoding · ${fmt(s.reading)} reading · ${fmt(s.held)} held · ${fmt(s.parked)} parked · ${fmt(s.idle)} idle of ${fmt(a.parallel)}` +
-      (a.outside_slots ? ` · ${fmt(a.outside_slots)} outside the slots` : "") : "one request at a time"],
-    ["Queue", `${fmt(q.waiting)} waiting${q.waiting ? ` (oldest ${fmt(q.oldest_wait_s, 1)} s)` : ""} · engine: ${fmt(q.engine_ctl_waiting)} for the control lines, ${fmt(q.engine_slot_waiting)} for a slot`],
-    ["Totals", `${fmt(t.generated)} generated · ${fmt(t.prompt_read)} read (${fmt(t.reads)} reads) · ${fmt(t.reused)} reused`],
-    ["Expert cache hit", hit ? `${fmt(hit.pct, 1)}% last request${hit.pcie_pct != null ? ` (+${fmt(hit.pcie_pct, 1)}% PCIe)` : ""}` +
-      (lg.hit_rate_pct_since_start != null ? ` · ${fmt(lg.hit_rate_pct_since_start, 1)}% since start` : "") + ago(hit) : null],
-    ["Pipelined windows", pipe ? `${fmt(pipe.rows_s, 1)} rows/s (${fmt(pipe.rows)} rows, ${fmt(pipe.group_steps)} steps, ${pipe.groups}×${pipe.group_slots})` +
-      (mtp ? ` · MTP ${fmt(mtp.accept_pct, 1)}%, ${fmt(mtp.rows_avg, 2)} rows/window, ${fmt(mtp.launch_to_picks_ms)} ms to picks` : "") + ago(pipe) : null],
-    ["Reads beside the slots", c.beside_reports ? `${fmt(c.beside_admissions)} admissions in ${fmt(c.beside_reports)} runs` +
-      (bs ? ` · last ${fmt(bs.admissions)} in ${fmt(bs.ms / 1000, 1)} s, ${fmt(bs.decoded_rows)} rows decoded${bs.held ? `, ${bs.held} held` : ""}${ago(bs)}` : "") : null],
-    ["Reads on their own thread", c.thread_reads ? `${fmt(c.thread_reads)} (${fmt(c.thread_read_tokens)} tokens)` +
-      (th ? ` · last ${fmt(th.tokens)} tokens in ${fmt(th.ms / 1000, 1)} s, slots ${fmt(th.slot_rows_s, 1)} rows/s meanwhile${ago(th)}` : "") : null],
-    ["Read yields", c.read_yields || lt.reads_held ? `${fmt(c.read_yields)} yields, ${fmt(c.pieces_taken_back)} pieces taken back · ${fmt(lt.reads_held)} reads held now` : null],
-    ["VRAM free", vram || null],
-    ["Window graphs", c.graph_captures || c.no_vram_for_graph ? `${fmt(c.graph_captures)} captured · ${fmt(c.no_vram_for_graph)} × no VRAM for a new one (${fmt(c.graphs_freed)} freed)` +
-      (c.vram_floor_givebacks ? ` · ${fmt(c.vram_floor_givebacks)} below-floor give-backs` : "") : null],
-    ["Engine ERR lines", t.errors ? `${fmt(t.errors)}${a.last_err ? ` · last: ${a.last_err.text} (${since(a.last_err.at)})` : ""}` : "none"],
-  ]);
-}
 
 function facts(el, rows) {
   el.innerHTML = rows.filter((r) => r[1] != null && r[1] !== "").map(([k, v, copy]) =>

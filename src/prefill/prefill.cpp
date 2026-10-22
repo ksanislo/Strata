@@ -3236,6 +3236,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         };
         for (int64_t l = LB; l < LE; ++l) {
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
+            // STRATA_READ_INTERLEAVE_LAYERS: the slots' windows on this card may run between layer blocks of a read
+            if (job && on_layer_gap && layer_gap_every > 0 && l > LB && (l - LB) % layer_gap_every == 0)
+                on_layer_gap(l, (void*) cs);
             if (l > LB) pf_step("reading the prompt (batched, step sync): the experts and the rest of layer", l - 1);
             core::progress_at("reading the prompt (batched): layer", l, p0);   // #251: a stall names layer and chunk
             const core::LayerView v(*m.wt, l);
