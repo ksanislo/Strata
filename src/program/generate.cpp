@@ -14646,10 +14646,15 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata batch: STRATA_BATCH_READS needs STRATA_SLOT_ADMIT_MULTI=1: off\n");
                 return 0;
             }
-            if (m > 0) std::fprintf(stderr, "strata batch: STRATA_BATCH_READS: up to %d reads beside the slots share a "
-                                            "prompt chunk\n", m);
+            if (m > 0) {
+                const strata::prefill::Prefill::BatchFast f = strata::prefill::Prefill::batch_fast();
+                std::fprintf(stderr, "strata batch: STRATA_BATCH_READS: up to %d reads beside the slots share a prompt "
+                                     "chunk; a read of at most %lld tokens goes in the next chunk (FAST; others %lld each)\n",
+                             m, (long long) f.tokens, (long long) f.share);
+            }
             return m;
         }();
+        static const int64_t br_fast = br_max > 0 ? strata::prefill::Prefill::batch_fast().tokens : 0;
         static const int64_t br_chunk = [] {
             const char* v = std::getenv("STRATA_BATCH_READS_CHUNK");
             return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 0;
@@ -14799,6 +14804,9 @@ int main(int argc, char** argv) {
                 auto pj = std::make_shared<strata::prefill::PromptJob>();
                 pj->tokens.assign(j.r.ids.begin() + a, j.r.ids.begin() + z);
                 pj->pos0 = a;
+                // STRATA_BATCH_READS_FAST: a read short enough to go whole is read in the next chunk (a chat question
+                // beside long agent reads waits for one short chunk, not for the queued pieces)
+                pj->urgent = br_fast > 0 && j.n - 1 - j.resume <= br_fast;
                 for (size_t k = 0; k < n_st; ++k) pj->sessions.push_back(bslot_ss[k][(size_t) b].get());
                 AdmJob* jp = &j;
                 strata::core::MtpDrafter* dr = batch_mtp ? slot_mtp[(size_t) b].get() : nullptr;

@@ -74,6 +74,7 @@ struct PromptJob {
     std::vector<Seg> segs;
     int64_t taken = 0;   ///< tokens the worker gave stage 0 so far (a prompt a batch sliced stays queued for the rest)
     bool whole = false;  ///< read in one chunk (at most the buffers' tokens), as a batch reads its segments
+    bool urgent = false; ///< STRATA_BATCH_READS_FAST: a short read's piece (the whole read fits FAST): the next chunk takes it
 
     bool failed() const { return failed_.load(); }
     bool done() const { return done_.load(); }
@@ -246,8 +247,18 @@ public:
     struct BatchPlan {
         std::vector<size_t> at;
         std::vector<int64_t> got;
+        bool fast = false;   ///< a latency chunk: urgent reads whole, the others at most `share` each (may be one prompt)
     };
-    static BatchPlan plan_batch(const std::deque<std::shared_ptr<PromptJob>>& q, int max_segs, int64_t budget);
+    /// STRATA_BATCH_READS_FAST=<tokens> (512; 0 off): an urgent piece of at most that many tokens goes in the next chunk
+    /// whole, ahead of everything not started; each other reader gets STRATA_BATCH_READS_FAST_SHARE (128) at most, the
+    /// chunk at most STRATA_BATCH_READS_FAST_CHUNK tokens (default: just below the stream-all size, 1023).
+    struct BatchFast {
+        int64_t tokens = 0, share = 128, chunk = 0;
+    };
+    static BatchFast batch_fast();
+    static BatchPlan plan_batch(const std::deque<std::shared_ptr<PromptJob>>& q, int max_segs, int64_t budget,
+                                const BatchFast& fast, int64_t fast_cap);
+    static BatchPlan plan_batch(const std::deque<std::shared_ptr<PromptJob>>& q, int max_segs, int64_t budget);   ///< FAST off
     /// A queued prompt that can share a chunk: its own sessions, no picture rows, not failed or stopped, tokens left.
     static bool batchable(const PromptJob& j);
 
