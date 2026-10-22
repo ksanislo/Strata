@@ -11981,6 +11981,7 @@ int main(int argc, char** argv) {
         int64_t bt_miss0 = 0, bt_hits0 = 0, bt_pcie0 = 0;
         int64_t bt_windows = 0, bt_rows = 0, bt_tokens = 0, bt_accepted = 0;   // bt_accepted: --batch-mtp proposals taken
         int64_t pipe_rows = 0;   // the pipelined groups' rows, never reset (bt_rows restarts when the slots go idle)
+        int64_t wins_done = 0;   // windows finished on the last stage, never reset (decode turns count them)
         // per stage (0 = CUDA0's verifier): the GPU-reach wait and pool time when the timed windows began; and the routed
         // (token, expert) entries the CPU and the PCIe share had served by then (bt_hits0 holds the VRAM entries)
         std::vector<double> bt_stage_wait0, bt_stage_pool0;
@@ -12747,6 +12748,7 @@ int main(int argc, char** argv) {
             bt_run += msd(w0, w1);
             bt_commit += msd(w1, w2);
             ++bt_windows;
+            ++wins_done;
             for (int a = 0; a < A; ++a) {
                 bt_rows += keep[active[a]];
                 bt_accepted += keep[active[a]] - 1;
@@ -13262,6 +13264,7 @@ int main(int argc, char** argv) {
                         rows_wait = nullptr;
                     }
                     ++bt_windows;
+                    ++wins_done;
                     G.inflight = false;
                     report_batch_window(G.S, G.active, !pipe_inflight() && !batch_on(), G.started);
                     continue;
@@ -13312,6 +13315,7 @@ int main(int argc, char** argv) {
                     rows_wait = nullptr;
                 }
                 ++bt_windows;
+                ++wins_done;
                 G.inflight = false;
                 report_batch_window(G.S, G.active, !pipe_inflight() && !batch_on(), G.started);
             }
