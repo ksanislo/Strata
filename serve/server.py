@@ -1327,6 +1327,15 @@ class StrataEngine:
                 except (IndexError, ValueError, AttributeError):
                     pass
                 continue
+            if line.startswith("HMEM "):               # HMEM <pinned> <whole> <slots> <bytes>...: RAM for the K/V host copies
+                f = line.split()
+                try:
+                    ram = {"pinned": int(f[1]), "whole": int(f[2]), "slots": [int(x) for x in f[4:4 + int(f[3])]]}
+                except (IndexError, ValueError):
+                    ram = None
+                if ram and self.proc is proc:
+                    self.info["context_ram"] = ram
+                continue
             if line.startswith("KMEM "):               # KMEM <cards> (<device> <budget> <free> [<givable>])...: context memory
                 f = line.split()
                 try:
