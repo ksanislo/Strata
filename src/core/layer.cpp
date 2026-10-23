@@ -652,6 +652,7 @@ struct HostPool {
 constexpr uint64_t kHostPiece = strata::kernels::kSplitCopyBytes;
 std::mutex g_host_mu;
 std::vector<std::unique_ptr<HostPool>> g_host_pools;
+bool g_host_main = false;   // qsa_set_host_elastic_main: the solo sessions' streamed states too
 bool host_elastic_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_KV_HOST_ELASTIC");
@@ -1167,6 +1168,13 @@ int64_t qsa_kv_resident() { return g_kv_resident; }
 int64_t qsa_kv_resident_min() { return 20480; }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes.load(); }
 uint64_t qsa_kv_host_reserved_bytes() { return g_kv_host_reserved.load(); }
+void qsa_set_host_elastic_main(bool on) {
+#ifndef _WIN32
+    g_host_main = on;
+#else
+    (void) on;
+#endif
+}
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells,
                          bool elastic_slot) {
@@ -1196,7 +1204,7 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
 }
 
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope, int64_t ring_cells, bool elastic_slot) {
+                        const QsaState* share_rope, int64_t ring_cells, bool elastic_slot, bool host_elastic) {
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     const int64_t pages = p.pages;
@@ -1335,7 +1343,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.host = strata::kernels::KvHostPools{};
     uint8_t* hel[4] = {};   // STRATA_KV_HOST_ELASTIC: an elastic slot's host arrays, addresses only until pinned
 #ifndef _WIN32
-    if (p.mode == 1 && slot_G > 0 && host_elastic_on())
+    if (((p.mode == 1 && (slot_G > 0 || g_host_main)) || (p.mode == 2 && host_elastic)) && host_elastic_on())
         st.host_elastic = host_pool_make(kv_per_slot(s, st.kv_hybrid, st.kv_q4, st.kv_int8), pages, s.page_size, hel);
 #endif
     if (st.host_elastic >= 0) {   // (kv_per_slot's order, as the carve below)
