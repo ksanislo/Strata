@@ -169,19 +169,28 @@ bool session_slot_fit(SessionState& s, int64_t cells, bool trim) {
             qsa_slot_trim(*st, cells);
             qsa_host_trim(*st, cells);   // STRATA_KV_HOST_ELASTIC: the host copy too
         }
+        if (s.host_follow != nullptr) qsa_host_trim(*s.host_follow, cells);
         s.slot_cells = std::min(s.slot_cells, cells);
     }
     if (!qsa_slots_grow(sts, cells)) return false;
     for (const QsaState* st : sts)   // the cells past the VRAM ring live in the host copy only
         if (!qsa_host_grow(*st, cells)) return false;
+    if (s.host_follow != nullptr && !qsa_host_grow(*s.host_follow, cells)) return false;
     s.slot_cells = std::max(s.slot_cells, cells);
     return true;
+}
+
+bool session_host_fit(SessionState& s, int64_t cells) {
+    cells = std::min<int64_t>(std::max<int64_t>(cells, 1), s.max_cells);
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
+        if (!qsa_host_grow(s.qsa_states[s.qsa_ord0 + j], cells)) return false;
+    return s.host_follow == nullptr || qsa_host_grow(*s.host_follow, cells);
 }
 
 uint64_t session_host_backed(const SessionState& s) {
     uint64_t n = 0;
     for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) n += qsa_host_backed_bytes(s.qsa_states[s.qsa_ord0 + j]);
-    return n;
+    return n + (s.host_follow != nullptr ? qsa_host_backed_bytes(*s.host_follow) : 0);
 }
 
 int64_t session_slot_need(const SessionState& s, int64_t cells) {
