@@ -653,6 +653,7 @@ constexpr uint64_t kHostPiece = strata::kernels::kSplitCopyBytes;
 std::mutex g_host_mu;
 std::vector<std::unique_ptr<HostPool>> g_host_pools;
 bool g_host_main = false;   // qsa_set_host_elastic_main: the solo sessions' streamed states too
+std::atomic<bool> g_host_failed{false};   // qsa_host_pin_failed: the last qsa_host_grow ran out of RAM
 bool host_elastic_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_KV_HOST_ELASTIC");
@@ -740,6 +741,7 @@ bool qsa_host_grow(const QsaState& st, int64_t cells) {
             if (e != cudaSuccess || cudaHostGetDevicePointer(&d, a, 0) != cudaSuccess || d != (void*) a) {
                 if (e == cudaSuccess) (void) cudaHostUnregister(a);   // (the device address is not the host's)
                 (void) cudaGetLastError();
+                g_host_failed = true;
                 std::fprintf(stderr, "strata: KV streaming: pinning more of a slot's host copy failed (%s; %.2f GiB pinned "
                                      "for K/V in all)\n", cudaGetErrorString(e), (double) g_kv_host_bytes.load() / 1073741824.0);
                 for (size_t j = 0; j < p.per.size(); ++j)
@@ -756,6 +758,7 @@ bool qsa_host_grow(const QsaState& st, int64_t cells) {
             g_kv_host_bytes += kHostPiece;
         }
     }
+    g_host_failed = false;
     return true;
 #else
     (void) st; (void) cells;
@@ -1168,6 +1171,13 @@ int64_t qsa_kv_resident() { return g_kv_resident; }
 int64_t qsa_kv_resident_min() { return 20480; }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes.load(); }
 uint64_t qsa_kv_host_reserved_bytes() { return g_kv_host_reserved.load(); }
+bool qsa_host_pin_failed() {
+#ifndef _WIN32
+    return g_host_failed.load();
+#else
+    return false;
+#endif
+}
 void qsa_set_host_elastic_main(bool on) {
 #ifndef _WIN32
     g_host_main = on;
