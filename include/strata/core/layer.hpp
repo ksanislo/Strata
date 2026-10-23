@@ -243,6 +243,9 @@ struct QsaState {
     /// An elastic --batch slot state (STRATA_ELASTIC_SLOTS): its arrays larger than a chunk are in a VMM range of its
     /// own, backed by qsa_slots_grow - its index in layer.cpp's registry; -1: carved as before.
     int32_t slot_elastic = -1;
+    /// STRATA_KV_HOST_ELASTIC: an elastic slot state's KV-streaming host copy has addresses for the whole context and
+    /// RAM pinned only as far as qsa_host_grow has reached - its index in layer.cpp's registry; -1: pinned whole.
+    int32_t host_elastic = -1;
     strata::kernels::KvHostPools host;
     strata::kernels::KvStreamMap map;
     int64_t idx_pooled_rows = 0;     ///< rows of `idx_pooled` (a ring, which has no indexer, keeps 2)
@@ -313,6 +316,15 @@ int64_t qsa_kv_resident();
 int64_t qsa_kv_resident_min();
 /// Pinned host bytes the streamed states hold (their host copies).
 uint64_t qsa_kv_host_bytes();
+/// The host copies' addresses (pinned or not): what a host copy pinned whole would take.
+uint64_t qsa_kv_host_reserved_bytes();
+/// STRATA_KV_HOST_ELASTIC: an elastic state's host copy pinned for its first `cells` cells (whole steps of
+/// STRATA_KV_HOST_STEP cells); false: RAM or the driver refused (nothing of the failed step stays pinned).
+bool qsa_host_grow(const QsaState& st, int64_t cells);
+/// ... unpinned (and its pages given back) past the steps `cells` cells need, keeping the first step; the state's
+/// device is synchronized first.  Returns the bytes given back.
+uint64_t qsa_host_trim(const QsaState& st, int64_t cells);
+uint64_t qsa_host_backed_bytes(const QsaState& st);
 /// Plan v0.3 P7: store K/V as INT8 with FP16 scales per 64 values (half the VRAM of FP16). Set before sizing and
 /// initializing the session; default off until gate G-C accepts it.
 void qsa_set_kv_int8(bool enabled);

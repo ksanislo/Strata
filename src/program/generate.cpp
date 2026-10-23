@@ -5572,6 +5572,7 @@ int main(int argc, char** argv) {
                      last ? " and the head" : "", (double) fb / 1073741824.0);
     }
 
+    const uint64_t kv_host_solo = strata::core::qsa_kv_host_bytes();   // the solo session's host K/V, every stage
     // --batch: every stage carves o.batch more sessions like its own (same layer range and context), one per
     // slot of the batch windows.  Before the expert cache is sized, so `--expert-cache auto` leaves them room.
     // Recommend, never force: a count the engine cannot run is said and adjusted (or batching left off) - the
@@ -5893,6 +5894,17 @@ int main(int argc, char** argv) {
                              (double) fb / 1073741824.0);
             }
         }
+    }
+    if (const uint64_t all = strata::core::qsa_kv_host_reserved_bytes(); all > 0) {   // (the line after the main session counts its first stage only)
+        const uint64_t now = strata::core::qsa_kv_host_bytes();
+        std::fprintf(stderr, "strata generate: KV streaming: %.2f GiB of pinned RAM for the K/V of every session at "
+                             "--max-context %lld (the solo session %.2f GiB, the batch slots and the drafters %.2f GiB)",
+                     (double) now / 1073741824.0, (long long) o.max_context, (double) kv_host_solo / 1073741824.0,
+                     (double) (now - kv_host_solo) / 1073741824.0);
+        if (now < all)   // STRATA_KV_HOST_ELASTIC
+            std::fprintf(stderr, "; the slots' copies grow with their conversations, %.2f GiB if every one were full",
+                         (double) all / 1073741824.0);
+        std::fprintf(stderr, "\n");
     }
     // THE HEAD BEFORE THE CACHE, AND BEFORE THE ARENA.  The expert cache takes what is free minus the reserve, so
     // everything allocated after it comes out of the reserve.  The native head (~0.5 GB with IQ3_S) was loaded after
@@ -12201,7 +12213,9 @@ int main(int argc, char** argv) {
         // per card, the slot budget, its free part and what the expert cache can still give it (STRATA_ELASTIC_SLOTS_GIVE,
         // down to give_floor) on stdout whenever they change (the server's context memory):
         // KMEM <cards> then <device> <budget bytes> <free bytes> <givable bytes> per card
-        std::vector<uint64_t> kmem_last;
+        // HMEM <pinned> <whole> <slots> then <bytes> per slot: the RAM pinned for the KV-streaming host copies, what it would
+        // be pinned whole, and each slot's part on every stage (STRATA_KV_HOST_ELASTIC)
+        std::vector<uint64_t> kmem_last, hmem_last;
         auto kmem_note = [&]() {
             if (!eslots_on) return;
             std::vector<uint64_t> v;
@@ -12212,6 +12226,20 @@ int main(int argc, char** argv) {
                 v.push_back(f);
                 v.push_back(give_on && k < gv.size() && gv[k].lo > give_floor
                                 ? (uint64_t) (gv[k].cache->bytes_of(gv[k].lo) - gv[k].cache->bytes_of(give_floor)) : 0);
+            }
+            std::vector<uint64_t> h = {strata::core::qsa_kv_host_bytes(), strata::core::qsa_kv_host_reserved_bytes()};
+            for (size_t b = 0; b < bs.size(); ++b) {
+                uint64_t n = 0;
+                for (const auto& stage : bslot_ss) n += b < stage.size() ? strata::core::session_host_backed(*stage[b]) : 0;
+                h.push_back(n);
+            }
+            if (h != hmem_last && h[1] > 0) {
+                hmem_last = h;
+                std::string ln = "HMEM " + std::to_string(h[0]) + " " + std::to_string(h[1]) + " " + std::to_string(bs.size());
+                for (size_t b = 0; b < bs.size(); ++b) ln += " " + std::to_string(h[2 + b]);
+                ln += "\n";
+                std::fwrite(ln.data(), 1, ln.size(), stdout);
+                std::fflush(stdout);
             }
             if (v == kmem_last) return;
             kmem_last = v;
@@ -13119,6 +13147,13 @@ int main(int argc, char** argv) {
         };
         std::vector<PGroup> pg((size_t) (piped ? o.batch_groups : 0));
         std::vector<int> stage_group((size_t) n_pipe, -1);
+        // the slots each group holds, group-major: member t of group gi is slot gi * GS + t until STRATA_REGROUP trades
+        // two (piped MTP only: the padded windows and the serial path need a group's slots in a row)
+        std::vector<int> gmem(pg.size() * (size_t) GS);
+        for (size_t i = 0; i < gmem.size(); ++i) gmem[i] = (int) i;
+        std::vector<int> grp_of(bs.size(), -1);
+        for (size_t i = 0; i < gmem.size(); ++i) grp_of[(size_t) gmem[i]] = (int) (i / (size_t) GS);
+        auto gm = [&](int gi, int t) { return gmem[(size_t) (gi * GS + t)]; };
         int64_t pipe_tick = 0, rr = 0;
         auto pipe_inflight = [&] { for (const PGroup& x : pg) if (x.inflight || x.drafting) return true; return false; };
         int64_t pm_prop = 0, pm_acc = 0;   // STRATA_PIPED_MTP: drafts verified, accepted
@@ -13250,7 +13285,7 @@ int main(int argc, char** argv) {
             bool lane_w[strata::kernels::kVerifyMaxT] = {};   // STRATA_FAST_LANE: group slot t's rows were prompt rows
             for (int t = 0; t < GS; ++t) {
                 if (L.first[t] < 0) continue;
-                const int b = gi * GS + t, i = L.first[t];
+                const int b = gm(gi, t), i = L.first[t];
                 const BSlot& sl = bs[(size_t) b];
                 if (sl.lane) {   // every row kept
                     lane_w[t] = true;
@@ -13268,7 +13303,7 @@ int main(int argc, char** argv) {
             if (fl_dump != nullptr)   // (STRATA_FAST_LANE_DUMP: before anything else is queued on this stage)
                 for (int t = 0; t < GS; ++t) {
                     if (L.first[t] < 0) continue;
-                    const BSlot& sl = bs[(size_t) (gi * GS + t)];
+                    const BSlot& sl = bs[(size_t) gm(gi, t)];
                     if (lane_w[t] && sl.p + L.n[t] >= (int64_t) sl.lane_ids.size())
                         fl_dump_first(vk, L.first[t] + L.n[t] - 1, sl.lane_ids, "lane");
                     else if (!lane_w[t] && sl.adm_log) {   // a read's first window: its row 0 is the prompt's last token
@@ -13283,7 +13318,7 @@ int main(int argc, char** argv) {
             int32_t lane_next[strata::kernels::kVerifyMaxT][strata::kernels::kVerifyMaxT] = {};   // its drafter's catch-up
             for (int t = 0; t < GS; ++t) {
                 if (L.first[t] < 0) continue;
-                const int b = gi * GS + t, i = L.first[t];
+                const int b = gm(gi, t), i = L.first[t];
                 BSlot& sl = bs[(size_t) b];
                 if (lane_w[t]) {
                     if (!fl_verdict(b, L.n[t], i, outb, L.tok, vk, lane_next[t])) return false;
@@ -13335,7 +13370,7 @@ int main(int argc, char** argv) {
             {
                 const strata::core::OnDevice on_last(vk.device());
                 for (int t = 0; t < GS; ++t) {
-                    const int b = gi * GS + t;
+                    const int b = gm(gi, t);
                     if (L.first[t] < 0 || !bs[(size_t) b].active) continue;
                     // (STRATA_FAST_LANE: the drafter's catch-up over a lane window may still read the buffer)
                     if (lane_cu_live[(size_t) b] && cudaStreamWaitEvent(vk.stream(), lane_cu_ev[(size_t) b], 0) != cudaSuccess) {
@@ -13356,7 +13391,7 @@ int main(int argc, char** argv) {
                 }
             }
             for (int t = 0; t < GS && any; ++t) {
-                const int b = gi * GS + t;
+                const int b = gm(gi, t);
                 if (L.first[t] < 0 || !bs[(size_t) b].active) continue;
                 strata::core::MtpDrafter& d = *slot_mtp[(size_t) b];
                 const strata::core::OnDevice on_d(d.device());
@@ -13393,7 +13428,7 @@ int main(int argc, char** argv) {
                 bool all = true;
                 for (int t = 0; t < GS; ++t) {
                     if (!G.dpend[t]) continue;
-                    const int b = gi * GS + t;
+                    const int b = gm(gi, t);
                     const int r = slot_mtp[(size_t) b]->draft_poll(bs[(size_t) b].draft.data(), err, &bs[(size_t) b].n_draft);
                     if (r < 0) { std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str()); return false; }
                     if (r == 0) { all = false; continue; }
@@ -13408,8 +13443,50 @@ int main(int argc, char** argv) {
             }
             return true;
         };
+        // STRATA_REGROUP (piped MTP; =0: off): a group decoding two slots more than another trades a live slot for a free one
+        // there, so the windows spread over the stages (a returning conversation goes back to the slot that holds it,
+        // whichever group that is).  The trade waits until the live slot's group is between windows with its drafts in
+        // and both groups' commits have landed on every stage (a commit reads its slots' staged rows); the group waits
+        // with its next window meanwhile.
+        static const bool regroup_on = [] {
+            const char* v = std::getenv("STRATA_REGROUP");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        int regroup_hold = -1;
+        auto regroup = [&] {
+            regroup_hold = -1;
+            if (!piped_mtp || !regroup_on || pg.size() < 2) return;
+            std::unique_ptr<bool[]> live(new bool[gmem.size()]), free_slot(new bool[gmem.size()]);
+            for (size_t i = 0; i < gmem.size(); ++i) {
+                const BSlot& sl = bs[(size_t) gmem[i]];
+                live[i] = sl.active;
+                free_slot[i] = !sl.active && !sl.reading;
+            }
+            const auto m = strata::program::batch_groups::regroup_pick((int) pg.size(), GS, live.get(), free_slot.get());
+            if (m.from < 0) return;
+            auto landed = [&](int gi) {
+                const int hb = strata::program::batch_groups::piped_mtp_hbase(gi, pm_group_rows);
+                for (int k = 0; k < n_pipe; ++k)
+                    if (!stage_verifier(k).batch_launch_ready(hb)) return false;
+                return true;
+            };
+            const PGroup& A = pg[(size_t) m.from];
+            if (A.inflight || A.drafting || !landed(m.from) || !landed(m.to)) {
+                regroup_hold = m.from;
+                return;
+            }
+            int n_from = 0;
+            for (int t = 0; t < GS; ++t) n_from += live[(size_t) (m.from * GS + t)] ? 1 : 0;
+            int& x = gmem[(size_t) (m.from * GS + m.from_t)];
+            int& y = gmem[(size_t) (m.to * GS + m.to_t)];
+            std::swap(x, y);
+            grp_of[(size_t) x] = m.from;
+            grp_of[(size_t) y] = m.to;
+            std::fprintf(stderr, "strata batch: slot %d decodes in group %d now (group %d had %d decoding), slot %d goes "
+                                 "to group %d\n", y, m.to, m.from, n_from, x, m.from);
+        };
         auto group_active = [&](int gi) {
-            for (int t = 0; t < GS; ++t) if (bs[(size_t) (gi * GS + t)].active) return true;
+            for (int t = 0; t < GS; ++t) if (bs[(size_t) gm(gi, t)].active) return true;
             return false;
         };
         // STRATA_SLOT_ADMIT: a group whose window would pad a slot that is being read waits until the read is done
@@ -13425,8 +13502,8 @@ int main(int argc, char** argv) {
             if (piped_mtp && !hold_with_pm) return false;
             bool act[strata::kernels::kVerifyMaxT] = {}, rd[strata::kernels::kVerifyMaxT] = {};
             for (int t = 0; t < GS; ++t) {
-                act[t] = bs[(size_t) (gi * GS + t)].active;
-                rd[t] = bs[(size_t) (gi * GS + t)].reading;
+                act[t] = bs[(size_t) gm(gi, t)].active;
+                rd[t] = bs[(size_t) gm(gi, t)].reading;
             }
             return strata::program::group_pads_reading(act, rd, GS);
         };
@@ -13447,8 +13524,9 @@ int main(int argc, char** argv) {
         };
         // slots [b0, b0 + n) whose window found no VRAM on stage k: each request ends with `BDONE <slot> <n> vram` and the
         // slot drops its state (the stages before k may have run the window)
-        auto end_slots_vram = [&](int b0, int n, int k, const std::string& why) {
-            for (int b = b0; b < b0 + n; ++b) {
+        auto end_slots_vram = [&](int gi, int k, const std::string& why) {
+            for (int t = 0; t < GS; ++t) {
+                const int b = gm(gi, t);
                 BSlot& sl = bs[(size_t) b];
                 if (!sl.active) continue;
                 std::fprintf(stderr, "strata batch: slot %d ends at position %lld: no VRAM for its window on stage %d "
@@ -13504,14 +13582,14 @@ int main(int argc, char** argv) {
                 }
                 const int32_t* outb = vk.batch_out();
                 for (int t = 0; t < G.S; ++t) {
-                    BSlot& sl = bs[(size_t) (gi * GS + t)];
+                    BSlot& sl = bs[(size_t) gm(gi, t)];
                     if (!sl.active) continue;
                     if (vk.nonfinite_in(t)) {   // #879: the slot ends, nothing emitted
                         std::fprintf(stderr, "strata batch: non-finite logits (#879) in slot %d at position %lld: it "
                                              "ends (BDONE nonfinite) and the next request reads its prompt from token 0\n",
-                                     gi * GS + t, (long long) sl.p);
+                                     gm(gi, t), (long long) sl.p);
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                        std::printf("BDONE %d %lld nonfinite %.1f\n", gi * GS + t, (long long) sl.produced, ms);
+                        std::printf("BDONE %d %lld nonfinite %.1f\n", gm(gi, t), (long long) sl.produced, ms);
                         sl.active = false;
                         sl.cached = false;
                         sl.checks.clear();
@@ -13519,9 +13597,9 @@ int main(int argc, char** argv) {
                         continue;
                     }
                     const int32_t y = outb[t];
-                    std::printf("BT %d %d\n", gi * GS + t, (int) y);
+                    std::printf("BT %d %d\n", gm(gi, t), (int) y);
                     ++sl.produced;
-                    adm_first(gi * GS + t);   // STRATA_SLOT_ADMIT: the admission's line, at its first token
+                    adm_first(gm(gi, t));   // STRATA_SLOT_ADMIT: the admission's line, at its first token
                     ++bt_rows;
                     ++pipe_rows;
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
@@ -13530,7 +13608,7 @@ int main(int argc, char** argv) {
                     sl.ids.push_back(sl.x);
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-                        std::printf("BDONE %d %lld %s %.1f\n", gi * GS + t, (long long) sl.produced, fin, ms);
+                        std::printf("BDONE %d %lld %s %.1f\n", gm(gi, t), (long long) sl.produced, fin, ms);
                         sl.active = false;
                         // a pipelined slot is a cache again (#857: a request left alone in its slot goes back to the solo path with its
                         // drafts): its state is final once its last window has left the last stage.  A later group window whose pad
@@ -13565,6 +13643,7 @@ int main(int argc, char** argv) {
                         elastic_idle((size_t) k, !in_prompt_read, -1);
                     }
             if (piped_mtp && !pm_collect()) return false;
+            regroup();
             // start waiting groups on free stages, the longest waiting first; a new step on stage 0 round-robin
             for (int k = n_pipe - 1; k >= 0; --k) {
                 if (stage_group[(size_t) k] >= 0) continue;
@@ -13580,13 +13659,14 @@ int main(int argc, char** argv) {
                     // (STRATA_FAST_LANE: a group with a lane read first)
                     auto lane_in = [&](int gi) {
                         for (int t = 0; t < GS; ++t)
-                            if (bs[(size_t) (gi * GS + t)].active && bs[(size_t) (gi * GS + t)].lane) return true;
+                            if (bs[(size_t) gm(gi, t)].active && bs[(size_t) gm(gi, t)].lane) return true;
                         return false;
                     };
                     for (int j = 0; j < 2 * (int) pg.size() && pick < 0; ++j) {
                         const int gi = (int) ((rr + j) % (int64_t) pg.size());
                         if (j < (int) pg.size() && (fast_lane_max <= 0 || !lane_in(gi))) continue;
                         if (!pg[(size_t) gi].inflight && !pg[(size_t) gi].drafting && group_active(gi) && !group_held(gi) &&
+                            gi != regroup_hold &&
                             (!piped_mtp || stage_verifier(0).batch_launch_ready(
                                                strata::program::batch_groups::piped_mtp_hbase(gi, pm_group_rows))))
                             pick = gi;
@@ -13596,9 +13676,9 @@ int main(int argc, char** argv) {
                     if (eslots_on) {   // its rows' slots backed on every stage before the window starts (pad rows: cell 0)
                         bool wait = false;   // (STRATA_PIPED_MTP: a slot's window may also write its drafts' cells)
                         for (int t = 0; t < GS; ++t)
-                            if (bs[(size_t) (pick * GS + t)].active)   // (STRATA_FAST_LANE: a lane slot's whole window)
-                                wait = slot_grow_or_end(pick * GS + t, bs[(size_t) (pick * GS + t)].p + 2 +
-                                                        (bs[(size_t) (pick * GS + t)].lane ? (int) strata::kernels::kVerifyMaxT
+                            if (bs[(size_t) gm(pick, t)].active)   // (STRATA_FAST_LANE: a lane slot's whole window)
+                                wait = slot_grow_or_end(gm(pick, t), bs[(size_t) gm(pick, t)].p + 2 +
+                                                        (bs[(size_t) gm(pick, t)].lane ? (int) strata::kernels::kVerifyMaxT
                                                          : piped_mtp ? pm_drafts : 0),
                                                         stage_quiet) == 2 || wait;
                         if (wait || !group_active(pick)) continue;   // (a card to give room is busy: the group starts later)
@@ -13606,7 +13686,7 @@ int main(int argc, char** argv) {
                     PGroup& G = pg[(size_t) pick];
                     G.S = 0;
                     G.active = 0;
-                    for (int t = 0; t < GS; ++t) if (bs[(size_t) (pick * GS + t)].active) {
+                    for (int t = 0; t < GS; ++t) if (bs[(size_t) gm(pick, t)].active) {
                         G.S = t + 1;
                         ++G.active;
                     }
@@ -13619,7 +13699,7 @@ int main(int argc, char** argv) {
                         const int32_t* lane_src[MT] = {};
                         bool any_lane = false;
                         for (int t = 0; t < GS && t < MT; ++t) {
-                            const BSlot& sl = bs[(size_t) (pick * GS + t)];
+                            const BSlot& sl = bs[(size_t) gm(pick, t)];
                             act[t] = sl.active;
                             nd[t] = sl.draft_ready ? sl.n_draft : 0;
                             xs[t] = sl.x;
@@ -13633,24 +13713,25 @@ int main(int argc, char** argv) {
                             }
                         }
                         const bool pm_on = strata::program::batch_groups::piped_mtp_on(active_total(), piped_mtp_max);
-                        G.lay = any_lane ? strata::program::fast_lane::layout(pick * GS, GS, act, lane_left, lane_src, nd, xs,
+                        G.lay = any_lane ? strata::program::fast_lane::layout(0, GS, act, lane_left, lane_src, nd, xs,
                                                                               dr, ps, left, pm_on, pm_drafts, pm_group_rows,
                                                                               o.max_context)
                                          : strata::program::batch_groups::piped_mtp_layout(
-                                               pick * GS, GS, act, nd, xs, dr, ps, left, pm_on, pm_drafts, pm_group_rows,
+                                               0, GS, act, nd, xs, dr, ps, left, pm_on, pm_drafts, pm_group_rows,
                                                o.max_context);
+                        strata::program::batch_groups::remap_rows(G.lay, gmem.data() + (size_t) pick * GS);
                         G.hbase = strata::program::batch_groups::piped_mtp_hbase(pick, pm_group_rows);
                         G.pm_t0 = Clock::now();
                         G.S = G.lay.S;
                         G.active = G.lay.active;
                     } else
                     for (int t = 0; t < G.S; ++t) {
-                        BSlot& sl = bs[(size_t) (pick * GS + t)];
+                        BSlot& sl = bs[(size_t) gm(pick, t)];
                         G.tok[t] = sl.active ? sl.x : 0;
                         G.pos[t] = sl.active ? sl.p : 0;
                         if (!sl.active && sl.cached && sdir)
                             std::fprintf(stderr, "strata batch: slot %d's conversation is not saved: a pipelined "
-                                                 "group's pad row overwrites it\n", pick * GS + t);
+                                                 "group's pad row overwrites it\n", gm(pick, t));
                         if (!sl.active) sl.cached = false;   // its pad row writes its state
                     }
                     G.inflight = true;
@@ -13691,7 +13772,7 @@ int main(int argc, char** argv) {
                             }
                     }
                     if (batch_telemetry_enabled) stage_in_flight.complete(k, Clock::now());
-                    end_slots_vram(pick * GS, GS, k, err);
+                    end_slots_vram(pick, k, err);
                     G.inflight = false;
                     continue;
                 }
@@ -14520,7 +14601,8 @@ int main(int argc, char** argv) {
             sl.reading = true;
             // a hole below an active slot of its group: a window of that group in flight may have it as a pad row
             const auto t_hole = Clock::now();
-            if (GS > 1 && pg[(size_t) (b / GS)].inflight && group_held(b / GS) && !pipe_drain()) return AdmEnd::fatal;
+            if (GS > 1 && pg[(size_t) grp_of[(size_t) b]].inflight && group_held(grp_of[(size_t) b]) && !pipe_drain())
+                return AdmEnd::fatal;
             note("its group drained", t_hole);
             std::string e;
             const auto t_mtp = Clock::now();
@@ -15024,13 +15106,14 @@ int main(int argc, char** argv) {
             ts.t_reads = Clock::now();
             auto br_tick = [&] {
                 if (br_max <= 0) return;
-                int groups = 0, active = 0, last_g = -1;
+                int groups = 0, active = 0;
+                std::vector<char> seen(bs.size(), 0);
                 for (size_t b = 0; b < bs.size(); ++b) {
                     if (!bs[b].active) continue;
-                    const int gi = piped ? (int) b / GS : (int) b;
+                    const int gi = piped ? grp_of[b] : (int) b;
                     if (piped && group_held(gi)) continue;   // (a held group cannot decode in a turn: not waited for)
                     ++active;
-                    if (gi != last_g) { ++groups; last_g = gi; }
+                    if (!seen[(size_t) gi]) { ++groups; seen[(size_t) gi] = 1; }
                 }
                 bool wait = false;
                 for (const auto& j : live)
