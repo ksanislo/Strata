@@ -209,9 +209,6 @@ int64_t session_vram_need(const SessionState& s, int64_t cells) {
     return qsa_slots_need(session_states(s), std::min<int64_t>(std::max<int64_t>(cells, 1), s.max_cells));
 }
 
-void session_vram_trim(SessionState& s, int64_t cells) {
-    for (const QsaState* st : session_states(s)) qsa_slot_trim(*st, std::max<int64_t>(cells, 1));
-}
 
 uint64_t session_host_backed(const SessionState& s) {
     uint64_t n = 0;
