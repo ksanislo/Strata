@@ -193,6 +193,26 @@ uint64_t session_host_trim(SessionState& s, int64_t cells) {
     return n + (s.host_follow != nullptr ? qsa_host_trim(*s.host_follow, cells) : 0);
 }
 
+namespace {
+std::vector<const QsaState*> session_states(const SessionState& s) {
+    std::vector<const QsaState*> sts;
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) sts.push_back(&s.qsa_states[s.qsa_ord0 + j]);
+    return sts;
+}
+}  // namespace
+
+bool session_vram_fit(SessionState& s, int64_t cells) {
+    return qsa_slots_grow(session_states(s), std::min<int64_t>(std::max<int64_t>(cells, 1), s.max_cells));
+}
+
+int64_t session_vram_need(const SessionState& s, int64_t cells) {
+    return qsa_slots_need(session_states(s), std::min<int64_t>(std::max<int64_t>(cells, 1), s.max_cells));
+}
+
+void session_vram_trim(SessionState& s, int64_t cells) {
+    for (const QsaState* st : session_states(s)) qsa_slot_trim(*st, std::max<int64_t>(cells, 1));
+}
+
 uint64_t session_host_backed(const SessionState& s) {
     uint64_t n = 0;
     for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) n += qsa_host_backed_bytes(s.qsa_states[s.qsa_ord0 + j]);
