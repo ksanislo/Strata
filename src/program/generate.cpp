@@ -5564,6 +5564,7 @@ int main(int argc, char** argv) {
             strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
             strata::core::ExpertCache::set_vmm(on);
         }
+        strata::core::qsa_set_host_elastic_main(o.serve);   // STRATA_KV_HOST_ELASTIC: the solo session and the stages' too
         if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
             return 1;
@@ -5621,6 +5622,7 @@ int main(int argc, char** argv) {
                      last ? " and the head" : "", (double) fb / 1073741824.0);
     }
 
+    strata::core::qsa_set_host_elastic_main(false);   // (the slots' own rule decides theirs)
     const uint64_t kv_host_solo = strata::core::qsa_kv_host_bytes();   // the solo session's host K/V, every stage
     // --batch: every stage carves o.batch more sessions like its own (same layer range and context), one per
     // slot of the batch windows.  Before the expert cache is sized, so `--expert-cache auto` leaves them room.
@@ -5922,6 +5924,8 @@ int main(int argc, char** argv) {
         if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st && !mtp_first ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
         mtp.set_ple_session(&ss);
+        if (mtp.kv_state().host_elastic >= 0)   // STRATA_KV_HOST_ELASTIC: the solo drafter's copy follows its session
+            (last_st && !mtp_first ? last_st->ss : ss).host_follow = &mtp.kv_state();
 #if defined(STRATA_HAVE_DFLASH2)
         if (o.draft == "dflash2") {
             const char* why = o.mtp.empty() ? "it needs --mtp (the fallback) and --spec 2 or more"
@@ -5982,6 +5986,15 @@ int main(int argc, char** argv) {
                 }
                 d->set_max_drafts(piped_mtp ? pm_drafts : 1);   // the serial windows verify one proposal per slot
                 d->set_ple_session(bslot_ss[0][(size_t) b].get());
+                // STRATA_KV_HOST_ELASTIC: its host copy follows the slot's (backed now for what the slot already is)
+                strata::core::SessionState& owner = *bslot_ss.back()[(size_t) b];
+                if (d->kv_state().host_elastic >= 0) {
+                    owner.host_follow = &d->kv_state();
+                    if (!strata::core::qsa_host_grow(d->kv_state(), std::max<int64_t>(owner.slot_cells, 1))) {
+                        std::fprintf(stderr, "strata generate: batch MTP slot %d: no RAM to pin for its K/V copy\n", b);
+                        return 1;
+                    }
+                }
                 slot_mtp.push_back(std::move(d));
             }
             if (!slot_mtp.empty()) {
@@ -6004,6 +6017,19 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "; the slots' copies grow with their conversations, %.2f GiB if every one were full",
                          (double) all / 1073741824.0);
         std::fprintf(stderr, "\n");
+    }
+    // STRATA_KV_HOST_ELASTIC: the solo session's host copies (every stage, its drafter) pinned for `cells` before anything
+    // writes them: a request's prompt and max_new, a restored conversation.  They only grow (the conversation they hold
+    // is parked from them after a new request has started)
+    auto solo_host_fit = [&](int64_t cells) -> bool {
+        if (!strata::core::session_host_fit(ss, cells)) return false;
+        for (auto& st : stages)
+            if (!strata::core::session_host_fit(st->ss, cells)) return false;
+        return true;
+    };
+    if (!solo_host_fit(1)) {
+        std::fprintf(stderr, "strata generate: no RAM to pin the first cells of the solo session's K/V copy\n");
+        return 1;
     }
     // THE HEAD BEFORE THE CACHE, AND BEFORE THE ARENA.  The expert cache takes what is free minus the reserve, so
     // everything allocated after it comes out of the reserve.  The native head (~0.5 GB with IQ3_S) was loaded after
@@ -16550,6 +16576,10 @@ int main(int argc, char** argv) {
                         }
                     }
                     if (stage_invalid) { refuse(err); continue; }
+                    if (!solo_host_fit((int64_t) image.live.ids.size() + 256)) {   // STRATA_KV_HOST_ELASTIC: its cells pinned
+                        refuse("no RAM is left to pin the saved conversation's context", strata::core::SessionError::memory);
+                        continue;
+                    }
                     // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells
                     if (!kvg_ensure((int64_t) image.live.ids.size() + 256, adapt_quiesce)) {
                         refuse("the K/V cannot grow to the saved conversation: no VRAM is left", strata::core::SessionError::memory);
@@ -16811,6 +16841,10 @@ int main(int argc, char** argv) {
             if (n + max_new + 8 > o.max_context) {
                 std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
                             (long long) max_new, (long long) o.max_context);
+                continue;
+            }
+            if (!solo_host_fit(std::min<int64_t>(o.max_context, n + max_new + 64))) {   // STRATA_KV_HOST_ELASTIC
+                std::printf("ERR no RAM is left to pin this request's context (%lld tokens)\n", (long long) (n + max_new));
                 continue;
             }
             bool bad = false;
@@ -17198,6 +17232,10 @@ int main(int argc, char** argv) {
                                  slot_ck != nullptr ? "its turn checkpoint" : "all it holds",
                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                 }
+            }
+            if (incoming && !solo_host_fit((int64_t) incoming->live.ids.size() + 256)) {   // STRATA_KV_HOST_ELASTIC
+                std::printf("ERR no RAM is left to pin the parked conversation's context\n");
+                return 1;
             }
             // the elastic K/V: a parked conversation is restored whole, and it may be longer than this prompt
             if (incoming && !kvg_ensure((int64_t) incoming->live.ids.size() + 256, kv_quiesce)) {
