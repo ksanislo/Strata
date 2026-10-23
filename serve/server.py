@@ -5959,18 +5959,21 @@ class Service:
                                     for k in list(self.conv_ended)[:1024]:
                                         self.conv_ended.pop(k, None)
                             if self.events is not None:
-                                row = self.terminal_requests.get(request_id) or {}
-                                adm = row.get("admitted_at")
-                                lc = logctx.current()
-                                self.events.write(
-                                    "request", id=request_id, conv=conv, gap_s=conv_gap, slot=lc.get("slot"),
-                                    client=lc.get("client"), prompt=len(ids),
-                                    reused=ctx.get("reused") if ctx and ctx_msg else None,
-                                    source=ctx.get("source") if ctx and ctx_msg else None, generated=n,
-                                    finish=finish, cancel=cancel.is_set() or None,
-                                    wait_s=round(adm - queued_t, 2) if adm else None,
-                                    ttft_s=round(ft - st.get("started", now), 2) if ft else None,
-                                    total_s=round(now - queued_t, 2), tok_s=round(rate, 1) if rate else None)
+                                try:                                 # (a log never fails the request)
+                                    row = self.terminal_requests.get(request_id) or {}
+                                    adm = row.get("admitted_at")
+                                    lc = logctx.current()
+                                    self.events.write(
+                                        "request", id=request_id, conv=conv, gap_s=conv_gap, slot=lc.get("slot"),
+                                        client=lc.get("client"), prompt=len(ids),
+                                        reused=ctx.get("reused") if ctx and ctx_msg else None,
+                                        source=ctx.get("source") if ctx and ctx_msg else None, generated=n,
+                                        finish=finish, cancel=cancel.is_set() or None,
+                                        wait_s=round(adm - queued_t, 2) if adm else None,
+                                        ttft_s=round(ft - st.get("started", now), 2) if ft else None,
+                                        total_s=round(now - queued_t, 2), tok_s=round(rate, 1) if rate else None)
+                                except Exception:  # noqa: BLE001
+                                    pass
                             if finish == "length" and parser.state in ("reasoning", "rcall"):   # #530
                                 print("[strata] the reply reached max tokens while still thinking, so it has no "
                                       "answer: a thinking budget (reasoning_budget_tokens, in the request or in "
