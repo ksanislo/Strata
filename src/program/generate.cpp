@@ -6043,12 +6043,28 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: no RAM to pin the first cells of the solo session's K/V copy\n");
         return 1;
     }
+    // STRATA_KV_VRAM_ELASTIC needs the elastic slots' budget to grow from; when the batch ended up without them (off,
+    // or no slot fitted), the solo session's VRAM pools are backed whole now, as when they were carved
+    if (![&] { for (const auto& v : bslot_ss) if (!v.empty() && v[0]->slot_cells >= 0) return true; return false; }()) {
+        auto back_whole = [&](strata::core::SessionState& u, int dev) {
+            const strata::core::OnDevice on(dev);
+            for (int64_t j = 0; u.qsa_states != nullptr && j < u.qsa_alloc; ++j)
+                if (!strata::core::qsa_slots_grow_fresh(u.qsa_states[u.qsa_ord0 + j], o.max_context)) return false;
+            return true;
+        };
+        bool ok = back_whole(ss, primary_device);
+        for (auto& st : stages) ok = ok && back_whole(st->ss, st->dev);
+        if (!ok) {
+            std::fprintf(stderr, "strata generate: the solo session's K/V pools do not fit in VRAM%s\n", vram_free_note().c_str());
+            return 1;
+        }
+    }
     // STRATA_KV_VRAM_ELASTIC: the solo session's VRAM pools and pooled keys for `cells` (every stage), the expert cache
     // giving the budget room when it is short; set where the elastic slots' give is (null: nothing to grow)
     std::function<bool(int64_t)> solo_vram_fit;
+    // (the host copies only: the VRAM ring's residency map may name any of its slots, so the solo session's VRAM pools
+    // keep what they grew to - a slot trims its own only with its state reset)
     auto solo_host_trim = [&](int64_t cells) {
-        strata::core::session_vram_trim(ss, cells);
-        for (auto& st : stages) strata::core::session_vram_trim(st->ss, cells);
         uint64_t n = strata::core::session_host_trim(ss, cells);
         for (auto& st : stages) n += strata::core::session_host_trim(st->ss, cells);
         if (n > 0)
