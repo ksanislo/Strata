@@ -321,6 +321,11 @@ uint64_t qsa_kv_host_reserved_bytes();
 /// STRATA_KV_HOST_ELASTIC: the states qsa_state_init makes from now on with a streamed host copy (not only the elastic
 /// slots') get one that grows (session_host_fit); --serve sets it around the solo session and the stages' sessions.
 void qsa_set_host_elastic_main(bool on);
+/// ... and their VRAM K/V pools and pooled indexer keys in a slot pool of their own (backed as the context grows:
+/// session_vram_fit; the first cells at once, from new chunks: they are used before a slot budget exists).
+void qsa_set_vram_elastic_main(bool on);
+/// A slot pool backed for `cells` from new chunks of its device (not a budget): a solo session's first cells.
+bool qsa_slots_grow_fresh(const QsaState& st, int64_t cells);
 /// The last qsa_host_grow found no RAM to pin (what a "no room" after a failed slot growth means: RAM, not VRAM).
 bool qsa_host_pin_failed();
 /// STRATA_KV_HOST_ELASTIC: an elastic state's host copy pinned for its first `cells` cells (whole steps of
