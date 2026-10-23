@@ -187,6 +187,12 @@ bool session_host_fit(SessionState& s, int64_t cells) {
     return s.host_follow == nullptr || qsa_host_grow(*s.host_follow, cells);
 }
 
+uint64_t session_host_trim(SessionState& s, int64_t cells) {
+    uint64_t n = 0;
+    for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) n += qsa_host_trim(s.qsa_states[s.qsa_ord0 + j], cells);
+    return n + (s.host_follow != nullptr ? qsa_host_trim(*s.host_follow, cells) : 0);
+}
+
 uint64_t session_host_backed(const SessionState& s) {
     uint64_t n = 0;
     for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j) n += qsa_host_backed_bytes(s.qsa_states[s.qsa_ord0 + j]);
