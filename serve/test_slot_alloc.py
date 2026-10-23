@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import random
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -102,6 +104,28 @@ class OneSlotGroups(unittest.TestCase):
         hist = list(range(1000, 1700))
         e.slot_held[3] = hist + [T, 7, 8] + [50]
         self.assertEqual(e.pick_slot(hist + [T, 5, 6] + list(range(3000, 3050))), 0)
+
+
+
+class NextPass(unittest.TestCase):
+    """A request that goes on in a next pass (the thinking budget's wrap-up) keeps its slot for it: freed, it went to a
+    request waiting for a slot and the next pass read the whole conversation again elsewhere (soak: 60-160 s stalls)."""
+
+    def test_the_kept_slot_waits_for_its_request_only(self):
+        e = engine(4, 4)
+        e.slot_busy = [True, False, True, True]          # slot 1 is the only free one: its request is between passes
+        e.slot_kept = {1: (threading.get_ident(), time.monotonic() + 5)}
+        self.assertEqual(e.pick_slot([1, 2, 3]), 1)       # this thread's next pass
+        other = []
+        t = threading.Thread(target=lambda: other.append(e.pick_slot([9, 9, 9])))
+        t.start(); t.join()
+        self.assertEqual(other, [None])                   # a request waiting for a slot does not take it
+
+    def test_an_old_keep_is_ignored(self):
+        e = engine(4, 2)
+        e.slot_busy = [True, False, True, True]
+        e.slot_kept = {1: (threading.get_ident() + 1, time.monotonic() - 1)}   # another request's, expired
+        self.assertEqual(e.pick_slot([1]), 1)
 
 
 if __name__ == "__main__":
