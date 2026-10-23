@@ -15,6 +15,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
+#include "strata/kernels/split_copy.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/fuse_decode.hpp"
 #include "strata/kernels/rope.hpp"
@@ -642,9 +643,13 @@ struct HostPool {
     uint8_t* base = nullptr;
     uint64_t total = 0;
     std::vector<uint64_t> off, per;   // each array's offset in the range, its bytes per page
-    int64_t pages = 0, unit = 0, units = 0;   // logical pages; pages per step; steps pinned (a prefix)
+    std::vector<int64_t> pinned;      // each array's pinned pieces (a prefix, kHostPiece bytes each)
+    int64_t pages = 0, unit = 0;      // logical pages; pages per growth step
     int dev = -1;
 };
+// pinned in pieces of kHostPiece bytes at kHostPiece-aligned addresses: the bulk copies split at the same boundaries
+// (kernels::memcpy_async_split), so no copy spans two registrations (one cudaMemcpyAsync across two is refused)
+constexpr uint64_t kHostPiece = strata::kernels::kSplitCopyBytes;
 std::mutex g_host_mu;
 std::vector<std::unique_ptr<HostPool>> g_host_pools;
 bool host_elastic_on() {
@@ -672,27 +677,26 @@ int64_t host_step_pages(int64_t page_size) {
         const long long n = v != nullptr ? std::atoll(v) : 0;
         return n > 0 ? (int64_t) n : (int64_t) 8192;
     }();
-    // whole 4 KiB pages for every array: a step of 1024 pages keeps the 64-byte-per-page scale arrays page-aligned
-    return std::max<int64_t>(1024, (cells + page_size - 1) / page_size + 1023) / 1024 * 1024;
+    return std::max<int64_t>(1, (cells + page_size - 1) / page_size);
 }
-// A state's host copy as addresses only; the pointers `host` gets are the arrays' bases.  -1: not made (the caller pins
-// it whole as before).
+// A state's host copy as addresses only; `arr` gets the arrays' bases.  -1: not made (the caller pins it whole).
 int32_t host_pool_make(const std::vector<uint64_t>& per, int64_t pages, int64_t page_size, uint8_t** arr) {
     auto pool = std::make_unique<HostPool>();
     pool->pages = pages;
     pool->unit = host_step_pages(page_size);
-    const int64_t steps = (pages + pool->unit - 1) / pool->unit;
-    constexpr uint64_t A = 2ull << 20;
     for (const uint64_t b : per) {
         pool->off.push_back(pool->total);
         pool->per.push_back(b);
-        pool->total += ((uint64_t) steps * pool->unit * b + A - 1) / A * A;
+        pool->pinned.push_back(0);
+        pool->total += ((uint64_t) pages * b + kHostPiece - 1) / kHostPiece * kHostPiece;
     }
-    void* m = mmap(nullptr, (size_t) pool->total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    // (an extra piece to align the base: mmap gives page alignment only)
+    void* m = mmap(nullptr, (size_t) (pool->total + kHostPiece), PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (m == MAP_FAILED) return -1;
+    pool->base = (uint8_t*) (((uintptr_t) m + kHostPiece - 1) / kHostPiece * kHostPiece);
     if (const int node = strata::core::numa_place_current_node(); node >= 0)   // STRATA_NUMA_PLACE: the stage's node
-        (void) strata::platform::numa_bind(m, (size_t) pool->total, node, strata::platform::numa_place_mode() == 2);
-    pool->base = (uint8_t*) m;
+        (void) strata::platform::numa_bind(pool->base, (size_t) pool->total, node, strata::platform::numa_place_mode() == 2);
     (void) cudaGetDevice(&pool->dev);
     for (size_t i = 0; i < per.size(); ++i) arr[i] = pool->base + pool->off[i];
     g_kv_host_reserved += (uint64_t) pages * std::accumulate(per.begin(), per.end(), (uint64_t) 0);
@@ -700,22 +704,22 @@ int32_t host_pool_make(const std::vector<uint64_t>& per, int64_t pages, int64_t 
     g_host_pools.push_back(std::move(pool));
     return (int32_t) g_host_pools.size() - 1;
 }
-uint64_t host_unit_bytes(const HostPool& p) {
-    uint64_t n = 0;
-    for (const uint64_t b : p.per) n += (uint64_t) p.unit * b;
-    return n;
+// array i's pieces for the first `pages` pages, rounded up to whole growth steps
+int64_t host_pieces(const HostPool& p, size_t i, int64_t pages) {
+    const int64_t pg = std::min<int64_t>(p.pages, (pages + p.unit - 1) / p.unit * p.unit);
+    return (int64_t) (((uint64_t) pg * p.per[i] + kHostPiece - 1) / kHostPiece);
 }
-void host_unpin_locked(HostPool& p, int64_t keep_units) {
-    for (int64_t u = p.units - 1; u >= keep_units; --u) {
-        for (size_t i = 0; i < p.per.size(); ++i) {
-            uint8_t* a = p.base + p.off[i] + (uint64_t) u * p.unit * p.per[i];
+void host_unpin_locked(HostPool& p, int64_t pages) {
+    for (size_t i = 0; i < p.per.size(); ++i) {
+        const int64_t keep = std::max<int64_t>(1, host_pieces(p, i, pages));
+        for (; p.pinned[i] > keep; --p.pinned[i]) {
+            uint8_t* a = p.base + p.off[i] + (uint64_t) (p.pinned[i] - 1) * kHostPiece;
             (void) cudaHostUnregister(a);
             (void) cudaGetLastError();
-            (void) madvise(a, (size_t) ((uint64_t) p.unit * p.per[i]), MADV_DONTNEED);
+            (void) madvise(a, (size_t) kHostPiece, MADV_DONTNEED);
+            g_kv_host_bytes -= kHostPiece;
         }
-        g_kv_host_bytes -= host_unit_bytes(p);
     }
-    p.units = std::min(p.units, keep_units);
 }
 #endif
 }  // namespace
@@ -724,37 +728,32 @@ bool qsa_host_grow(const QsaState& st, int64_t cells) {
     if (st.host_elastic < 0) return true;
     std::lock_guard<std::mutex> lk(g_host_mu);
     HostPool& p = *g_host_pools[(size_t) st.host_elastic];
-    const int64_t pages = std::min<int64_t>(p.pages, (std::max<int64_t>(cells, 1) + 3) / 4);
-    const int64_t want = (pages + p.unit - 1) / p.unit;
-    while (p.units < want) {
-        const int64_t u = p.units;
-        size_t done = 0;
-        for (; done < p.per.size(); ++done) {
-            uint8_t* a = p.base + p.off[done] + (uint64_t) u * p.unit * p.per[done];
-            if (cudaHostRegister(a, (size_t) ((uint64_t) p.unit * p.per[done]),
-                                 cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess)
-                break;
+    const int64_t pages = (std::max<int64_t>(cells, 1) + 3) / 4;
+    const std::vector<int64_t> had = p.pinned;   // (a failed step gives back what it pinned, every array)
+    for (size_t i = 0; i < p.per.size(); ++i) {
+        const int64_t want = host_pieces(p, i, pages);
+        while (p.pinned[i] < want) {
+            uint8_t* a = p.base + p.off[i] + (uint64_t) p.pinned[i] * kHostPiece;
             void* d = nullptr;
-            if (cudaHostGetDevicePointer(&d, a, 0) != cudaSuccess || d != (void*) a) {   // (checked per device at the start)
-                (void) cudaHostUnregister(a);
-                break;
+            const cudaError_t e = cudaHostRegister(a, (size_t) kHostPiece, cudaHostRegisterPortable | cudaHostRegisterMapped);
+            if (e != cudaSuccess || cudaHostGetDevicePointer(&d, a, 0) != cudaSuccess || d != (void*) a) {
+                if (e == cudaSuccess) (void) cudaHostUnregister(a);   // (the device address is not the host's)
+                (void) cudaGetLastError();
+                std::fprintf(stderr, "strata: KV streaming: pinning more of a slot's host copy failed (%s; %.2f GiB pinned "
+                                     "for K/V in all)\n", cudaGetErrorString(e), (double) g_kv_host_bytes.load() / 1073741824.0);
+                for (size_t j = 0; j < p.per.size(); ++j)
+                    for (; p.pinned[j] > had[j]; --p.pinned[j]) {
+                        uint8_t* q = p.base + p.off[j] + (uint64_t) (p.pinned[j] - 1) * kHostPiece;
+                        (void) cudaHostUnregister(q);
+                        (void) madvise(q, (size_t) kHostPiece, MADV_DONTNEED);
+                        g_kv_host_bytes -= kHostPiece;
+                    }
+                (void) cudaGetLastError();
+                return false;
             }
+            ++p.pinned[i];
+            g_kv_host_bytes += kHostPiece;
         }
-        if (done < p.per.size()) {
-            const cudaError_t e = cudaGetLastError();
-            for (size_t i = 0; i < done; ++i) {
-                uint8_t* a = p.base + p.off[i] + (uint64_t) u * p.unit * p.per[i];
-                (void) cudaHostUnregister(a);
-                (void) madvise(a, (size_t) ((uint64_t) p.unit * p.per[i]), MADV_DONTNEED);
-            }
-            (void) cudaGetLastError();
-            std::fprintf(stderr, "strata: KV streaming: pinning %.1f MiB more of a slot's host copy failed (%s; %.2f GiB "
-                                 "pinned for K/V in all)\n", (double) host_unit_bytes(p) / 1048576.0,
-                         cudaGetErrorString(e), (double) g_kv_host_bytes.load() / 1073741824.0);
-            return false;
-        }
-        g_kv_host_bytes += host_unit_bytes(p);
-        ++p.units;
     }
     return true;
 #else
@@ -767,15 +766,16 @@ uint64_t qsa_host_trim(const QsaState& st, int64_t cells) {
     if (st.host_elastic < 0) return 0;
     std::lock_guard<std::mutex> lk(g_host_mu);
     HostPool& p = *g_host_pools[(size_t) st.host_elastic];
-    const int64_t pages = std::min<int64_t>(p.pages, (std::max<int64_t>(cells, 1) + 3) / 4);
-    const int64_t keep = std::max<int64_t>(1, (pages + p.unit - 1) / p.unit);
-    if (p.units <= keep) return 0;
-    const uint64_t before = g_kv_host_bytes.load();
+    const int64_t pages = (std::max<int64_t>(cells, 1) + 3) / 4;
+    bool more = false;
+    for (size_t i = 0; i < p.per.size(); ++i) more = more || p.pinned[i] > std::max<int64_t>(1, host_pieces(p, i, pages));
+    if (!more) return 0;
     {   // nothing on the card may still read or write the pages given back
         const strata::core::OnDevice on(p.dev);
         (void) cudaDeviceSynchronize();
     }
-    host_unpin_locked(p, keep);
+    const uint64_t before = g_kv_host_bytes.load();
+    host_unpin_locked(p, pages);
     return before - g_kv_host_bytes.load();
 #else
     (void) st; (void) cells;
@@ -787,7 +787,9 @@ uint64_t qsa_host_backed_bytes(const QsaState& st) {
     if (st.host_elastic < 0) return 0;
     std::lock_guard<std::mutex> lk(g_host_mu);
     const HostPool& p = *g_host_pools[(size_t) st.host_elastic];
-    return (uint64_t) p.units * host_unit_bytes(p);
+    uint64_t n = 0;
+    for (const int64_t k : p.pinned) n += (uint64_t) k * kHostPiece;
+    return n;
 #else
     (void) st;
     return 0;
