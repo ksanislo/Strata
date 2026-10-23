@@ -318,6 +318,16 @@ int64_t qsa_kv_resident_min();
 uint64_t qsa_kv_host_bytes();
 /// The host copies' addresses (pinned or not): what a host copy pinned whole would take.
 uint64_t qsa_kv_host_reserved_bytes();
+/// STRATA_KV_HOST_ELASTIC: the states qsa_state_init makes from now on with a streamed host copy (not only the elastic
+/// slots') get one that grows (session_host_fit); --serve sets it around the solo session and the stages' sessions.
+void qsa_set_host_elastic_main(bool on);
+/// ... and their VRAM K/V pools and pooled indexer keys in a slot pool of their own (backed as the context grows:
+/// session_vram_fit; the first cells at once, from new chunks: they are used before a slot budget exists).
+void qsa_set_vram_elastic_main(bool on);
+/// A slot pool backed for `cells` from new chunks of its device (not a budget): a solo session's first cells.
+bool qsa_slots_grow_fresh(const QsaState& st, int64_t cells);
+/// The last qsa_host_grow found no RAM to pin (what a "no room" after a failed slot growth means: RAM, not VRAM).
+bool qsa_host_pin_failed();
 /// STRATA_KV_HOST_ELASTIC: an elastic state's host copy pinned for its first `cells` cells (whole steps of
 /// STRATA_KV_HOST_STEP cells); false: RAM or the driver refused (nothing of the failed step stays pinned).
 bool qsa_host_grow(const QsaState& st, int64_t cells);
@@ -343,7 +353,8 @@ inline int qsa_kv_format(const QsaState& st) {
     return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
 }
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0, bool elastic_slot = false);
+                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0, bool elastic_slot = false,
+                        bool host_elastic = false);   // a ring (the drafter's) whose host copy grows with its slot
 /// THE ELASTIC SLOT STATES' MEMORY.  Each device has a budget of physical chunks made once (qsa_slot_budget_add) that its
 /// slot states map as their conversations grow and give back when trimmed.
 uint64_t qsa_slot_budget_add(int dev, uint64_t bytes);   ///< returns the bytes made

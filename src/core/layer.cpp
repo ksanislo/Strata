@@ -652,6 +652,9 @@ struct HostPool {
 constexpr uint64_t kHostPiece = strata::kernels::kSplitCopyBytes;
 std::mutex g_host_mu;
 std::vector<std::unique_ptr<HostPool>> g_host_pools;
+bool g_host_main = false;   // qsa_set_host_elastic_main: the solo sessions' streamed states too
+bool g_vram_main = false;   // qsa_set_vram_elastic_main: their VRAM pools and pooled keys in slot pools too
+std::atomic<bool> g_host_failed{false};   // qsa_host_pin_failed: the last qsa_host_grow ran out of RAM
 bool host_elastic_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_KV_HOST_ELASTIC");
@@ -739,6 +742,7 @@ bool qsa_host_grow(const QsaState& st, int64_t cells) {
             if (e != cudaSuccess || cudaHostGetDevicePointer(&d, a, 0) != cudaSuccess || d != (void*) a) {
                 if (e == cudaSuccess) (void) cudaHostUnregister(a);   // (the device address is not the host's)
                 (void) cudaGetLastError();
+                g_host_failed = true;
                 std::fprintf(stderr, "strata: KV streaming: pinning more of a slot's host copy failed (%s; %.2f GiB pinned "
                                      "for K/V in all)\n", cudaGetErrorString(e), (double) g_kv_host_bytes.load() / 1073741824.0);
                 for (size_t j = 0; j < p.per.size(); ++j)
@@ -755,6 +759,7 @@ bool qsa_host_grow(const QsaState& st, int64_t cells) {
             g_kv_host_bytes += kHostPiece;
         }
     }
+    g_host_failed = false;
     return true;
 #else
     (void) st; (void) cells;
@@ -1083,6 +1088,26 @@ void qsa_slot_budget(int dev, uint64_t& total, uint64_t& free) {
     total = it == g_slot_budget.end() ? 0 : (uint64_t) it->second.total * G;
     free = it == g_slot_budget.end() ? 0 : (uint64_t) it->second.free.size() * G;
 }
+bool qsa_slots_grow_fresh(const QsaState& st, int64_t cells) {
+    if (st.slot_elastic < 0) return true;
+    std::lock_guard<std::mutex> lk(g_slot_mu);
+    SlotPool& p = *g_slot_pools[(size_t) st.slot_elastic];
+    const uint64_t G = p.range.granularity();
+    const int dev = p.range.device();
+    const strata::core::OnDevice on(dev);
+    for (const auto& a : p.arr) {
+        const int64_t c0 = (int64_t) (a.off / G);
+        const int64_t c1 = c0 + strata::core::slot_chunks(a, strata::core::slot_units(a, cells, p.page_size, p.idx_block), G);
+        std::vector<int64_t> fresh;
+        for (int64_t c = c0; c < c1; ++c)
+            if (!p.range.mapped(c)) fresh.push_back(c);
+        if (fresh.empty()) continue;
+        if (!p.range.map_range(c0, c1, [dev] { return strata::core::vmm_chunk_new(dev); })) return false;
+        for (const int64_t c : fresh)
+            if (cudaMemset(p.range.base() + (uint64_t) c * G, 0, (size_t) G) != cudaSuccess) return false;
+    }
+    return true;
+}
 bool qsa_slots_grow(const std::vector<const QsaState*>& states, int64_t cells) {
     std::lock_guard<std::mutex> lk(g_slot_mu);
     int dev = -1;
@@ -1167,12 +1192,27 @@ int64_t qsa_kv_resident() { return g_kv_resident; }
 int64_t qsa_kv_resident_min() { return 20480; }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes.load(); }
 uint64_t qsa_kv_host_reserved_bytes() { return g_kv_host_reserved.load(); }
+void qsa_set_vram_elastic_main(bool on) { g_vram_main = on; }
+bool qsa_host_pin_failed() {
+#ifndef _WIN32
+    return g_host_failed.load();
+#else
+    return false;
+#endif
+}
+void qsa_set_host_elastic_main(bool on) {
+#ifndef _WIN32
+    g_host_main = on;
+#else
+    (void) on;
+#endif
+}
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells,
                          bool elastic_slot) {
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
-    const uint64_t G = elastic_slot ? strata::core::vmm_granularity() : 0;
+    const uint64_t G = elastic_slot || (g_vram_main && ring_cells == 0) ? strata::core::vmm_granularity() : 0;
     uint64_t n = 0;
     if (G > 0) {   // an elastic slot: only the arrays that stay carved (qsa_state_init)
         const bool hybrid = g_kv_hybrid && ring_cells <= 0;
@@ -1196,7 +1236,7 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
 }
 
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope, int64_t ring_cells, bool elastic_slot) {
+                        const QsaState* share_rope, int64_t ring_cells, bool elastic_slot, bool host_elastic) {
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     const int64_t pages = p.pages;
@@ -1229,7 +1269,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             st.v_scale = (uint16_t*) a[3];
         } else { st.k_pool = (uint16_t*) a[0]; st.v_pool = (uint16_t*) a[1]; }
     };
-    const uint64_t slot_G = elastic_slot ? strata::core::vmm_granularity() : 0;   // as qsa_state_bytes decided
+    // as qsa_state_bytes decided (a solo session's state under qsa_set_vram_elastic_main too: session_vram_fit)
+    const uint64_t slot_G = elastic_slot || (g_vram_main && ring_cells == 0) ? strata::core::vmm_granularity() : 0;
     std::unique_ptr<SlotPool> spool;
     std::vector<int> in_range;   // per pool array (then the pooled rows, last): its index in spool->arr, or -1
     if (slot_G > 0) {
@@ -1335,7 +1376,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.host = strata::kernels::KvHostPools{};
     uint8_t* hel[4] = {};   // STRATA_KV_HOST_ELASTIC: an elastic slot's host arrays, addresses only until pinned
 #ifndef _WIN32
-    if (p.mode == 1 && slot_G > 0 && host_elastic_on())
+    if (((p.mode == 1 && (slot_G > 0 || g_host_main)) || (p.mode == 2 && host_elastic)) && host_elastic_on())
         st.host_elastic = host_pool_make(kv_per_slot(s, st.kv_hybrid, st.kv_q4, st.kv_int8), pages, s.page_size, hel);
 #endif
     if (st.host_elastic >= 0) {   // (kv_per_slot's order, as the carve below)
@@ -1411,6 +1452,11 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         std::lock_guard<std::mutex> lk(g_slot_mu);
         st.slot_elastic = (int32_t) g_slot_pools.size();
         g_slot_pools.push_back(std::move(spool));
+    }
+    // a solo session's state (qsa_set_vram_elastic_main): its first cells now, before anything at load uses it
+    if (!elastic_slot && st.slot_elastic >= 0 && !qsa_slots_grow_fresh(st, 1)) {
+        std::fprintf(stderr, "strata: KV streaming: backing a solo session state's first cells failed\n");
+        return 0;
     }
     return c.used;
 }

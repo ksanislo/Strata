@@ -192,6 +192,13 @@ std::string vram_free_note() {
 // the stage's RoPE table ("lean"), and with "1" their K/V and indexer arrays are also reserved, not backed, and grow with
 // the conversation from a per-card budget of STRATA_ELASTIC_SLOTS_MIB (default 1024), in steps of
 // STRATA_ELASTIC_SLOTS_STEP cells (default 4096).  CUDA only (one VMM device per stage); 0 = off, 1 = lean, 2 = elastic
+// STRATA_KV_VRAM_ELASTIC (default on; =0: off): the solo session's VRAM pools and pooled keys grow with its context
+// (session_vram_fit) instead of being carved for --max-context
+bool host_vram_main_env() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_KV_VRAM_ELASTIC"); return v == nullptr || v[0] != '0'; }();
+    return on;
+}
+
 int elastic_slots_mode() {
     static const int m = [] {
         const char* v = std::getenv("STRATA_ELASTIC_SLOTS");
@@ -5515,6 +5522,10 @@ int main(int argc, char** argv) {
             strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
             strata::core::ExpertCache::set_vmm(on);
         }
+        strata::core::qsa_set_host_elastic_main(o.serve);   // STRATA_KV_HOST_ELASTIC: the solo session and the stages' too
+        // ... and their VRAM pools and pooled keys grow too, under the elastic slots (they draw on the same budget)
+        const bool vram_main = o.serve && o.batch > 0 && elastic_slots_mode() == 2 && host_vram_main_env();
+        strata::core::qsa_set_vram_elastic_main(vram_main && strata::core::vmm_available(primary_device));
         if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
             return 1;
@@ -5550,6 +5561,8 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < stages.size(); ++i) {
         GpuStage& st = *stages[i];
         const strata::core::OnDevice on(st.dev);
+        strata::core::qsa_set_vram_elastic_main(o.serve && o.batch > 0 && elastic_slots_mode() == 2 && host_vram_main_env() &&
+                                                strata::core::vmm_available(st.dev));
         void* sbuf_s = nullptr;
         if (cudaMalloc(&sbuf_s, strata::core::session_bytes(g, o.max_context, K, st.lb, st.le)) != cudaSuccess ||
             strata::core::session_init(g, o.max_context, K, sbuf_s, st.ss, st.lb, st.le) == 0) {
@@ -5572,6 +5585,8 @@ int main(int argc, char** argv) {
                      last ? " and the head" : "", (double) fb / 1073741824.0);
     }
 
+    strata::core::qsa_set_host_elastic_main(false);   // (the slots' own rule decides theirs)
+    strata::core::qsa_set_vram_elastic_main(false);
     const uint64_t kv_host_solo = strata::core::qsa_kv_host_bytes();   // the solo session's host K/V, every stage
     // --batch: every stage carves o.batch more sessions like its own (same layer range and context), one per
     // slot of the batch windows.  Before the expert cache is sized, so `--expert-cache auto` leaves them room.
@@ -5869,6 +5884,8 @@ int main(int argc, char** argv) {
         if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st && !mtp_first ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
         mtp.set_ple_session(&ss);
+        if (mtp.kv_state().host_elastic >= 0)   // STRATA_KV_HOST_ELASTIC: the solo drafter's copy follows its session
+            (last_st && !mtp_first ? last_st->ss : ss).host_follow = &mtp.kv_state();
         if (batch_mtp) {
             // Slot b's drafter lives where the solo drafter does (the guard above: the last stage's GPU), carved from the
             // LAST stage's slot-b session (bslot_ss.back(): stage 0's on one GPU): it borrows that session's context
@@ -5883,6 +5900,15 @@ int main(int argc, char** argv) {
                 }
                 d->set_max_drafts(piped_mtp ? pm_drafts : 1);   // the serial windows verify one proposal per slot
                 d->set_ple_session(bslot_ss[0][(size_t) b].get());
+                // STRATA_KV_HOST_ELASTIC: its host copy follows the slot's (backed now for what the slot already is)
+                strata::core::SessionState& owner = *bslot_ss.back()[(size_t) b];
+                if (d->kv_state().host_elastic >= 0) {
+                    owner.host_follow = &d->kv_state();
+                    if (!strata::core::qsa_host_grow(d->kv_state(), std::max<int64_t>(owner.slot_cells, 1))) {
+                        std::fprintf(stderr, "strata generate: batch MTP slot %d: no RAM to pin for its K/V copy\n", b);
+                        return 1;
+                    }
+                }
                 slot_mtp.push_back(std::move(d));
             }
             if (!slot_mtp.empty()) {
@@ -5906,6 +5932,31 @@ int main(int argc, char** argv) {
                          (double) all / 1073741824.0);
         std::fprintf(stderr, "\n");
     }
+    // STRATA_KV_HOST_ELASTIC: the solo session's host copies (every stage, its drafter) pinned for `cells` before anything
+    // writes them: a request's prompt and max_new, a restored conversation.  They only grow (the conversation they hold
+    // is parked from them after a new request has started)
+    auto solo_host_fit = [&](int64_t cells) -> bool {
+        if (!strata::core::session_host_fit(ss, cells)) return false;
+        for (auto& st : stages)
+            if (!strata::core::session_host_fit(st->ss, cells)) return false;
+        return true;
+    };
+    if (!solo_host_fit(1)) {
+        std::fprintf(stderr, "strata generate: no RAM to pin the first cells of the solo session's K/V copy\n");
+        return 1;
+    }
+    // STRATA_KV_VRAM_ELASTIC: the solo session's VRAM pools and pooled keys for `cells` (every stage), the expert cache
+    // giving the budget room when it is short; set where the elastic slots' give is (null: nothing to grow)
+    std::function<bool(int64_t)> solo_vram_fit;
+    auto solo_host_trim = [&](int64_t cells) {
+        strata::core::session_vram_trim(ss, cells);
+        for (auto& st : stages) strata::core::session_vram_trim(st->ss, cells);
+        uint64_t n = strata::core::session_host_trim(ss, cells);
+        for (auto& st : stages) n += strata::core::session_host_trim(st->ss, cells);
+        if (n > 0)
+            std::fprintf(stderr, "strata serve: the solo session's K/V copy gives back %.0f MiB of pinned RAM\n",
+                         (double) n / 1048576.0);
+    };
     // THE HEAD BEFORE THE CACHE, AND BEFORE THE ARENA.  The expert cache takes what is free minus the reserve, so
     // everything allocated after it comes out of the reserve.  The native head (~0.5 GB with IQ3_S) was loaded after
     // it and ate most of the 700 MiB: 128K IQ3_S ended with 30 MiB free, the driver paged, and a request stalled for
@@ -12447,6 +12498,22 @@ int main(int argc, char** argv) {
             return 0;
         };
         const std::function<bool(size_t)> all_quiet = [](size_t) { return true; };
+        // STRATA_KV_VRAM_ELASTIC: the solo session on stage k grows from that card's slot budget as the slots do (a solo
+        // request runs with the slots' windows quiet, so the cache may give at once)
+        if (eslots_on)
+            solo_vram_fit = [&](int64_t cells) -> bool {
+                for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                    strata::core::SessionState& u = k == 0 ? ss : stages[k - 1]->ss;
+                    const strata::core::OnDevice on_k(eslot_dev(k));
+                    if (strata::core::session_vram_fit(u, cells)) continue;
+                    if (!give_on || gv[k].lo <= give_floor) return false;
+                    int64_t fr = 0;
+                    strata::core::qsa_slot_budget_chunks(eslot_dev(k), &fr, nullptr);
+                    give(k, std::max<int64_t>(strata::core::session_vram_need(u, cells) - fr, 16));
+                    if (!strata::core::session_vram_fit(u, cells)) return false;
+                }
+                return true;
+            };
         // the chunks card k's decoding slots need for their next step (what its budget keeps free)
         auto slots_low_water = [&](size_t k) -> int64_t {
             int64_t n = 0;
@@ -12586,8 +12653,10 @@ int main(int argc, char** argv) {
                 if (strata::core::device_sync() != cudaSuccess) { e = "elastic slots: device sync failed"; return false; }
             }
             if (!ok) {
-                e = "elastic slots: the slot budget (STRATA_ELASTIC_SLOTS_MIB) has no room for " + std::to_string(upto) +
-                    " cells in slot " + std::to_string(b);
+                e = strata::core::qsa_host_pin_failed()
+                        ? "no RAM is left to pin " + std::to_string(upto) + " cells of context in slot " + std::to_string(b)
+                        : "elastic slots: the slot budget (STRATA_ELASTIC_SLOTS_MIB) has no room for " + std::to_string(upto) +
+                              " cells in slot " + std::to_string(b);
                 return false;
             }
             // the slots decoding beside it are backed a step ahead now, while everything is quiet; then idle slots and
@@ -12616,8 +12685,9 @@ int main(int argc, char** argv) {
                 return 0;
             }
             if (r == 2) return 2;
-            std::fprintf(stderr, "strata batch: elastic slot %d ends at %lld tokens: the slot budget has no room to grow "
-                                 "(STRATA_ELASTIC_SLOTS_MIB)\n", b, (long long) sl.p);
+            std::fprintf(stderr, "strata batch: elastic slot %d ends at %lld tokens: %s\n", b, (long long) sl.p,
+                         strata::core::qsa_host_pin_failed() ? "no RAM is left to pin its context (STRATA_KV_HOST_ELASTIC)"
+                                                             : "the slot budget has no room to grow (STRATA_ELASTIC_SLOTS_MIB)");
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
             std::printf("BDONE %d %lld length %.1f\n", b, (long long) sl.produced, ms);
             std::fflush(stdout);
@@ -16395,6 +16465,11 @@ int main(int argc, char** argv) {
                         }
                     }
                     if (stage_invalid) { refuse(err); continue; }
+                    if (!solo_host_fit((int64_t) image.live.ids.size() + 256) ||   // STRATA_KV_HOST_ELASTIC: its cells pinned
+                        (solo_vram_fit && !solo_vram_fit((int64_t) image.live.ids.size() + 256))) {
+                        refuse("no memory (RAM or VRAM) is left for the saved conversation's context", strata::core::SessionError::memory);
+                        continue;
+                    }
                     // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells
                     if (!kvg_ensure((int64_t) image.live.ids.size() + 256, adapt_quiesce)) {
                         refuse("the K/V cannot grow to the saved conversation: no VRAM is left", strata::core::SessionError::memory);
@@ -16656,6 +16731,14 @@ int main(int argc, char** argv) {
             if (n + max_new + 8 > o.max_context) {
                 std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
                             (long long) max_new, (long long) o.max_context);
+                continue;
+            }
+            if (!solo_host_fit(std::min<int64_t>(o.max_context, n + max_new + 64))) {   // STRATA_KV_HOST_ELASTIC
+                std::printf("ERR no RAM is left to pin this request's context (%lld tokens)\n", (long long) (n + max_new));
+                continue;
+            }
+            if (solo_vram_fit && !solo_vram_fit(std::min<int64_t>(o.max_context, n + max_new + 64))) {
+                std::printf("ERR no VRAM is left for this request's context (%lld tokens)\n", (long long) (n + max_new));
                 continue;
             }
             bool bad = false;
@@ -17044,6 +17127,11 @@ int main(int argc, char** argv) {
                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                 }
             }
+            if (incoming && (!solo_host_fit((int64_t) incoming->live.ids.size() + 256) ||   // STRATA_KV_HOST_ELASTIC
+                             (solo_vram_fit && !solo_vram_fit((int64_t) incoming->live.ids.size() + 256)))) {
+                std::printf("ERR no memory (RAM or VRAM) is left for the parked conversation's context\n");
+                return 1;
+            }
             // the elastic K/V: a parked conversation is restored whole, and it may be longer than this prompt
             if (incoming && !kvg_ensure((int64_t) incoming->live.ids.size() + 256, kv_quiesce)) {
                 std::printf("ERR the K/V cannot grow to the parked conversation: no VRAM is left\n");
@@ -17168,6 +17256,8 @@ int main(int argc, char** argv) {
             std::printf("INFO ctx_source=%s ctx_reused=%lld ctx_prompt=%lld\n",
                         ctx_from ? ctx_from : resume > 0 ? "gpu" : "none", (long long) resume, (long long) n);
             std::fflush(stdout);
+            // STRATA_KV_HOST_ELASTIC: the same for the solo session's host copies (this request's prompt and max_new stay)
+            solo_host_trim(std::min<int64_t>(o.max_context, n + max_new + 64));
             // the elastic K/V: the outgoing session is parked and this request rewrites every cell from `resume` on,
             // so cells past this prompt's are no longer anyone's - far more than it needs go back to the cache
             if (kvg.on) {
@@ -19909,6 +19999,7 @@ int main(int argc, char** argv) {
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
             stage_pool_note();
+            kmem_note();   // (HMEM: the solo session's host copies may have grown for this request)
             if (serve_adapt_drain_ms >= 1.0)
                 std::fprintf(stderr, "strata serve: the request first waited %.0f ms for the adaptive tier's round in flight\n",
                              serve_adapt_drain_ms);
