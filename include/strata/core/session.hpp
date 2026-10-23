@@ -122,6 +122,9 @@ uint64_t session_host_backed(const SessionState& s);
 /// ... grown (never trimmed) for `cells` cells: the solo session's, before anything writes them (a request's prompt and
 /// its max_new, a restored conversation).  False: no RAM to pin.
 bool session_host_fit(SessionState& s, int64_t cells);
+/// ... unpinned past `cells` (the device of each state synchronized first): once nothing holds its cells past them
+/// any more (the solo session's outgoing conversation is parked).  Returns the bytes given back.
+uint64_t session_host_trim(SessionState& s, int64_t cells);
 /// Before the memory `session_init` carved is freed: forgets what points into it from outside the session (the
 /// rope kernels' registered angle table, #280), so a later session never rotates by freed memory.
 void session_release(SessionState& s);
