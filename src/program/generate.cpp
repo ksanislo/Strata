@@ -15968,8 +15968,11 @@ int main(int argc, char** argv) {
                                      "(drain %.0f ms); freed %s\n", b,
                              std::chrono::duration<double>(now - eidle_seen[(size_t) b].since).count(), sl.ids.size(),
                              park_ms, drain_ms, note.c_str());
+                std::printf("BIDLE %d\n", b);   // (the server: the slot holds nothing now)
+                std::fflush(stdout);
             }
             for (size_t k = 0; k < bslot_ss.size(); ++k) elastic_idle(k, true, -1);   // (the caches take it back, refilled)
+            kmem_note();
             return true;
         };
         // an allocation that fails for lack of VRAM (a window graph, the drafter's records) asks for it here: the card's
