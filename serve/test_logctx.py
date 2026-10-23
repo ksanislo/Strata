@@ -1,4 +1,5 @@
 """serve/logctx.py: timestamped lines with request tags, the client's address and kind, conversation keys, events."""
+import contextlib
 import io
 import json
 import os
@@ -110,6 +111,23 @@ class Events(unittest.TestCase):
             rec = json.loads(open(day).read())
             self.assertEqual((rec["ev"], rec["id"], rec["prompt"]), ("request", "x", 12))
             self.assertNotIn("gap_s", rec)        # (None fields are left out)
+            ev.write("session", event="parked", tokens="12")   # a field named "event" (the engine's sess_event)
+            ev.write("session", bad=object())                  # never raises
+            last = json.loads(open(day).read().splitlines()[-2])
+            self.assertEqual((last["ev"], last["event"]), ("session", "parked"))
+
+
+class EngineNotes(unittest.TestCase):
+    def test_a_session_note_goes_to_the_event_log_without_stopping_the_reader(self):
+        from serve.server import StrataEngine
+        with tempfile.TemporaryDirectory() as d:
+            e = StrataEngine.__new__(StrataEngine)
+            e.sessions, e.events = {}, logctx.EventLog(d, "M")
+            line = "INFO sess_event=parked sess_tokens=12 sess_bytes=34 sess_ms=5 sess_why=ram\n"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertTrue(e._session_note(line))
+            rec = json.loads(open(os.path.join(d, f"M-{time.strftime('%Y-%m-%d')}.jsonl")).read())
+            self.assertEqual((rec["ev"], rec["event"], rec["tokens"]), ("session", "parked", "12"))
 
 
 if __name__ == "__main__":
