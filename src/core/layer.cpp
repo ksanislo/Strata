@@ -645,6 +645,7 @@ struct HostPool {
     std::vector<uint64_t> off, per;   // each array's offset in the range, its bytes per page
     std::vector<int64_t> pinned;      // each array's pinned pieces (a prefix, kHostPiece bytes each)
     int64_t pages = 0, unit = 0;      // logical pages; pages per growth step
+    int64_t page_size = 4;            // cells per page
     int dev = -1;
 };
 // pinned in pieces of kHostPiece bytes at kHostPiece-aligned addresses: the bulk copies split at the same boundaries
@@ -686,6 +687,7 @@ int64_t host_step_pages(int64_t page_size) {
 int32_t host_pool_make(const std::vector<uint64_t>& per, int64_t pages, int64_t page_size, uint8_t** arr) {
     auto pool = std::make_unique<HostPool>();
     pool->pages = pages;
+    pool->page_size = page_size;
     pool->unit = host_step_pages(page_size);
     for (const uint64_t b : per) {
         pool->off.push_back(pool->total);
@@ -731,7 +733,7 @@ bool qsa_host_grow(const QsaState& st, int64_t cells) {
     if (st.host_elastic < 0) return true;
     std::lock_guard<std::mutex> lk(g_host_mu);
     HostPool& p = *g_host_pools[(size_t) st.host_elastic];
-    const int64_t pages = (std::max<int64_t>(cells, 1) + 3) / 4;
+    const int64_t pages = (std::max<int64_t>(cells, 1) + p.page_size - 1) / p.page_size;
     const std::vector<int64_t> had = p.pinned;   // (a failed step gives back what it pinned, every array)
     for (size_t i = 0; i < p.per.size(); ++i) {
         const int64_t want = host_pieces(p, i, pages);
@@ -771,7 +773,7 @@ uint64_t qsa_host_trim(const QsaState& st, int64_t cells) {
     if (st.host_elastic < 0) return 0;
     std::lock_guard<std::mutex> lk(g_host_mu);
     HostPool& p = *g_host_pools[(size_t) st.host_elastic];
-    const int64_t pages = (std::max<int64_t>(cells, 1) + 3) / 4;
+    const int64_t pages = (std::max<int64_t>(cells, 1) + p.page_size - 1) / p.page_size;
     bool more = false;
     for (size_t i = 0; i < p.per.size(); ++i) more = more || p.pinned[i] > std::max<int64_t>(1, host_pieces(p, i, pages));
     if (!more) return 0;
