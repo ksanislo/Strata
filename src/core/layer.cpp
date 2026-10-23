@@ -52,6 +52,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <atomic>
+#include <numeric>
 #include <vector>
 namespace strata::core {
 namespace { bool g_shared_early = true; bool g_fused_gr = false; bool g_fast_attn = true; bool g_publish_kernel = true; bool g_fused_gdn = true; bool g_fast_select = true; }
@@ -578,7 +580,8 @@ struct Cursor {    uint8_t* p;    uint64_t used = 0;    template <typename T>   
 namespace {
 // KV streaming (docs/kv-streaming-design.md): 0 keeps every cell in VRAM.
 int64_t g_kv_resident = 0;
-uint64_t g_kv_host_bytes = 0;
+std::atomic<uint64_t> g_kv_host_bytes{0};   // pinned now
+std::atomic<uint64_t> g_kv_host_reserved{0};   // ... and the addresses the host copies have
 
 // The KV host copy: pinned and device-mapped. cudaHostAlloc is the default, but under WSL2 the driver caps what
 // cudaHostAlloc(Mapped) may pin at about 1 GiB in all, while cudaHostRegister of ordinary memory is not capped there:
@@ -629,6 +632,169 @@ uint8_t* kv_host_alloc(uint64_t bytes) {
 #endif
 }
 
+// ---- STRATA_KV_HOST_ELASTIC (default on with elastic slots; =0: off): an elastic slot state's host copy is one
+// address range for the whole context (MAP_NORESERVE: no RAM until pinned), each array pinned in steps of
+// STRATA_KV_HOST_STEP cells (8192) as the slot's cells grow (qsa_host_grow, from session_slot_fit) and unpinned past
+// what it keeps when it is trimmed.  The kernels keep the one pointer per array: a registered page's device address
+// is its host address on every card here (cudaDevAttrCanUseHostPointerForRegisteredMem, checked at the first state).
+#ifndef _WIN32
+struct HostPool {
+    uint8_t* base = nullptr;
+    uint64_t total = 0;
+    std::vector<uint64_t> off, per;   // each array's offset in the range, its bytes per page
+    int64_t pages = 0, unit = 0, units = 0;   // logical pages; pages per step; steps pinned (a prefix)
+    int dev = -1;
+};
+std::mutex g_host_mu;
+std::vector<std::unique_ptr<HostPool>> g_host_pools;
+bool host_elastic_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_KV_HOST_ELASTIC");
+        if (v != nullptr && v[0] == '0') return false;
+        int n = 0;
+        if (cudaGetDeviceCount(&n) != cudaSuccess || n < 1) { (void) cudaGetLastError(); return false; }
+        for (int d = 0; d < n; ++d) {
+            int same = 0;
+            if (cudaDeviceGetAttribute(&same, cudaDevAttrCanUseHostPointerForRegisteredMem, d) != cudaSuccess || !same) {
+                (void) cudaGetLastError();
+                std::fprintf(stderr, "strata: KV streaming: CUDA%d cannot use a registered page's host address: the slots' "
+                                     "host copies are pinned whole\n", d);
+                return false;
+            }
+        }
+        return true;
+    }();
+    return on;
+}
+int64_t host_step_pages(int64_t page_size) {
+    static const int64_t cells = [] {
+        const char* v = std::getenv("STRATA_KV_HOST_STEP");
+        const long long n = v != nullptr ? std::atoll(v) : 0;
+        return n > 0 ? (int64_t) n : (int64_t) 8192;
+    }();
+    // whole 4 KiB pages for every array: a step of 1024 pages keeps the 64-byte-per-page scale arrays page-aligned
+    return std::max<int64_t>(1024, (cells + page_size - 1) / page_size + 1023) / 1024 * 1024;
+}
+// A state's host copy as addresses only; the pointers `host` gets are the arrays' bases.  -1: not made (the caller pins
+// it whole as before).
+int32_t host_pool_make(const std::vector<uint64_t>& per, int64_t pages, int64_t page_size, uint8_t** arr) {
+    auto pool = std::make_unique<HostPool>();
+    pool->pages = pages;
+    pool->unit = host_step_pages(page_size);
+    const int64_t steps = (pages + pool->unit - 1) / pool->unit;
+    constexpr uint64_t A = 2ull << 20;
+    for (const uint64_t b : per) {
+        pool->off.push_back(pool->total);
+        pool->per.push_back(b);
+        pool->total += ((uint64_t) steps * pool->unit * b + A - 1) / A * A;
+    }
+    void* m = mmap(nullptr, (size_t) pool->total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (m == MAP_FAILED) return -1;
+    if (const int node = strata::core::numa_place_current_node(); node >= 0)   // STRATA_NUMA_PLACE: the stage's node
+        (void) strata::platform::numa_bind(m, (size_t) pool->total, node, strata::platform::numa_place_mode() == 2);
+    pool->base = (uint8_t*) m;
+    (void) cudaGetDevice(&pool->dev);
+    for (size_t i = 0; i < per.size(); ++i) arr[i] = pool->base + pool->off[i];
+    g_kv_host_reserved += (uint64_t) pages * std::accumulate(per.begin(), per.end(), (uint64_t) 0);
+    std::lock_guard<std::mutex> lk(g_host_mu);
+    g_host_pools.push_back(std::move(pool));
+    return (int32_t) g_host_pools.size() - 1;
+}
+uint64_t host_unit_bytes(const HostPool& p) {
+    uint64_t n = 0;
+    for (const uint64_t b : p.per) n += (uint64_t) p.unit * b;
+    return n;
+}
+void host_unpin_locked(HostPool& p, int64_t keep_units) {
+    for (int64_t u = p.units - 1; u >= keep_units; --u) {
+        for (size_t i = 0; i < p.per.size(); ++i) {
+            uint8_t* a = p.base + p.off[i] + (uint64_t) u * p.unit * p.per[i];
+            (void) cudaHostUnregister(a);
+            (void) cudaGetLastError();
+            (void) madvise(a, (size_t) ((uint64_t) p.unit * p.per[i]), MADV_DONTNEED);
+        }
+        g_kv_host_bytes -= host_unit_bytes(p);
+    }
+    p.units = std::min(p.units, keep_units);
+}
+#endif
+}  // namespace
+bool qsa_host_grow(const QsaState& st, int64_t cells) {
+#ifndef _WIN32
+    if (st.host_elastic < 0) return true;
+    std::lock_guard<std::mutex> lk(g_host_mu);
+    HostPool& p = *g_host_pools[(size_t) st.host_elastic];
+    const int64_t pages = std::min<int64_t>(p.pages, (std::max<int64_t>(cells, 1) + 3) / 4);
+    const int64_t want = (pages + p.unit - 1) / p.unit;
+    while (p.units < want) {
+        const int64_t u = p.units;
+        size_t done = 0;
+        for (; done < p.per.size(); ++done) {
+            uint8_t* a = p.base + p.off[done] + (uint64_t) u * p.unit * p.per[done];
+            if (cudaHostRegister(a, (size_t) ((uint64_t) p.unit * p.per[done]),
+                                 cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess)
+                break;
+            void* d = nullptr;
+            if (cudaHostGetDevicePointer(&d, a, 0) != cudaSuccess || d != (void*) a) {   // (checked per device at the start)
+                (void) cudaHostUnregister(a);
+                break;
+            }
+        }
+        if (done < p.per.size()) {
+            const cudaError_t e = cudaGetLastError();
+            for (size_t i = 0; i < done; ++i) {
+                uint8_t* a = p.base + p.off[i] + (uint64_t) u * p.unit * p.per[i];
+                (void) cudaHostUnregister(a);
+                (void) madvise(a, (size_t) ((uint64_t) p.unit * p.per[i]), MADV_DONTNEED);
+            }
+            (void) cudaGetLastError();
+            std::fprintf(stderr, "strata: KV streaming: pinning %.1f MiB more of a slot's host copy failed (%s; %.2f GiB "
+                                 "pinned for K/V in all)\n", (double) host_unit_bytes(p) / 1048576.0,
+                         cudaGetErrorString(e), (double) g_kv_host_bytes.load() / 1073741824.0);
+            return false;
+        }
+        g_kv_host_bytes += host_unit_bytes(p);
+        ++p.units;
+    }
+    return true;
+#else
+    (void) st; (void) cells;
+    return true;
+#endif
+}
+uint64_t qsa_host_trim(const QsaState& st, int64_t cells) {
+#ifndef _WIN32
+    if (st.host_elastic < 0) return 0;
+    std::lock_guard<std::mutex> lk(g_host_mu);
+    HostPool& p = *g_host_pools[(size_t) st.host_elastic];
+    const int64_t pages = std::min<int64_t>(p.pages, (std::max<int64_t>(cells, 1) + 3) / 4);
+    const int64_t keep = std::max<int64_t>(1, (pages + p.unit - 1) / p.unit);
+    if (p.units <= keep) return 0;
+    const uint64_t before = g_kv_host_bytes.load();
+    {   // nothing on the card may still read or write the pages given back
+        const strata::core::OnDevice on(p.dev);
+        (void) cudaDeviceSynchronize();
+    }
+    host_unpin_locked(p, keep);
+    return before - g_kv_host_bytes.load();
+#else
+    (void) st; (void) cells;
+    return 0;
+#endif
+}
+uint64_t qsa_host_backed_bytes(const QsaState& st) {
+#ifndef _WIN32
+    if (st.host_elastic < 0) return 0;
+    std::lock_guard<std::mutex> lk(g_host_mu);
+    const HostPool& p = *g_host_pools[(size_t) st.host_elastic];
+    return (uint64_t) p.units * host_unit_bytes(p);
+#else
+    (void) st;
+    return 0;
+#endif
+}
+
+namespace {
 // ---- the elastic K/V (--kv-grow): one VMM range per state, each pool array at a chunk boundary in it
 bool g_kv_elastic = false;
 int64_t g_kv_elastic_init = 16384;
@@ -997,7 +1163,8 @@ uint64_t qsa_slot_reserved_bytes(const QsaState& st) {
 void qsa_set_kv_resident(int64_t cells) { g_kv_resident = cells > 0 ? cells : 0; }
 int64_t qsa_kv_resident() { return g_kv_resident; }
 int64_t qsa_kv_resident_min() { return 20480; }
-uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
+uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes.load(); }
+uint64_t qsa_kv_host_reserved_bytes() { return g_kv_host_reserved.load(); }
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells,
                          bool elastic_slot) {
@@ -1048,6 +1215,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     const uint64_t q4_row = strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
     st.kv_elastic = -1;
     st.slot_elastic = -1;
+    st.host_elastic = -1;
     // the pool arrays' pointers, in kv_per_slot's order
     auto assign = [&st](uint8_t* const* a) {
         if (st.kv_hybrid) { st.k_q = (int8_t*) a[0]; st.k_scale = (uint16_t*) a[1]; st.v_q4 = a[2]; }
@@ -1163,7 +1331,21 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.host_step[strata::kernels::kStepCount] = 0;
     // KV streaming: the authoritative K/V of every cell, pinned and device-mapped, in the identity layout
     st.host = strata::kernels::KvHostPools{};
-    if (p.mode != 0) {
+    uint8_t* hel[4] = {};   // STRATA_KV_HOST_ELASTIC: an elastic slot's host arrays, addresses only until pinned
+#ifndef _WIN32
+    if (p.mode == 1 && slot_G > 0 && host_elastic_on())
+        st.host_elastic = host_pool_make(kv_per_slot(s, st.kv_hybrid, st.kv_q4, st.kv_int8), pages, s.page_size, hel);
+#endif
+    if (st.host_elastic >= 0) {   // (kv_per_slot's order, as the carve below)
+        if (st.kv_hybrid) { st.host.k_q = (int8_t*) hel[0]; st.host.k_scale = (uint16_t*) hel[1]; st.host.v_q4 = hel[2]; }
+        else if (st.kv_q4) { st.host.k_q4 = hel[0]; st.host.v_q4 = hel[1]; }
+        else if (st.kv_int8) {
+            st.host.k_q = (int8_t*) hel[0];
+            st.host.v_q = (int8_t*) hel[1];
+            st.host.k_scale = (uint16_t*) hel[2];
+            st.host.v_scale = (uint16_t*) hel[3];
+        } else { st.host.k_pool = (uint16_t*) hel[0]; st.host.v_pool = (uint16_t*) hel[1]; }
+    } else if (p.mode != 0) {
         const uint64_t hrows = (uint64_t) pages * s.n_head_kv * s.page_size;
         const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
         uint8_t* h = nullptr;
@@ -1174,10 +1356,11 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             if (p.mode == 1) std::fprintf(stderr, "strata: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
                                  "(%.2f GiB pinned so far): RAM or the driver refused to pin it - lower the context, "
                                  "or run without --kv-resident\n", (double) bytes / 1073741824.0,
-                                 (double) g_kv_host_bytes / 1073741824.0);
+                                 (double) g_kv_host_bytes.load() / 1073741824.0);
             return 0;
         }
         g_kv_host_bytes += bytes;
+        g_kv_host_reserved += bytes;
         Cursor hc{d};
         if (st.kv_hybrid) {
             st.host.k_q = hc.take<int8_t>(hrows * s.head_dim);
