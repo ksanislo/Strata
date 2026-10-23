@@ -6030,6 +6030,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: no RAM to pin the first cells of the solo session's K/V copy\n");
         return 1;
     }
+    auto solo_host_trim = [&](int64_t cells) {
+        uint64_t n = strata::core::session_host_trim(ss, cells);
+        for (auto& st : stages) n += strata::core::session_host_trim(st->ss, cells);
+        if (n > 0)
+            std::fprintf(stderr, "strata serve: the solo session's K/V copy gives back %.0f MiB of pinned RAM\n",
+                         (double) n / 1048576.0);
+    };
     // THE HEAD BEFORE THE CACHE, AND BEFORE THE ARENA.  The expert cache takes what is free minus the reserve, so
     // everything allocated after it comes out of the reserve.  The native head (~0.5 GB with IQ3_S) was loaded after
     // it and ate most of the 700 MiB: 128K IQ3_S ended with 30 MiB free, the driver paged, and a request stalled for
@@ -17345,6 +17352,8 @@ int main(int argc, char** argv) {
             std::printf("INFO ctx_source=%s ctx_reused=%lld ctx_prompt=%lld\n",
                         ctx_from ? ctx_from : resume > 0 ? "gpu" : "none", (long long) resume, (long long) n);
             std::fflush(stdout);
+            // STRATA_KV_HOST_ELASTIC: the same for the solo session's host copies (this request's prompt and max_new stay)
+            solo_host_trim(std::min<int64_t>(o.max_context, n + max_new + 64));
             // the elastic K/V: the outgoing session is parked and this request rewrites every cell from `resume` on,
             // so cells past this prompt's are no longer anyone's - far more than it needs go back to the cache
             if (kvg.on) {
