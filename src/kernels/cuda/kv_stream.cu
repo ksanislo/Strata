@@ -2,6 +2,7 @@
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
+#include "strata/kernels/split_copy.hpp"
 
 #include <cuda_runtime.h>
 
@@ -244,7 +245,7 @@ void kv_ring_restore(const QsaAttnPools& slots, const KvHostPools& host, int fmt
     for (int64_t b = b0; b < b1;) {
         const int64_t sl = b % n_slots, run = std::min<int64_t>(b1 - b, n_slots - sl);   // up to the ring's end
         for (int a = 0; a < r.n; ++a)
-            if (cudaMemcpyAsync(r.dst[a] + sl * r.len[a], r.src[a] + b * r.len[a], (size_t) (run * r.len[a]),
+            if (memcpy_async_split(r.dst[a] + sl * r.len[a], r.src[a] + b * r.len[a], (size_t) (run * r.len[a]),
                                 cudaMemcpyDefault, (cudaStream_t) stream) != cudaSuccess)
                 check("ring restore");
         b += run;
@@ -256,7 +257,7 @@ void kv_stage_from_host(const QsaAttnPools& stage, const KvHostPools& host, int 
     if (n_blocks <= 0) return;
     const Runs r = runs_of(stage, host, fmt, s);
     for (int a = 0; a < r.n; ++a)
-        if (cudaMemcpyAsync(r.dst[a], r.src[a], (size_t) (n_blocks * r.len[a]), cudaMemcpyDefault,
+        if (memcpy_async_split(r.dst[a], r.src[a], (size_t) (n_blocks * r.len[a]), cudaMemcpyDefault,
                             (cudaStream_t) stream) != cudaSuccess)
             check("stage");
 }
@@ -266,7 +267,7 @@ void kv_unstage_to_host(const QsaAttnPools& stage, const KvHostPools& host, int 
     if (b1 <= b0) return;
     const Runs r = runs_of(stage, host, fmt, s);   // src: the host copy, dst: the staging pool (identity layout both)
     for (int a = 0; a < r.n; ++a)
-        if (cudaMemcpyAsync((void*) (r.src[a] + b0 * r.len[a]), r.dst[a] + b0 * r.len[a], (size_t) ((b1 - b0) * r.len[a]),
+        if (memcpy_async_split((void*) (r.src[a] + b0 * r.len[a]), r.dst[a] + b0 * r.len[a], (size_t) ((b1 - b0) * r.len[a]),
                             cudaMemcpyDefault, (cudaStream_t) stream) != cudaSuccess)
             check("unstage");
 }

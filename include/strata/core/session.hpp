@@ -115,6 +115,8 @@ int64_t session_slot_need(const SessionState& s, int64_t cells);
 /// Physical bytes its elastic arrays hold now, and their reserved addresses (0 for any other session).
 uint64_t session_slot_backed(const SessionState& s);
 uint64_t session_slot_reserved(const SessionState& s);
+/// STRATA_KV_HOST_ELASTIC: the RAM pinned for the session's host copies (0 for a host copy pinned whole).
+uint64_t session_host_backed(const SessionState& s);
 /// Before the memory `session_init` carved is freed: forgets what points into it from outside the session (the
 /// rope kernels' registered angle table, #280), so a later session never rotates by freed memory.
 void session_release(SessionState& s);
