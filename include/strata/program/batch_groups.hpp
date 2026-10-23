@@ -159,6 +159,40 @@ inline Layout piped_mtp_layout(int base, int gs, const bool* active, const int* 
     return L;
 }
 
+/// A layout made with base 0 over a group's members: each row's slot from `members` (member t is slot members[t]).
+inline void remap_rows(Layout& L, const int* members) {
+    for (int r = 0; r < L.S; ++r) L.rows[r] = members[L.rows[r]];
+}
+
+/// STRATA_REGROUP: a window holds its group's live slots only, so the slots a group holds are the host's choice.  The
+/// move that evens out the groups' decoding slots: member `from_t` of group `from` (a live slot) trades places with
+/// member `to_t` of group `to` (a free one: neither decoding nor being read), when `from` decodes at least two slots
+/// more than `to` (so a move never undoes another).  Members are group-major: member t of group g is [g * gs + t].
+/// from < 0: nothing to move.
+struct Regroup {
+    int from = -1, from_t = -1, to = -1, to_t = -1;
+};
+inline Regroup regroup_pick(int groups, int gs, const bool* live, const bool* free_slot) {
+    Regroup r;
+    int hi = -1, hi_n = 0, lo = -1, lo_n = 0, lo_t = -1;
+    for (int g = 0; g < groups; ++g) {
+        int n = 0, f = -1;
+        for (int t = 0; t < gs; ++t) {
+            n += live[g * gs + t] ? 1 : 0;
+            if (f < 0 && free_slot[g * gs + t]) f = t;
+        }
+        if (hi < 0 || n > hi_n) { hi = g; hi_n = n; }
+        if (f >= 0 && (lo < 0 || n < lo_n)) { lo = g; lo_n = n; lo_t = f; }
+    }
+    if (hi < 0 || lo < 0 || hi_n - lo_n < 2) return r;
+    for (int t = gs - 1; t >= 0; --t)
+        if (live[hi * gs + t]) { r.from_t = t; break; }
+    r.from = hi;
+    r.to = lo;
+    r.to_t = lo_t;
+    return r;
+}
+
 /// A slot's accepted rows (1..n_rows): its token, then each draft the target picked after the row before it, while the
 /// pick is not an end token and the tokens can be emitted (as --batch-mtp's serial windows decide for one draft).
 /// `pick[j]` is row j's pick, `tok[j]` row j's token, `eos[j]` whether pick j ends the conversation.
