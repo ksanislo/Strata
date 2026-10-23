@@ -12608,8 +12608,10 @@ int main(int argc, char** argv) {
                 if (strata::core::device_sync() != cudaSuccess) { e = "elastic slots: device sync failed"; return false; }
             }
             if (!ok) {
-                e = "elastic slots: the slot budget (STRATA_ELASTIC_SLOTS_MIB) has no room for " + std::to_string(upto) +
-                    " cells in slot " + std::to_string(b);
+                e = strata::core::qsa_host_pin_failed()
+                        ? "no RAM is left to pin " + std::to_string(upto) + " cells of context in slot " + std::to_string(b)
+                        : "elastic slots: the slot budget (STRATA_ELASTIC_SLOTS_MIB) has no room for " + std::to_string(upto) +
+                              " cells in slot " + std::to_string(b);
                 return false;
             }
             // the slots decoding beside it are backed a step ahead now, while everything is quiet; then idle slots and
@@ -12638,8 +12640,9 @@ int main(int argc, char** argv) {
                 return 0;
             }
             if (r == 2) return 2;
-            std::fprintf(stderr, "strata batch: elastic slot %d ends at %lld tokens: the slot budget has no room to grow "
-                                 "(STRATA_ELASTIC_SLOTS_MIB)\n", b, (long long) sl.p);
+            std::fprintf(stderr, "strata batch: elastic slot %d ends at %lld tokens: %s\n", b, (long long) sl.p,
+                         strata::core::qsa_host_pin_failed() ? "no RAM is left to pin its context (STRATA_KV_HOST_ELASTIC)"
+                                                             : "the slot budget has no room to grow (STRATA_ELASTIC_SLOTS_MIB)");
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
             std::printf("BDONE %d %lld length %.1f\n", b, (long long) sl.produced, ms);
             std::fflush(stdout);
