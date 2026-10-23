@@ -8,12 +8,20 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 namespace strata::kernels {
 
 constexpr size_t kSplitCopyBytes = (size_t) 2 << 20;
 
+/// STRATA_SPLIT_COPY=0: one copy as before (A/B only: safe only with STRATA_KV_HOST_ELASTIC=0)
+inline bool split_copy_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_SPLIT_COPY"); return v == nullptr || v[0] != '0'; }();
+    return on;
+}
+
 inline cudaError_t memcpy_async_split(void* dst, const void* src, size_t n, cudaMemcpyKind kind, cudaStream_t stream) {
+    if (!split_copy_on()) return cudaMemcpyAsync(dst, src, n, kind, stream);
     auto* d = (uint8_t*) dst;
     auto* s = (const uint8_t*) src;
     while (n > 0) {
