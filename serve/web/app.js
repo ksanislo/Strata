@@ -262,7 +262,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, agg, 
                   ["error", "st-badge--error", "Error"]];
   // a slot: its badges; one line with the state on the left and its context figures on the right; one bar split in two
   // halves - the state's progress on top, the context against the limit below (grey, amber past 75%, red past 90%)
-  const block = (title, s, detail, pct, ctxTok) => {
+  const block = (title, s, detail, pct, ctxTok, ram) => {
     const max = eng.max_context || 0, cp = ctxTok && max ? Math.min(100, (100 * ctxTok) / max) : 0;
     const ctone = cp > 90 ? ' data-tone="danger"' : cp > 75 ? ' data-tone="warn"' : "";
     const ctxText = ctxTok && max ? `${kfmt(ctxTok)} / ${ctxfmt(max)}` : "";
@@ -270,7 +270,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, agg, 
       BADGES.map(([k, cls, t]) => `<span class="st-badge ${cls}${k === s ? " on" : ""}">${t}</span>`).join("") +
       `</span></div><div class="state-card__row"><span class="muted slot-detail">${detail}</span>` +
       (ctxText ? `<span class="muted slot-ctx">${ctxText}</span>` : "") + `</div>` +
-      `<div class="slot-bars"${ctxText ? ` title="context ${ctxText} (${Math.round(cp)}%)"` : ""}>` +
+      `<div class="slot-bars"${ctxText ? ` title="context ${ctxText} (${Math.round(cp)}%)${ram ? ` · RAM ${gb(ram)} GB` : ""}"` : ""}>` +
       `<div class="st-progress"${s === "reading" ? ' data-tone="info"' : ""}><div class="st-progress__bar" style="width:${pct || 0}%"></div></div>` +
       `<div class="st-progress slot-ctx-bar"${ctone}><div class="st-progress__bar" style="width:${cp.toFixed(1)}%"></div></div></div></div>`;
   };
@@ -293,7 +293,9 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, agg, 
     }
     // the conversation's own context: what it reads up to, what it holds while generating, or what an idle slot keeps
     const ctxTok = s === "reading" || s === "queued" ? c.prompt_tokens : s === "generating" ? c.context_tokens : c.held_tokens;
-    return block(title, s, detail, pct, ctxTok);
+    // (HMEM: the RAM its K/V host copy has pinned on every stage)
+    const ram = eng.context_ram && c.slot != null ? eng.context_ram.slots[c.slot] : 0;
+    return block(title, s, detail, pct, ctxTok, ram);
   };
   // every configured slot, in order and numbered from 1, so a conversation keeps its place. A request the engine
   // runs on its single-conversation path (everything else idle) has no slot number: it shows in the first idle slot,
@@ -397,6 +399,10 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, agg, 
   $("ctx-fill").style.opacity = 235.6 * frac >= 3 ? "1" : "0";         // a near-zero arc would draw just its round cap
   $("ctx-pct").textContent = `${Math.round(frac * 100)}%`;
   $("ctx-sub").textContent = sub;
+  const cr = eng.context_ram;   // HMEM: the RAM the conversations' K/V host copies have pinned
+  $("ctx-fill").closest("svg").parentElement.title = cr
+    ? `RAM for conversation context: ${gb(cr.pinned)} GB pinned` + (cr.whole > cr.pinned ? ` (${gb(cr.whole)} GB if every slot were full)` : "")
+    : "";
   const cacheBytes = (eng.expert_cache_mib || 0) * 1048576;
   $("slots-text").textContent = eng.expert_slots ? `${fmt(eng.expert_slots)} · ${gb(cacheBytes)} GB` : "–";
   $("slots-bar").style.width = hw.gpu_mem_total ? `${Math.min(100, (100 * cacheBytes) / hw.gpu_mem_total)}%` : "0%";

@@ -12213,7 +12213,9 @@ int main(int argc, char** argv) {
         // per card, the slot budget, its free part and what the expert cache can still give it (STRATA_ELASTIC_SLOTS_GIVE,
         // down to give_floor) on stdout whenever they change (the server's context memory):
         // KMEM <cards> then <device> <budget bytes> <free bytes> <givable bytes> per card
-        std::vector<uint64_t> kmem_last;
+        // HMEM <pinned> <whole> <slots> then <bytes> per slot: the RAM pinned for the KV-streaming host copies, what it would
+        // be pinned whole, and each slot's part on every stage (STRATA_KV_HOST_ELASTIC)
+        std::vector<uint64_t> kmem_last, hmem_last;
         auto kmem_note = [&]() {
             if (!eslots_on) return;
             std::vector<uint64_t> v;
@@ -12224,6 +12226,20 @@ int main(int argc, char** argv) {
                 v.push_back(f);
                 v.push_back(give_on && k < gv.size() && gv[k].lo > give_floor
                                 ? (uint64_t) (gv[k].cache->bytes_of(gv[k].lo) - gv[k].cache->bytes_of(give_floor)) : 0);
+            }
+            std::vector<uint64_t> h = {strata::core::qsa_kv_host_bytes(), strata::core::qsa_kv_host_reserved_bytes()};
+            for (size_t b = 0; b < bs.size(); ++b) {
+                uint64_t n = 0;
+                for (const auto& stage : bslot_ss) n += b < stage.size() ? strata::core::session_host_backed(*stage[b]) : 0;
+                h.push_back(n);
+            }
+            if (h != hmem_last && h[1] > 0) {
+                hmem_last = h;
+                std::string ln = "HMEM " + std::to_string(h[0]) + " " + std::to_string(h[1]) + " " + std::to_string(bs.size());
+                for (size_t b = 0; b < bs.size(); ++b) ln += " " + std::to_string(h[2 + b]);
+                ln += "\n";
+                std::fwrite(ln.data(), 1, ln.size(), stdout);
+                std::fflush(stdout);
             }
             if (v == kmem_last) return;
             kmem_last = v;
