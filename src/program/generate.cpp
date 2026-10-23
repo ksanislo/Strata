@@ -15105,9 +15105,10 @@ int main(int argc, char** argv) {
                         std::fflush(stderr);
                     }
                 }
-            } else if (eidle_on) {   // STRATA_ELASTIC_IDLE: the idle slots are looked at every second while no line comes
-                bool got = false;
+            } else if (eidle_on) {   // STRATA_ELASTIC_IDLE: the idle slots are looked at every second while no line comes,
+                bool got = false;    // and at every line (a request that follows another at once: its boundary)
                 for (;;) {
+                    if (!eidle_tick()) return 1;
                     {
                         std::unique_lock<std::mutex> lk(in_mu);
                         in_cv.wait_for(lk, std::chrono::seconds(1), [&] { return !in_lines.empty() || in_eof; });
@@ -15118,7 +15119,6 @@ int main(int argc, char** argv) {
                         }
                         if (got || in_eof) break;
                     }
-                    if (!eidle_tick()) return 1;
                 }
                 if (!got) break;
                 adm_direct = adm_take(line);
