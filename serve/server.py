@@ -1256,6 +1256,11 @@ class StrataEngine:
         # (its flag leaked) and would keep every later request waiting for a slot that nothing will free.
         self.slot_claims: set[int] = set()
         self.slot_releasing: set[int] = set()
+        # a request that goes on in a next pass (keep_slot_for_next: the thinking budget's wrap-up, a forced call's
+        # opening, a reasoning recovery) keeps its slot for that pass: {slot: (its thread, until)}.  Freed at its end,
+        # the slot went to a request waiting for one, and the next pass read the whole conversation again elsewhere
+        self.slot_kept: dict[int, tuple[int, float]] = {}
+        self._next_pass = threading.local()
         self._orphan_seen: dict[int, float] = {}
         # what each slot's sessions hold (prompt + every token a window fed), so a conversation's next turn goes to
         # the slot that has its start (the engine checks it again); when the slot was last used
@@ -1811,6 +1816,21 @@ class StrataEngine:
                 self.slot_cv.notify_all()
         threading.Thread(target=wait, daemon=True).start()
 
+    SLOT_KEEP_S = 5.0        # how long a slot waits for its request's next pass (it comes within milliseconds)
+
+    def keep_slot_for_next(self, on: bool = True) -> None:
+        """The pass this thread is closing has a next one: its slot waits for it (see slot_kept)."""
+        self._next_pass.on = on
+
+    def drop_kept_slots(self) -> None:
+        """The request on this thread is over: a slot it kept for a next pass goes back."""
+        me = threading.get_ident()
+        with self.slot_cv:
+            for b in [b for b, k in self.slot_kept.items() if k[0] == me]:
+                del self.slot_kept[b]
+            self.slot_cv.notify_all()
+        self._next_pass.on = False
+
     BGEN_REFUSALS_MAX = 6    # #1994: how often one request tries another slot after the engine refused a BGEN
     SLOT_PARK_S = 2.0        # ... and how long a refused slot stays out of the picks
 
@@ -2063,6 +2083,7 @@ class StrataEngine:
                                 if slot is not None:
                                     self.slot_busy[slot] = True
                                     self.slot_claims.add(slot)
+                                    self.slot_kept.pop(slot, None)
                                     logctx.set_slot(slot)
                                     if admit_wait:
                                         admit_wait = False
@@ -2309,6 +2330,10 @@ class StrataEngine:
             if slot is not None:
                 self.slot_live[slot] = None
                 self.slot_used[slot] = time.time()
+                if getattr(self._next_pass, "on", False):
+                    self._next_pass.on = False
+                    with self.slot_cv:
+                        self.slot_kept[slot] = (threading.get_ident(), time.monotonic() + self.SLOT_KEEP_S)
                 if phase == "slot" and bdone_in:
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
                     self.slot_held[slot] = stream[:-1] if stream else []     # as the BDONE wait leaves it
@@ -2383,6 +2408,12 @@ class StrataEngine:
         prompt (the engine then reads only the rest), else an empty one, else the one used longest ago - so the
         conversations other slots hold stay for their next turns.  None: every slot is busy."""
         free = [b for b in self.slot_order if not self.slot_busy[b]]
+        me, now = threading.get_ident(), time.monotonic()
+        kept = {b: k for b, k in getattr(self, "slot_kept", {}).items() if k[1] > now}
+        mine = [b for b in free if b in kept and kept[b][0] == me]
+        if mine:                                     # this request's next pass: its own slot
+            return mine[0]
+        free = [b for b in free if b not in kept]    # another request's next pass is coming for these
         if not free:
             return None
         gs = getattr(self, "slot_gs", 0)
@@ -5468,6 +5499,9 @@ class Service:
         try:
             yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only)
         finally:
+            drop = getattr(self.engine, "drop_kept_slots", None)
+            if drop is not None:
+                drop()                  # (a slot kept for a next pass that did not come)
             logctx.end()
             if ka is not None:
                 ka.release()
@@ -5778,6 +5812,9 @@ class Service:
                             leaving = True                  # the STOP below is ended, but no error replaces this
                             raise
                         finally:
+                            keep = getattr(self.engine, "keep_slot_for_next", None)
+                            if keep is not None and not leaving and not cancel.is_set():
+                                keep(wrap or opens or recover_prompt is not None)   # a next pass follows: its slot waits
                             try:
                                 gen.close()             # STOP+drain to THIS request's DONE while still holding the
                                 #                         fifo, so a stop-token break can't leave the shared engine
