@@ -50,6 +50,15 @@ Turing (sm_75) only, exact or within rounding: `STRATA_SM75_PERF=1 STRATA_SM75_S
 STRATA_SM75_Q8G=1 STRATA_GDN_KEYHEAD=1 STRATA_ARGMAX_ROWS_SM70=1 STRATA_BF16_TC=1
 STRATA_BF16_TC_SKIP=indexer,router,ssm` (Q4 also `STRATA_MMQ_KQ=1`).
 
+## Logging (server config keys)
+
+`"trusted_proxies": ["127.0.0.1", "::1", "172.18.0.0/16"]` (the proxies in front: llama-swap, nginx's network) and
+`"event_log": "/data/llm/logs/strata/events"`.  Every printed line and every engine-log line then starts with the time;
+a request's lines carry `[req <id> conv <key> slot <n>]`; the event log has one JSON line per request (client address
+and kind, prompt, reused, time to first token, the gap since the conversation's last request) and per conversation
+parked or restored.  `"log_time": false` turns the times and tags off.  Known gap: `reused`/`source` in a request's
+event can belong to another request when several overlap.
+
 ## What the switches do
 
 | switch | what |
