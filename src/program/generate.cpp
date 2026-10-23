@@ -5572,6 +5572,7 @@ int main(int argc, char** argv) {
                      last ? " and the head" : "", (double) fb / 1073741824.0);
     }
 
+    const uint64_t kv_host_solo = strata::core::qsa_kv_host_bytes();   // the solo session's host K/V, every stage
     // --batch: every stage carves o.batch more sessions like its own (same layer range and context), one per
     // slot of the batch windows.  Before the expert cache is sized, so `--expert-cache auto` leaves them room.
     // Recommend, never force: a count the engine cannot run is said and adjusted (or batching left off) - the
@@ -5894,6 +5895,11 @@ int main(int argc, char** argv) {
             }
         }
     }
+    if (const uint64_t all = strata::core::qsa_kv_host_bytes(); all > 0)   // (the line after the main session counts its first stage only)
+        std::fprintf(stderr, "strata generate: KV streaming: %.2f GiB of pinned RAM for the K/V of every session at "
+                             "--max-context %lld (the solo session %.2f GiB, the batch slots and the drafters %.2f GiB)\n",
+                     (double) all / 1073741824.0, (long long) o.max_context, (double) kv_host_solo / 1073741824.0,
+                     (double) (all - kv_host_solo) / 1073741824.0);
     // THE HEAD BEFORE THE CACHE, AND BEFORE THE ARENA.  The expert cache takes what is free minus the reserve, so
     // everything allocated after it comes out of the reserve.  The native head (~0.5 GB with IQ3_S) was loaded after
     // it and ate most of the 700 MiB: 128K IQ3_S ended with 30 MiB free, the driver paged, and a request stalled for
