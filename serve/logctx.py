@@ -249,13 +249,14 @@ class EventLog:
                 except OSError:
                     pass
 
-    def write(self, event: str, **fields) -> None:
-        rec = {"ts": stamp(ms=True), "ev": event, **{k: v for k, v in fields.items() if v is not None}}
-        line = json.dumps(rec, separators=(",", ":"), default=str) + "\n"
+    def write(self, kind: str, /, **fields) -> None:
+        """Never raises: a log is no reason for the caller (the engine's output reader, a request) to stop."""
         try:
+            rec = {"ts": stamp(ms=True), "ev": kind, **{k: v for k, v in fields.items() if v is not None}}
+            line = json.dumps(rec, separators=(",", ":"), default=str) + "\n"
             with self._lock:
                 f = self._file()
                 f.write(line)
                 f.flush()
-        except OSError:
+        except Exception:  # noqa: BLE001
             pass
