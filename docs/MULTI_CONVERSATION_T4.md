@@ -21,7 +21,8 @@ Args added to the usual ones: `--conversation-cache-mib 16384 --conversation-cac
   "STRATA_PARALLEL_LOAD": "1",
   "STRATA_ELASTIC_SLOTS": "1",
   "STRATA_ELASTIC_SLOTS_GIVE": "1",
-  "STRATA_ELASTIC_IDLE": "0",
+  "STRATA_ELASTIC_IDLE": "1",
+  "STRATA_ELASTIC_IDLE_S": "300",
   "STRATA_PIPED_MTP": "1",
   "STRATA_PIPED_MTP_DRAFTS": "2",
   "STRATA_SLOT_ADMIT": "1",
@@ -65,6 +66,7 @@ event can belong to another request when several overlap.
 |---|---|
 | STAGE_SERVE, PIPED_MTP | each card serves its layers on its own thread; slots in groups of 2 pipeline through the cards, MTP drafts while <= 2 conversations decode |
 | ELASTIC_SLOTS(+GIVE) | a slot's K/V memory grows with its conversation, taken from the expert cache when the budget runs short |
+| ELASTIC_IDLE (+_S 300) | a conversation idle 5 minutes is saved to RAM (and the session folder) and its card memory goes back to the expert cache; the slots start with only what they need, so the cache starts ~3 GB larger |
 | SLOT_ADMIT(+MULTI, CHUNK) | a new prompt is read beside the decoding slots, in 2048-token pieces |
 | READ_YIELD | a read stops at a piece boundary for a text request waiting behind it |
 | BATCH_READS | several reads share one prompt chunk |
