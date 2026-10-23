@@ -15824,8 +15824,11 @@ int main(int argc, char** argv) {
                                      "(drain %.0f ms); freed %s\n", b,
                              std::chrono::duration<double>(now - eidle_seen[(size_t) b].since).count(), sl.ids.size(),
                              park_ms, drain_ms, note.c_str());
+                std::printf("BIDLE %d\n", b);   // (the server: the slot holds nothing now)
+                std::fflush(stdout);
             }
             for (size_t k = 0; k < bslot_ss.size(); ++k) elastic_idle(k, true, -1);   // (the caches take it back, refilled)
+            kmem_note();
             return true;
         };
         // --serve is driven by its server over stdin (QUIT, or EOF when the server is gone): a SIGTERM / SIGINT sent to
@@ -15898,9 +15901,10 @@ int main(int argc, char** argv) {
                         std::fflush(stderr);
                     }
                 }
-            } else if (eidle_on) {   // STRATA_ELASTIC_IDLE: the idle slots are looked at every second while no line comes
-                bool got = false;
+            } else if (eidle_on) {   // STRATA_ELASTIC_IDLE: the idle slots are looked at every second while no line comes,
+                bool got = false;    // and at every line (a request that follows another at once: its boundary)
                 for (;;) {
+                    if (!eidle_tick()) return 1;
                     {
                         std::unique_lock<std::mutex> lk(in_mu);
                         in_cv.wait_for(lk, std::chrono::seconds(1), [&] { return !in_lines.empty() || in_eof; });
@@ -15911,7 +15915,6 @@ int main(int argc, char** argv) {
                         }
                         if (got || in_eof) break;
                     }
-                    if (!eidle_tick()) return 1;
                 }
                 if (!got) break;
                 adm_direct = adm_take(line);

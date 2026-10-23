@@ -1300,6 +1300,15 @@ class StrataEngine:
                 if sample is not None and self.proc is proc:
                     self.terminal_stage_sample = {**sample, "observed_monotonic": time.monotonic()}
                 continue
+            if line.startswith("BIDLE "):              # STRATA_ELASTIC_IDLE parked the slot's conversation: it holds nothing
+                try:
+                    b = int(line.split()[1])
+                    with self.slot_cv:
+                        if 0 <= b < len(self.slot_held) and not self.slot_busy[b]:
+                            self.slot_held[b] = []
+                except (IndexError, ValueError, AttributeError):
+                    pass
+                continue
             if line.startswith("KMEM "):               # KMEM <cards> (<device> <budget> <free> [<givable>])...: context memory
                 f = line.split()
                 try:
