@@ -9,6 +9,7 @@
 #include "strata/core/batch_rows.hpp"
 
 #include <cstdio>
+#include <utility>
 #include <initializer_list>
 
 namespace bg = strata::program::batch_groups;
@@ -203,6 +204,30 @@ int main() {
         check(bg::piped_mtp_keep(4, pick, tok, no, false, 10, 100, 997, 1000) == 2, "keep: context's end");
         const int32_t t1[2] = {1, 6};
         check(bg::piped_mtp_keep(2, pick, t1, no, false, 10, 100, 50, 1000) == 1, "keep: draft rejected");
+    }
+    {   // STRATA_REGROUP: 4 groups of 2; slots 0,1 decode in group 0, 2 in group 1, 7 reads (not free) in group 3
+        bool live[8] = {true, true, true, false, false, false, false, false};
+        bool fr[8] = {false, false, false, true, true, true, true, false};
+        bg::Regroup m = bg::regroup_pick(4, 2, live, fr);
+        check(m.from == 0 && m.from_t == 1 && m.to == 2 && m.to_t == 0, "regroup: a second live slot goes to an idle group");
+        live[1] = false;
+        fr[1] = true;
+        check(bg::regroup_pick(4, 2, live, fr).from < 0, "regroup: one live slot per group: no move");
+        bool l2[8] = {true, true, true, true, true, false, true, false};   // 2,2,1,1: a move would not even it out
+        bool f2[8] = {false, false, false, false, false, true, false, true};
+        check(bg::regroup_pick(4, 2, l2, f2).from < 0, "regroup: two apart at least");
+        bool l3[4] = {true, true, false, false}, f3[4] = {false, false, false, false};   // the other group is reading
+        check(bg::regroup_pick(2, 2, l3, f3).from < 0, "regroup: no free slot to trade with");
+        // a trade applied to the members table, then a layout over them: the rows are the members' slots
+        int mem[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+        std::swap(mem[m.from * 2 + m.from_t], mem[m.to * 2 + m.to_t]);
+        const bool act2[2] = {true, false};
+        const int nd2[2] = {0, 0};
+        const int32_t x2[2] = {7, 0}, dr2[16] = {};
+        const int64_t p2[2] = {40, 0}, left2b[2] = {9, 9};
+        bg::Layout L = bg::piped_mtp_layout(0, 2, act2, nd2, x2, dr2, p2, left2b, false, 0, 4, 1000);
+        bg::remap_rows(L, mem + m.to * 2);
+        check(L.S == 1 && L.rows[0] == 1 && mem[4] == 1 && mem[1] == 4, "regroup: group 2's window carries slot 1");
     }
 
     std::printf("%s\n", g_fail == 0 ? "batch_groups_test: all passed" : "batch_groups_test: FAILED");
