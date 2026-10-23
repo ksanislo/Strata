@@ -126,11 +126,10 @@ bool session_host_fit(SessionState& s, int64_t cells);
 /// any more (the solo session's outgoing conversation is parked).  Returns the bytes given back.
 uint64_t session_host_trim(SessionState& s, int64_t cells);
 /// The solo session's VRAM pools and pooled keys (qsa_set_vram_elastic_main) backed for `cells` from its device's
-/// slot budget (false: the budget is short - the expert cache gives, then again), the chunks that needs, and given
-/// back past `cells`.
+/// slot budget (false: the budget is short - the expert cache gives, then again), and the chunks that needs.  Never
+/// trimmed: the VRAM ring's residency map may name any of its slots.
 bool session_vram_fit(SessionState& s, int64_t cells);
 int64_t session_vram_need(const SessionState& s, int64_t cells);
-void session_vram_trim(SessionState& s, int64_t cells);
 /// Before the memory `session_init` carved is freed: forgets what points into it from outside the session (the
 /// rope kernels' registered angle table, #280), so a later session never rotates by freed memory.
 void session_release(SessionState& s);
