@@ -62,6 +62,8 @@ struct SessionState {
     int qsa_primary() const { return (int) qsa_ord0; }
     /// An elastic --batch slot session (session_init's `slot` 2): the cells its states are backed for; -1: not one.
     int64_t slot_cells = -1;
+    /// STRATA_KV_HOST_ELASTIC: a state outside the session whose host copy grows and shrinks with it (the slot's drafter)
+    const QsaState* host_follow = nullptr;
     /// The doorbell the host loop polls.  Null until a caller provides one - the engine runs without it, and
     /// neither `session_token` nor `session_replay` looks at it.
     const Doorbell* db = nullptr;
@@ -117,6 +119,9 @@ uint64_t session_slot_backed(const SessionState& s);
 uint64_t session_slot_reserved(const SessionState& s);
 /// STRATA_KV_HOST_ELASTIC: the RAM pinned for the session's host copies (0 for a host copy pinned whole).
 uint64_t session_host_backed(const SessionState& s);
+/// ... grown (never trimmed) for `cells` cells: the solo session's, before anything writes them (a request's prompt and
+/// its max_new, a restored conversation).  False: no RAM to pin.
+bool session_host_fit(SessionState& s, int64_t cells);
 /// Before the memory `session_init` carved is freed: forgets what points into it from outside the session (the
 /// rope kernels' registered angle table, #280), so a later session never rotates by freed memory.
 void session_release(SessionState& s);
