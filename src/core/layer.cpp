@@ -1210,6 +1210,92 @@ void qsa_set_host_elastic_main(bool on) {
 #endif
 }
 
+namespace {
+// ---- STRATA_ROPE_GROW (default on with the elastic solo pools, past a 262144 context; =0: off): a session's RoPE table
+// in two VMM ranges of the whole context, the first 262144 positions backed at load and more from the card's slot budget
+// as conversations pass them (qsa_rope_grow at session_slot_fit / session_vram_fit).  Its address never moves, so the
+// captured graphs and the states sharing it keep their pointers.
+struct RopeGrow {
+    strata::core::VmmRange cos, sin;
+    int n_rot = 0;
+    int64_t max_cells = 0, cells = 0;   // positions the table has, and backed and filled
+};
+std::vector<std::unique_ptr<RopeGrow>> g_rope_grow;
+std::mutex g_rope_mu;
+constexpr int64_t kRopeBase = 262144, kRopeMargin = 4096;   // backed at load; past the cells asked for (drafts)
+bool rope_grow_on(int64_t max_cells) {
+    static const bool env = [] { const char* v = std::getenv("STRATA_ROPE_GROW"); return v == nullptr || v[0] != '0'; }();
+    return env && g_vram_main && max_cells > kRopeBase && strata::core::vmm_available();
+}
+RopeGrow* rope_grow_of(const float* cos_tab) {
+    for (auto& r : g_rope_grow)
+        if ((const float*) r->cos.base() == cos_tab) return r.get();
+    return nullptr;
+}
+uint64_t rope_row_bytes(const RopeGrow& r) { return (uint64_t) (r.n_rot / 2) * 4; }
+/// The chunks of one table that back its first `cells` positions.
+int64_t rope_chunks(const RopeGrow& r, int64_t cells) {
+    const uint64_t G = r.cos.granularity();
+    return (int64_t) (((uint64_t) cells * rope_row_bytes(r) + G - 1) / G);
+}
+int64_t rope_target(const RopeGrow& r, int64_t cells) { return std::min(r.max_cells, cells + kRopeMargin); }
+int64_t rope_need(const RopeGrow& r, int64_t cells) {
+    const int64_t c1 = rope_chunks(r, rope_target(r, cells));
+    int64_t n = 0;
+    for (int64_t c = 0; c < c1; ++c) n += !r.cos.mapped(c) + !r.sin.mapped(c);
+    return n;
+}
+/// Backs both tables for `cells` positions (whole chunks) and fills the positions new to them.
+bool rope_map(RopeGrow& r, int64_t cells, const std::function<strata::core::VmmChunk()>& take) {
+    const int64_t c1 = rope_chunks(r, rope_target(r, cells));
+    const int64_t to = std::min<int64_t>(r.max_cells, (int64_t) ((uint64_t) c1 * r.cos.granularity() / rope_row_bytes(r)));
+    if (to <= r.cells) return true;
+    if (!r.cos.map_range(0, c1, take) || !r.sin.map_range(0, c1, take)) return false;
+    const size_t rows = (size_t) (to - r.cells), half = (size_t) (r.n_rot / 2);
+    std::vector<float> hc(rows * half), hs(rows * half);
+    strata::kernels::build_rope_table_range(r.n_rot, strata::kernels::rope_scaling(), (int) r.cells, (int) to, hc.data(),
+                                            hs.data());
+    const uint64_t at = (uint64_t) r.cells * rope_row_bytes(r);
+    if (cudaMemcpy(r.cos.base() + at, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(r.sin.base() + at, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
+        std::fprintf(stderr, "strata: the RoPE table could not be filled: %s\n", cudaGetErrorString(cudaGetLastError()));
+        return false;
+    }
+    r.cells = to;
+    return true;
+}
+}  // namespace
+
+bool qsa_rope_grow(const QsaState& st, int64_t cells) {
+    std::lock_guard<std::mutex> lk(g_rope_mu);
+    RopeGrow* r = st.cos_tab != nullptr ? rope_grow_of(st.cos_tab) : nullptr;
+    if (r == nullptr || rope_target(*r, cells) <= r->cells) return true;
+    const int dev = r->cos.device();
+    const int64_t need = rope_need(*r, cells);
+    std::vector<strata::core::VmmChunk> got;
+    if (qsa_slot_budget_take(dev, need, got) < need) {   // all or nothing, as the slots' K/V
+        for (const strata::core::VmmChunk h : got) qsa_slot_budget_give(dev, h);
+        return false;
+    }
+    const strata::core::OnDevice on(dev);
+    size_t i = 0;
+    const int64_t had = r->cells;
+    if (!rope_map(*r, cells, [&] { return i < got.size() ? got[i++] : (strata::core::VmmChunk) 0; })) return false;
+    std::fprintf(stderr, "strata: CUDA%d's RoPE table covers %lld positions now (was %lld)\n", dev, (long long) r->cells,
+                 (long long) had);
+    return true;
+}
+int64_t qsa_rope_need(const QsaState& st, int64_t cells) {
+    std::lock_guard<std::mutex> lk(g_rope_mu);
+    const RopeGrow* r = st.cos_tab != nullptr ? rope_grow_of(st.cos_tab) : nullptr;
+    return r == nullptr || rope_target(*r, cells) <= r->cells ? 0 : rope_need(*r, cells);
+}
+void qsa_rope_release(const float* cos_tab) {
+    std::lock_guard<std::mutex> lk(g_rope_mu);
+    for (auto it = g_rope_grow.begin(); it != g_rope_grow.end(); ++it)
+        if ((const float*) (*it)->cos.base() == cos_tab) { g_rope_grow.erase(it); return; }
+}
+
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells,
                          bool elastic_slot) {
     const QsaShapes s = qsa_shapes(g);
@@ -1231,7 +1317,7 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
     if (!strata::core::slot_array_elastic((uint64_t) p.pooled_rows * s.idx_dim * 4, G))
         n += (uint64_t) p.pooled_rows * s.idx_dim * 4;                         // pooled
     n += 16;                                                                   // block_pos
-    if (with_rope) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;          // cos + sin tables
+    if (with_rope && !rope_grow_on(max_cells)) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;   // cos + sin tables
     n += strata::kernels::qsa_step_bytes() + 16;                               // counts and aligned attention status
     n += (uint64_t) s.n_head * 4;                                              // pos_dev
     return align_up16(n) + 256;
@@ -1356,9 +1442,27 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     if (spool && in_range.back() >= 0) st.idx_pooled = (float*) (spool->range.base() + spool->arr[(size_t) in_range.back()].off);
     else st.idx_pooled = c.take<float>((uint64_t) p.pooled_rows * s.idx_dim);
     st.idx_block_pos = c.take<int32_t>(1);
+    bool rope_grown = false;
     if (share_rope != nullptr) {
         st.cos_tab = share_rope->cos_tab;
         st.sin_tab = share_rope->sin_tab;
+    } else if (rope_grow_on(max_cells)) {
+        auto r = std::make_unique<RopeGrow>();
+        r->n_rot = (int) s.n_rot;
+        r->max_cells = max_cells;
+        const uint64_t bytes = (uint64_t) max_cells * (s.n_rot / 2) * 4;
+        if (!r->cos.reserve(bytes) || !r->sin.reserve(bytes) ||
+            !rope_map(*r, kRopeBase - kRopeMargin, [] { return (strata::core::VmmChunk) 0; })) {
+            std::fprintf(stderr, "strata: STRATA_ROPE_GROW: the RoPE table's addresses or first positions failed\n");
+            return 0;
+        }
+        st.cos_tab = (float*) r->cos.base();
+        st.sin_tab = (float*) r->sin.base();
+        {
+            std::lock_guard<std::mutex> lk(g_rope_mu);
+            g_rope_grow.push_back(std::move(r));
+        }
+        rope_grown = true;
     } else {
         st.cos_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));
         st.sin_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));
@@ -1429,11 +1533,13 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     // agree with the host's libm.  A table shorter than the sequence would have the rotation read past it.
     // The process's rope scaling (none by default) is INSIDE the table - the rotation kernels cannot tell.
     if (share_rope == nullptr) {
-        std::vector<float> hc((size_t) max_cells * (s.n_rot / 2)), hs((size_t) max_cells * (s.n_rot / 2));
-        strata::kernels::build_rope_table((int) s.n_rot, strata::kernels::rope_scaling(), (int) max_cells,
-                                          hc.data(), hs.data());
-        cudaMemcpy(st.cos_tab, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice);
-        cudaMemcpy(st.sin_tab, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice);
+        if (!rope_grown) {   // (a grown table filled its first positions above)
+            std::vector<float> hc((size_t) max_cells * (s.n_rot / 2)), hs((size_t) max_cells * (s.n_rot / 2));
+            strata::kernels::build_rope_table((int) s.n_rot, strata::kernels::rope_scaling(), (int) max_cells,
+                                              hc.data(), hs.data());
+            cudaMemcpy(st.cos_tab, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice);
+            cudaMemcpy(st.sin_tab, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice);
+        }
         st.owns_rope = true;
         if (s.n_rot == 64)   // the native and prompt-path rope kernels read it (mrope.hpp, STRATA_ROPE_TABLE=1)
             strata::kernels::rope_table_set(st.cos_tab, st.sin_tab, (int) max_cells, strata::kernels::rope_scaling());

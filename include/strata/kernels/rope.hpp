@@ -51,6 +51,8 @@ void build_rope_table(int n_rot, double theta, int max_pos, float* cos_tab, floa
 /// for linear/YaRN the scaled angles (YaRN's mscale included) replace them.  The math is ggml's,
 /// transcribed; see the header of `rope_scaling.hpp` for what arrives from where.
 void build_rope_table(int n_rot, const RopeScaling& scaling, int max_pos, float* cos_tab, float* sin_tab);
+/// Positions [p0, p1) of the same table into cos_tab/sin_tab[0 ..): each row exactly what the whole table holds there.
+void build_rope_table_range(int n_rot, const RopeScaling& scaling, int p0, int p1, float* cos_tab, float* sin_tab);
 
 // `x` and `out` are (rows, head_dim) and `pos` is (rows,) - one position per row, so a batch of heads at
 // different sequence positions is one call.  `cos_tab`/`sin_tab` are (max_pos, n_rot/2).  `out` may equal `x`.
