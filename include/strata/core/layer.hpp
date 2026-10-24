@@ -42,7 +42,10 @@
 
 #include <cstdio>
 #include <functional>
+#include <utility>
 #include <vector>
+
+#include "strata/kernels/rope_scaling.hpp"
 
 #include "strata/core/vmm.hpp"
 #include <cstdlib>
@@ -337,6 +340,11 @@ bool qsa_rope_grow(const QsaState& st, int64_t cells);
 int64_t qsa_rope_need(const QsaState& st, int64_t cells);
 /// Frees a grown RoPE table (session_release, with the table's owner).
 void qsa_rope_release(const float* cos_tab);
+/// STRATA_YARN_ELASTIC: the engine's RoPE level from `from` to `to`, with no GPU work in flight: every session's table
+/// rebuilt in place (rope_content() becomes `to`), every listed state's stored keys moved for its first `cells` cells
+/// (the host copy, the VRAM pools or ring, the indexer's pooled keys and spare; a streamed ring refills from the host).
+bool qsa_rope_level(const strata::kernels::RopeScaling& from, const strata::kernels::RopeScaling& to,
+                    const strata::kernels::QsaShapes& s, const std::vector<std::pair<const QsaState*, int64_t>>& states);
 /// ... unpinned (and its pages given back) past the steps `cells` cells need, keeping the first step; the state's
 /// device is synchronized first.  Returns the bytes given back.
 uint64_t qsa_host_trim(const QsaState& st, int64_t cells);

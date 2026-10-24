@@ -46,6 +46,13 @@ void rope_scaling_set(const RopeScaling& scaling) { g_rope_scaling = scaling; }
 const RopeScaling& rope_scaling() { return g_rope_scaling; }
 
 namespace {
+RopeScaling g_rope_content;
+bool g_rope_content_on = false;
+}  // namespace
+void rope_content_set(const RopeScaling& scaling) { g_rope_content = scaling; g_rope_content_on = true; }
+const RopeScaling& rope_content() { return g_rope_content_on ? g_rope_content : g_rope_scaling; }
+
+namespace {
 void rope_rows(int n_rot, double theta, int p0, int p1, float* cos_tab, float* sin_tab) {
     const int half = n_rot / 2;
     for (int p = p0; p < p1; ++p) {

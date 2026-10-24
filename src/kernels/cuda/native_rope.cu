@@ -182,14 +182,16 @@ bool same_scaling(const RopeScaling& a, const RopeScaling& b) {
            a.beta_fast == b.beta_fast && a.beta_slow == b.beta_slow;
 }
 // opt-in: STRATA_ROPE_TABLE=1 (the table's angles differ from the fast-math ones in the last bits, so outputs move)
+bool g_rope_table_forced = false;
 bool rope_table_enabled() {
     static const bool on = [] {
         const char* e = std::getenv("STRATA_ROPE_TABLE");
         return e != nullptr && e[0] == '1';
     }();
-    return on;
+    return on || g_rope_table_forced;
 }
 }  // namespace
+void rope_table_force(bool on) { g_rope_table_forced = on; }
 void rope_table_set(const float* cos_tab, const float* sin_tab, int max_pos, const RopeScaling& scaling) {
     rope_tab[mrope_dev()] = RopeReg{RopeTab{cos_tab, sin_tab, max_pos}, scaling};
 }
