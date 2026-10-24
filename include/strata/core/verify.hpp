@@ -415,9 +415,11 @@ private:
     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph (0.1.39); N: LRU-evict beyond N layouts
     uint64_t bgraph_bytes_ = 0, bgraph_n_ = 0, bgraph_evictions_ = 0;   ///< batch_graph_bytes; evictions (and reliefs) so far
     int last_rows_[8] = {};                ///< the slots of the last batch window's rows
+    int row_level(int slot) const;
     std::vector<int> bkey(const int* rows, int S, int hbase) const {   // #871: the doorbell variant has its own graphs
         std::vector<int> k = batch_key(rows, S, hbase);
         k.push_back(ar_off_ ? 1 : 0);
+        for (int t = 0; t < S; ++t) k.push_back(row_level(rows[t]));   // (the slots' RoPE levels are baked in too)
         return k;
     }
     static std::vector<int> batch_key(const int* rows, int S, int hbase) {
@@ -620,9 +622,11 @@ private:
     cudaStream_t df_side_[2] = {};
     cudaEvent_t df_fork_ = nullptr;
     cudaEvent_t df_join_[2] = {};
-    cudaGraphExec_t exec_[9] = {};
-    cudaGraphExec_t exec_nr_[9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
-    bool launched_[9] = {}, launched_nr_[9] = {};   ///< this graph has been launched once (early_ple_flag: a cold first launch raises the PLE flag first)
+    // [level]: the graphs bake the session's RoPE level (the indexer's position base, STRATA_YARN_ELASTIC): a set per level
+    cudaGraphExec_t exec_[2][9] = {};
+    cudaGraphExec_t exec_nr_[2][9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
+    bool launched_[2][9] = {}, launched_nr_[2][9] = {};   ///< this graph has been launched once (early_ple_flag: a cold first launch raises the PLE flag first)
+    int lv() const;   ///< the level of the session the solo graphs run on (0 plain, 1 YaRN)
     // fork 34a35db (STRATA_SIDE_MIXER=1): the GDN gates and the QSA indexer on a branch of the window's graph beside the
     // mixer's projections, joined before the recurrence / the attention
     cudaStream_t side_ = nullptr;
@@ -630,7 +634,7 @@ private:
     // fork b063c13 (STRATA_SIDE_MIXER=2): a second branch for the GDN gate projection and the QSA queries' chain
     cudaStream_t side2_ = nullptr;
     cudaEvent_t pfork_ = nullptr, pjoin_ = nullptr;
-    cudaGraphExec_t commit_exec_ = nullptr;
+    cudaGraphExec_t commit_exec_[2] = {};   // [level]
 
     // mapped staging (host pointer, device alias)
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T
