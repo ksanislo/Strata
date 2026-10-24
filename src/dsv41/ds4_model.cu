@@ -1025,6 +1025,7 @@ struct Model::Impl {
     std::vector<uint8_t*> ram_slots, ram_chunks;
     std::vector<size_t> ram_chunk_bytes;
     bool ram_pinned = false;   // the slots are pinned memory (the prompt path DMAs them from where they lie)
+    bool store_dma = false;    // the RAM store is page-locked whole and never evicts (init_store): its slots too
     size_t flow_part[3] = {0, 0, 0};   // the flow's staging room for each part: its largest over the trunk's layers
     std::vector<int> ram_free;
     std::deque<RamSwap> ram_queue;
@@ -3189,6 +3190,11 @@ struct Model::Impl {
             ++c.it_ram;
             return;
         }
+        if (store_blob != nullptr && store_dma) {   // (a page-locked store that never evicts: DMA'd from its slot)
+            for (int r = 0; r < 3; ++r) it.src[r] = store_blob + l.lay.trellis[r] + mx_read_off(l, mi, r);
+            ++c.it_ram;
+            return;
+        }
         if (in_ram)   // (copied into staging by io, then DMA'd; copy_mode: from its NH parts, flow_pump)
             it.ram = store_blob != nullptr ? store_blob
                      : copy_mode ? ram_part[(size_t) l.ram[(size_t) e]][0] : ram_slots[(size_t) l.ram[(size_t) e]];
@@ -4519,6 +4525,26 @@ struct Model::Impl {
                 cudaHostUnregister(h);
             };
         }
+        // DS4_STORE_PIN=1 (opt-in): the arena page-locked for the copy engines, when it holds every routed expert - then nothing is
+        // ever evicted and the prompt's stream DMAs a slot from where it lies instead of copying it into staging first.  4x T4,
+        // PCIe 3.0, 180 GB store: the stream's waits 1.7-2.5 s a card -> 0, a 1.2K-token prompt 17.5 -> 16.0 s, but the load
+        // 40 -> 210 s (registering 180 GB) - so not by default
+        {
+            size_t all = 0;
+            for (const Layer& l : L)
+                if (l.il < g.nl) all += (size_t) l.n_exp;
+            const size_t slot_b = (geo.empty() ? 0 : std::max_element(geo.begin(), geo.end(), [](const auto& a, const auto& b) {
+                                      return a.blob < b.blob; })->blob) + 2 * ExpertStore::kSlack + 4096;
+            const bool fits = slot_b > 0 && cfg.budget_bytes / slot_b >= all;
+            if (fits && !want_zc && std::getenv("DS4_STORE_PIN") != nullptr && std::atoi(std::getenv("DS4_STORE_PIN")) != 0) {
+                cfg.pin_chunk = [](void* h, size_t n) -> bool {
+                    if (cudaHostRegister(h, n, cudaHostRegisterPortable) == cudaSuccess) return true;
+                    (void) cudaGetLastError();
+                    return false;
+                };
+                cfg.unpin_chunk = [](void* h) { cudaHostUnregister(h); };
+            }
+        }
         bool direct = true;
         for (os::fd_t f : pk.dfds) direct = direct && f != os::kBadFd;
         auto st = std::make_unique<ExpertStore>();
@@ -4527,6 +4553,8 @@ struct Model::Impl {
             return;
         }
         store = std::move(st);
+        store_dma = store->dma_pinned();
+        if (store_dma) std::fprintf(stderr, "ds4: RAM store: page-locked whole (it holds every routed expert): the prompt streams its slots by DMA\n");
         // (the router lookahead's guesses are not read ahead with the store: measured 4.5 against 4.7 tok/s, 62% of the guesses are right and
         // the SSD is the narrow part; DS4_AHEAD=1 turns them on)
         if (std::getenv("DS4_AHEAD") == nullptr) ahead_mode = 0;
