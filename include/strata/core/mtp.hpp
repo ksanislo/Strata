@@ -22,6 +22,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/pinned_ring.hpp"
 #include "strata/core/session.hpp"
+#include "strata/kernels/mrope.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
@@ -222,6 +223,8 @@ private:
 
     const ModelGeometry* g_ = nullptr;
     SessionState* ss_ = nullptr;
+    /// STRATA_YARN_ELASTIC: the rotary position offset of the conversation drafted for (its session's level)
+    int32_t rope_off() const { return ss_ != nullptr && ss_->rope_level ? strata::kernels::kRopeYarnOff : 0; }
     SessionState* ple_ss_ = nullptr;
     const WeightTable* wt_ = nullptr;
     const NativeHead* head_ = nullptr;

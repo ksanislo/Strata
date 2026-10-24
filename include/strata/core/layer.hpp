@@ -340,11 +340,18 @@ bool qsa_rope_grow(const QsaState& st, int64_t cells);
 int64_t qsa_rope_need(const QsaState& st, int64_t cells);
 /// Frees a grown RoPE table (session_release, with the table's owner).
 void qsa_rope_release(const float* cos_tab);
-/// STRATA_YARN_ELASTIC: the engine's RoPE level from `from` to `to`, with no GPU work in flight: every session's table
-/// rebuilt in place (rope_content() becomes `to`), every listed state's stored keys moved for its first `cells` cells
-/// (the host copy, the VRAM pools or ring, the indexer's pooled keys and spare; a streamed ring refills from the host).
-bool qsa_rope_level(const strata::kernels::RopeScaling& from, const strata::kernels::RopeScaling& to,
-                    const strata::kernels::QsaShapes& s, const std::vector<std::pair<const QsaState*, int64_t>>& states);
+/// STRATA_YARN_ELASTIC per conversation (set before any session): every session owner gets a YaRN-level table (the
+/// kernels read it for rotary positions >= kRopeYarnOff), backed by qsa_rope_yarn_fit as YaRN conversations need it.
+void qsa_set_rope_yarn(const strata::kernels::RopeScaling* yarn);
+bool qsa_rope_yarn_fit(const QsaState& st, int64_t cells);
+int64_t qsa_rope_yarn_need(const QsaState& st, int64_t cells);
+/// One conversation's stored keys from plain RoPE (as the kernels computed it) to the YaRN level, its first `cells`
+/// cells per state: host copies, VRAM pools or rings, the indexer's pooled keys and spare (a streamed ring refills).
+/// The states must be quiet; `stream` runs the work (synchronized before it returns).
+bool qsa_rope_move(const strata::kernels::QsaShapes& s, const std::vector<std::pair<const QsaState*, int64_t>>& states,
+                   void* stream);
+/// What a checkpoint's spare (its `dead` rotary values, angle 0) is multiplied by at the move: cos(0) at YaRN.
+float qsa_rope_yarn_spare_scale();
 /// ... unpinned (and its pages given back) past the steps `cells` cells need, keeping the first step; the state's
 /// device is synchronized first.  Returns the bytes given back.
 uint64_t qsa_host_trim(const QsaState& st, int64_t cells);

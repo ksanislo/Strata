@@ -92,7 +92,8 @@ void SessionDir::open() {
         Entry e;
         e.path = de.path().string();
         std::string err;
-        if (!session_file_peek(e.path, o_.id, e.peek, err)) {
+        if (!session_file_peek(e.path, o_.id, e.peek, err) &&
+            (o_.id_yarn.config == 0 || !session_file_peek(e.path, o_.id_yarn, e.peek, err))) {
             say("drop " + e.path + " (" + err + ")");
             const uint64_t sz = (uint64_t) fs::file_size(de.path(), ec);
             fs::remove(de.path(), ec);
@@ -190,7 +191,7 @@ void SessionDir::writer_loop() {
         std::string err;
         SessionStatus st;
         const auto t0 = std::chrono::steady_clock::now();
-        const bool ok = session_file_write(path, *job.image, o_.id, written, err, wo, &st);
+        const bool ok = session_file_write(path, *job.image, id_of(*job.image), written, err, wo, &st);
         const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
         lk.lock();
@@ -242,8 +243,8 @@ bool SessionDir::write_now(const SavedConversation& meta, const std::vector<Sess
     wo.min_free_bytes = o_.min_free_bytes;
     SessionStatus st;
     const auto t0 = std::chrono::steady_clock::now();
-    const bool ok = meta.stage_images.empty() ? session_file_write(path, meta, kv, o_.id, bytes, error, wo, &st)
-                                              : session_file_write(path, meta, kv, stage_kv, o_.id, bytes, error, wo, &st);
+    const bool ok = meta.stage_images.empty() ? session_file_write(path, meta, kv, id_of(meta), bytes, error, wo, &st)
+                                              : session_file_write(path, meta, kv, stage_kv, id_of(meta), bytes, error, wo, &st);
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::lock_guard<std::mutex> lk(mu_);
     if (!ok) {
@@ -390,7 +391,20 @@ std::optional<SavedConversation> SessionDir::fetch(const std::vector<int32_t>& i
 bool SessionDir::read_file(const std::string& path, SavedConversation& image, std::string& error) const {
     size_t bytes = 0;
     SessionStatus st;
-    return session_file_map(path, o_.id, image, bytes, error, o_.limits, &st);   // K/V as views: no RAM copy
+    if (session_file_map(path, o_.id, image, bytes, error, o_.limits, &st)) return true;   // K/V as views: no RAM copy
+    if (o_.id_yarn.config == 0 || !session_file_map(path, o_.id_yarn, image, bytes, error, o_.limits, &st)) return false;
+    // a YaRN conversation's file: the level rides on every state it restores
+    image.live.rope_level = 1;
+    for (auto& p : image.live.stage_parts) p.rope_level = 1;
+    for (auto& c : image.checkpoints) {
+        c.rope_level = 1;
+        for (auto& p : c.stage_parts) p.rope_level = 1;
+    }
+    for (auto& si : image.stage_images) {
+        si.live.rope_level = 1;
+        for (auto& c : si.checkpoints) c.rope_level = 1;
+    }
+    return true;
 }
 
 void SessionDir::drop_entry_locked(size_t i, const char* why) {
