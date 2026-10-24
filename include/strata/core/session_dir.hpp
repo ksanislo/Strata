@@ -27,6 +27,8 @@ public:
     struct Options {
         std::string dir;
         SessionFileIdentity id;
+        // STRATA_YARN_ELASTIC: the identity of a conversation at the YaRN level (config 0: none); its files read as such
+        SessionFileIdentity id_yarn;
         SessionReadLimits limits;              // this runtime's bounds (its stages included); admit = RAM preflight
         // the least recently used files go first when the folder is over max_bytes (or, a safety net, max_files);
         // a file not written or resumed for max_age goes in any case
@@ -82,6 +84,10 @@ public:
                            const SessionPeek& older);
 
 private:
+    const SessionFileIdentity& id_of(const SavedConversation& s) const {
+        return o_.id_yarn.config != 0 && s.live.rope_level == 1 ? o_.id_yarn : o_.id;
+    }
+
     enum class State { idle, loading, preloaded };
     struct Entry {
         std::string path;

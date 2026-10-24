@@ -123,8 +123,14 @@ public:
 
     /// With borrowed buffers: lay them out again for chunks of `chunk` tokens (at most `init`'s) in `borrow` - a
     /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
-    bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err);
+    /// `stage_cells` (KV streaming): the K/V staging covers this many cells (stage_cells_for), 0 = the whole context.
+    bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err, int64_t stage_cells = 0);
     int64_t chunk() const;
+    /// The cells the K/V staging holds as laid out now (0: no staging - the K/V is resident).
+    int64_t stage_cells() const;
+    /// The staging cells a loan for reads reaching `reach` cells lays out: 262144 (or the whole context, if less) up
+    /// to there, past it the reach rounded up to 131072; 0 (the whole context) for reach <= 0 or STRATA_KV_STAGE_REACH=0.
+    static int64_t stage_cells_for(const core::SessionState& ss, int64_t reach);
 
     /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all).  Sizes the streamed
     /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.
@@ -176,7 +182,7 @@ public:
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).  `src`: init gets an
     /// ExpertSource (carve picks the fused MoE layout only then).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
-                                 bool src = true);
+                                 bool src = true, int64_t stage_cells = 0);
 
     /// The same without the streamed ring: what the chunk's own buffers cost.  The auto chunk scan sizes the chunk
     /// first and hands the ring what the chunk leaves over, so it needs the chunk priced on its own.
@@ -358,7 +364,7 @@ public:
 
 private:
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
-                                      bool owned_pages, bool src);
+                                      bool owned_pages, bool src, int64_t stage_cells = 0);
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool
     // Stage-1 pipeline: intermediate stages return after handing their chunk to
     // the direct successor. The public run() drains the chain once at prompt end.

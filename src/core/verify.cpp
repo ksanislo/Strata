@@ -617,11 +617,13 @@ Verifier::~Verifier() {
     }
     if (cs_) cudaStreamSynchronize(cs_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
-    for (auto& e : exec_)
-        if (e) cudaGraphExecDestroy(e);
-    for (auto& e : exec_nr_)
-        if (e) cudaGraphExecDestroy(e);
-    if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
+    for (int l = 0; l < 2; ++l) {
+        for (auto& e : exec_[l])
+            if (e) cudaGraphExecDestroy(e);
+        for (auto& e : exec_nr_[l])
+            if (e) cudaGraphExecDestroy(e);
+        if (commit_exec_[l]) cudaGraphExecDestroy(commit_exec_[l]);
+    }
     for (auto& kv : exec_bm_)
         if (kv.second) cudaGraphExecDestroy(kv.second);
     for (auto& kv : commit_bm_)
@@ -1581,13 +1583,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (dec_batch && !g_no_batch_kv && !batch_rec_) {
                         const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                         native_qsa_indexer_append_steps(idx_raw + tb * ID, step_ + tb * kStepCount + kStepPos, kStepCount,
-                                                        n, 0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                        n, ss.rope_level ? strata::kernels::kRopeYarnOff : 0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                                         rope_scaling(), ns);
                     } else {
                         for (int t = tb; t < te; ++t) {
                             const QsaState& sx = slot_ss(t).qsa_states[qi];
                             const QsaIndexerBuffers ib{sx.idx_tail, sx.idx_dead, sx.idx_pooled, sx.idx_block_pos};
-                            native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
+                            native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos,
+                                                      slot_ss(t).rope_level ? strata::kernels::kRopeYarnOff : 0,
                                                       (const float*) wikn->data, EPS, ib, s, sx.max_cells,
                                                       rope_scaling(), ns, row_rope ? pos_thw + t * 3 : nullptr);
                         }
@@ -2317,8 +2320,13 @@ void Verifier::refresh_ar() {
     }
 }
 
+int Verifier::lv() const { return ss_ != nullptr && ss_->rope_level ? 1 : 0; }
+int Verifier::row_level(int slot) const {
+    return slot >= 0 && (size_t) slot < slots_.size() && slots_[(size_t) slot] != nullptr && slots_[(size_t) slot]->rope_level ? 1 : 0;
+}
+
 bool Verifier::capture(int T, std::string& err) {
-    cudaGraphExec_t& exec_t = ar_off_ ? exec_nr_[T] : exec_[T];
+    cudaGraphExec_t& exec_t = ar_off_ ? exec_nr_[lv()][T] : exec_[lv()][T];
     if (exec_t != nullptr) return true;
     {   // said before the capture: a process that exits inside it (#1275: Windows, 313 MiB free) leaves this line as the trace
         size_t free_b = 0, total_b = 0;
@@ -2453,7 +2461,7 @@ bool Verifier::capture(int T, std::string& err) {
 }
 
 bool Verifier::capture_commit(std::string& err) {
-    if (commit_exec_ != nullptr) return true;
+    if (commit_exec_[lv()] != nullptr) return true;
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
@@ -2521,7 +2529,7 @@ bool Verifier::capture_commit(std::string& err) {
             }
             if (ok && fits && nq > 0) {
                 native_qsa_indexer_append_steps_layers(idx_raw_L_ + (size_t) qsa_index * MT * ID, MT * ID, commit_ + 2, 1,
-                                                       (int) MT, 0, EPS, il, nq, s, mc, rope_scaling(), cs_);
+                                                       (int) MT, ss.rope_level ? strata::kernels::kRopeYarnOff : 0, EPS, il, nq, s, mc, rope_scaling(), cs_);
                 qsa_batched = true;
             }
         }
@@ -2550,11 +2558,13 @@ bool Verifier::capture_commit(std::string& err) {
                 copy_from_mapped(st.idx_tail, tail_snap_ + (size_t) qsa_index * TS, TS, cs_);
                 const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                 if (!g_no_batch_kv) {
-                    native_qsa_indexer_append_steps(idx_raw_L_ + (size_t) qsa_index * MT * ID, commit_ + 2, 1, (int) MT, 0,
+                    native_qsa_indexer_append_steps(idx_raw_L_ + (size_t) qsa_index * MT * ID, commit_ + 2, 1, (int) MT,
+                                                    ss.rope_level ? strata::kernels::kRopeYarnOff : 0,
                                                     (const float*) wikn->data, EPS, ib, s, st.max_cells, rope_scaling(), cs_);
                 } else {
                     for (int64_t t = 0; t < MT; ++t)
-                        native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commit_ + 2 + t, 0,
+                        native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commit_ + 2 + t,
+                                                  ss.rope_level ? strata::kernels::kRopeYarnOff : 0,
                                                   (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                                   rope_scaling(), cs_);
                 }
@@ -2572,7 +2582,7 @@ bool Verifier::capture_commit(std::string& err) {
         if (graph) cudaGraphDestroy(graph);
         return false;
     }
-    if (ce != cudaSuccess || cudaGraphInstantiate(&commit_exec_, graph, 0) != cudaSuccess) {
+    if (ce != cudaSuccess || cudaGraphInstantiate(&commit_exec_[lv()], graph, 0) != cudaSuccess) {
         if (graph) cudaGraphDestroy(graph);
         err = std::string("verify: commit capture: ") + cudaGetErrorString(ce);
         return false;
@@ -2590,7 +2600,8 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     for (int t = 0; t < T; ++t) {
         h_tok_[t] = tokens[t];
         qsa_step_fill(h_step_ + t * kStepCount, pos0 + t, s);
-        const int32_t pos_t = (int32_t) (pos0 + t);
+        // the rotary position (STRATA_YARN_ELASTIC: a YaRN conversation's offset by kRopeYarnOff); the step keeps the cell
+        const int32_t pos_t = (int32_t) (pos0 + t) + (ss_->rope_level ? strata::kernels::kRopeYarnOff : 0);
         for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = pos_t;
         for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = pos_t;
         for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = pos_t;
@@ -2694,7 +2705,7 @@ bool Verifier::chain_overlap() const {
 bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
     const OnDevice on_device(device_);
     prelaunched_ = 0;
-    cudaGraphExec_t exec_t = ar_off_ ? exec_nr_[T] : exec_[T];   // #871: the variant the previous stage refreshed
+    cudaGraphExec_t exec_t = ar_off_ ? exec_nr_[lv()][T] : exec_[lv()][T];   // #871: the variant the previous stage refreshed
     if (T < 1 || T > max_t_ || exec_t == nullptr) { err = "verify: prelaunch before the window was captured"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     if (pos0 + T > ss_->qsa_states[ss_->qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
@@ -2765,7 +2776,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
 #endif
     const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;   // #267 test hook (off: false)
     bool flag_raised = false;   // the PLE flag went up before the launch (early_ple_flag_mode)
-    bool& graph_launched = ar_off_ ? launched_nr_[T] : launched_[T];
+    bool& graph_launched = ar_off_ ? launched_nr_[lv()][T] : launched_[lv()][T];
     if (!pre && ar_on() && !test_stall && (early_ple_flag_mode() == 1 || (early_ple_flag_mode() == 2 && !graph_launched))) {
         if (do_ple) {
             const Clock::time_point tp = Clock::now();
@@ -2794,11 +2805,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             const char* value = std::getenv("STRATA_VERIFY_ASYNC_LAUNCH");
             return value != nullptr && value[0] == '1';
         }();
-        launch_o.emplace(ar_off_ ? exec_nr_[T] : exec_[T], cs_, device_, threaded_launch,
+        launch_o.emplace(ar_off_ ? exec_nr_[lv()][T] : exec_[lv()][T], cs_, device_, threaded_launch,
                          [this] { (void) release_gpu_waits(5000); });
         const cudaError_t le = launch_o->status();
 #else
-        const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
+        const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[lv()][T] : exec_[lv()][T], cs_);
 #endif
         trace_ev("LAUNCHED", -1, -1, (int64_t) le);
         graph_launched = true;
@@ -3296,7 +3307,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
                              (long long) ct.n);
         }
         if (ct.on) cudaEventRecord(ct.b, cs_);
-        const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
+        const cudaError_t le = cudaGraphLaunch(commit_exec_[lv()], cs_);
         if (ct.on) { cudaEventRecord(ct.e, cs_); ct.pending = true; }
         if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
         // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
@@ -3505,7 +3516,8 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                     for (int u = first; u < t; ++u)
                         native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + u) * ID,
                                                   commitb_ + (size_t) rows[first] * CB + 2 + (u - first),
-                                                  0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                  slots_[(size_t) rows[first]]->rope_level ? strata::kernels::kRopeYarnOff : 0,
+                                                  (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                                   rope_scaling(), cs_,
                                                   CB > 2 + MT ? commitb_ + (size_t) rows[first] * CB + 2 + MT + 3 * (u - first)
                                                               : nullptr);
@@ -3678,6 +3690,10 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
             int32_t* o = pthw + t * 3;
             o[0] = o[1] = o[2] = (int32_t) b0;
             if (rr[t]) rr[t]->at(b0, o);
+        }
+        if (slots_[(size_t) rows[t]]->rope_level) {   // STRATA_YARN_ELASTIC: this row's conversation is at YaRN
+            rp += strata::kernels::kRopeYarnOff;
+            if (row_rope) for (int c3 = 0; c3 < 3; ++c3) pthw[t * 3 + c3] += strata::kernels::kRopeYarnOff;
         }
         for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = rp;
         int32_t* pk = h_pos_ + (size_t) max_t_ * g.n_head;
@@ -4451,7 +4467,7 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
-    if (exec_[T] == nullptr || commit_exec_ == nullptr || ev_done_ == nullptr || pl_ple_rows_.empty()) {
+    if (exec_[lv()][T] == nullptr || commit_exec_[lv()] == nullptr || ev_done_ == nullptr || pl_ple_rows_.empty()) {
         err = "verify: pipelined window not prepared (capture_all)";
         return false;
     }
@@ -4473,7 +4489,7 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     std::atomic_thread_fence(std::memory_order_seq_cst);
     trace_ev("WINDOW (pipelined)", -1, -1, pos0 * 16 + T);
     ms_host += ms_since(t0);
-    const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
+    const cudaError_t le = cudaGraphLaunch(exec_[lv()][T], cs_);
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     if (fl_prof_) cudaMemcpyAsync(prof_pin_, prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost, cs_);
@@ -4643,7 +4659,7 @@ bool Verifier::pl_finish(int32_t* out, std::string& err) {
 bool Verifier::pl_commit_async(int n_keep, std::string& err) {
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
-    if (commit_exec_ == nullptr || ev_commit_ == nullptr) { err = "verify: pipelined commit not prepared"; return false; }
+    if (commit_exec_[lv()] == nullptr || ev_commit_ == nullptr) { err = "verify: pipelined commit not prepared"; return false; }
     const Clock::time_point t0 = Clock::now();
     if (commit_live_) {   // its graph reads the words below when it starts: the previous one has (a window ago)
         cudaError_t q;
@@ -4654,7 +4670,7 @@ bool Verifier::pl_commit_async(int n_keep, std::string& err) {
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
+    const cudaError_t le = cudaGraphLaunch(commit_exec_[lv()], cs_);
     if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
     if (cudaEventRecord(ev_commit_, cs_) != cudaSuccess) { err = "verify: event record failed"; return false; }
     (void) cudaStreamQuery(cs_);

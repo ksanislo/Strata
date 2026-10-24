@@ -62,6 +62,9 @@ struct SessionState {
     int qsa_primary() const { return (int) qsa_ord0; }
     /// An elastic --batch slot session (session_init's `slot` 2): the cells its states are backed for; -1: not one.
     int64_t slot_cells = -1;
+    /// STRATA_YARN_ELASTIC per conversation: the RoPE level its K/V holds (0 plain, 1 YaRN: its rotary positions are
+    /// passed offset by kRopeYarnOff).  Checkpoints carry it; a fresh conversation starts at 0.
+    int rope_level = 0;
     /// STRATA_KV_HOST_ELASTIC: a state outside the session whose host copy grows and shrinks with it (the slot's drafter)
     const QsaState* host_follow = nullptr;
     /// The doorbell the host loop polls.  Null until a caller provides one - the engine runs without it, and

@@ -66,13 +66,17 @@ void slot_rope_at(int slot, int64_t cell, int32_t out[3]);
 /// device.  With it the rope kernels rotate by the table's exact angles; without it they compute pos * powf(...) with cosf/sinf, which under
 /// --use_fast_math is 0.0014 rad off at 32K and ~0.02 at 262K, and the prompt path (precise libm) and decode
 /// (fast-math) disagree with each other.
+/// STRATA_YARN_ELASTIC per conversation: a conversation at the YaRN level passes its rotary positions offset by this
+/// (past any real position); rows below it rotate as they always did, rows at or past it read the YaRN table.
+constexpr int kRopeYarnOff = 1 << 21;
 struct RopeTab {
     const float* cos = nullptr;   ///< null: no table, the kernels compute the angle as they always did
     const float* sin = nullptr;
     int max_pos = 0;
+    int min_pos = 0;              ///< positions below it compute their angle; row p of the table is position min_pos + p
 };
 /// Registers the table the session just built with `scaling` (the latest one of the device wins).
-void rope_table_set(const float* cos_tab, const float* sin_tab, int max_pos, const RopeScaling& scaling);
+void rope_table_set(const float* cos_tab, const float* sin_tab, int max_pos, const RopeScaling& scaling, int min_pos = 0);
 /// Forgets the table `cos_tab` (on every device) - before the memory that holds it is freed (session_release).
 void rope_table_release(const float* cos_tab);
 /// The registered table when STRATA_ROPE_TABLE=1 and it was built with `scaling`; otherwise none (the default: the
@@ -83,14 +87,15 @@ RopeTab rope_table_for(const RopeScaling& scaling);
 /// ggml rope_multi, is_imrope, sections {11, 11, 10, 0}: sector = pair % 32; sector % 3 == 1 -> h (sector < 33),
 /// == 2 -> w (sector < 30), == 0 -> t (sector < 33).  For pairs 0..31 all three bounds hold, so it is pair % 3.
 __device__ __forceinline__ int mrope_pos(const int32_t* tab, int pos, int pair) {
+    if (pos >= kRopeYarnOff) return tab ? kRopeYarnOff + __ldg(tab + (size_t) (pos - kRopeYarnOff) * 3 + pair % 3) : pos;
     return tab ? __ldg(tab + (size_t) pos * 3 + pair % 3) : pos;
 }
 /// cos and sin of rotary position p, pair `pair` (0..31) from the table (scaling and magnitude included); false
 /// when there is no table or p lies past it - then the caller computes the angle as it always did
 __device__ __forceinline__ bool rope_tab_cs(const RopeTab& t, int p, int pair, float& c, float& s) {
-    if (t.cos == nullptr || p < 0 || p >= t.max_pos) return false;
-    c = __ldg(t.cos + (size_t) p * 32 + pair);
-    s = __ldg(t.sin + (size_t) p * 32 + pair);
+    if (t.cos == nullptr || p < t.min_pos || p >= t.max_pos) return false;
+    c = __ldg(t.cos + (size_t) (p - t.min_pos) * 32 + pair);
+    s = __ldg(t.sin + (size_t) (p - t.min_pos) * 32 + pair);
     return true;
 }
 #endif

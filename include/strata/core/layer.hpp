@@ -42,7 +42,10 @@
 
 #include <cstdio>
 #include <functional>
+#include <utility>
 #include <vector>
+
+#include "strata/kernels/rope_scaling.hpp"
 
 #include "strata/core/vmm.hpp"
 #include <cstdlib>
@@ -331,6 +334,27 @@ bool qsa_host_pin_failed();
 /// STRATA_KV_HOST_ELASTIC: an elastic state's host copy pinned for its first `cells` cells (whole steps of
 /// STRATA_KV_HOST_STEP cells); false: RAM or the driver refused (nothing of the failed step stays pinned).
 bool qsa_host_grow(const QsaState& st, int64_t cells);
+/// STRATA_ROPE_GROW: the RoPE table `st` reads (its own or the one it shares) backed for `cells` positions, from its
+/// card's slot budget; true when it already is or is not grown.  `need`: the budget chunks that takes.
+bool qsa_rope_grow(const QsaState& st, int64_t cells);
+int64_t qsa_rope_need(const QsaState& st, int64_t cells);
+/// Frees a grown RoPE table (session_release, with the table's owner).
+void qsa_rope_release(const float* cos_tab);
+/// STRATA_YARN_ELASTIC per conversation (set before any session): every session owner gets a YaRN-level table (the
+/// kernels read it for rotary positions >= kRopeYarnOff), backed by qsa_rope_yarn_fit as YaRN conversations need it.
+void qsa_set_rope_yarn(const strata::kernels::RopeScaling* yarn);
+bool qsa_rope_yarn_fit(const QsaState& st, int64_t cells);
+int64_t qsa_rope_yarn_need(const QsaState& st, int64_t cells);
+/// No YaRN conversation is live: every YaRN table's chunks back to its card's slot budget (or freed).  Returns them.
+int64_t qsa_rope_yarn_trim();
+/// One conversation's stored keys from plain RoPE (as the kernels computed it) to the YaRN level, its first `cells`
+/// cells per state: host copies, VRAM pools or rings, the indexer's pooled keys and spare (a streamed ring refills).
+/// The states must be quiet; `stream` runs the work (synchronized before it returns).  `thw` (host, [cell][3]): a
+/// picture conversation's M-RoPE positions for every cell moved (null: each cell at its index).
+bool qsa_rope_move(const strata::kernels::QsaShapes& s, const std::vector<std::pair<const QsaState*, int64_t>>& states,
+                   void* stream, const int32_t* thw = nullptr);
+/// What a checkpoint's spare (its `dead` rotary values, angle 0) is multiplied by at the move: cos(0) at YaRN.
+float qsa_rope_yarn_spare_scale();
 /// ... unpinned (and its pages given back) past the steps `cells` cells need, keeping the first step; the state's
 /// device is synchronized first.  Returns the bytes given back.
 uint64_t qsa_host_trim(const QsaState& st, int64_t cells);

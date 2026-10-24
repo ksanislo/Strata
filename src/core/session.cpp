@@ -172,6 +172,8 @@ bool session_slot_fit(SessionState& s, int64_t cells, bool trim) {
         if (s.host_follow != nullptr) qsa_host_trim(*s.host_follow, cells);
         s.slot_cells = std::min(s.slot_cells, cells);
     }
+    if (!sts.empty() && !qsa_rope_grow(*sts[0], cells)) return false;   // (the stage's table, shared)
+    if (!sts.empty() && s.rope_level && !qsa_rope_yarn_fit(*sts[0], cells)) return false;   // its YaRN rows too
     if (!qsa_slots_grow(sts, cells)) return false;
     for (const QsaState* st : sts)   // the cells past the VRAM ring live in the host copy only
         if (!qsa_host_grow(*st, cells)) return false;
@@ -202,11 +204,17 @@ std::vector<const QsaState*> session_states(const SessionState& s) {
 }  // namespace
 
 bool session_vram_fit(SessionState& s, int64_t cells) {
-    return qsa_slots_grow(session_states(s), std::min<int64_t>(std::max<int64_t>(cells, 1), s.max_cells));
+    const std::vector<const QsaState*> sts = session_states(s);
+    cells = std::min<int64_t>(std::max<int64_t>(cells, 1), s.max_cells);
+    return (sts.empty() || (qsa_rope_grow(*sts[0], cells) && (!s.rope_level || qsa_rope_yarn_fit(*sts[0], cells)))) &&
+           qsa_slots_grow(sts, cells);
 }
 
 int64_t session_vram_need(const SessionState& s, int64_t cells) {
-    return qsa_slots_need(session_states(s), std::min<int64_t>(std::max<int64_t>(cells, 1), s.max_cells));
+    const std::vector<const QsaState*> sts = session_states(s);
+    cells = std::min<int64_t>(std::max<int64_t>(cells, 1), s.max_cells);
+    return (sts.empty() ? 0 : qsa_rope_need(*sts[0], cells) + (s.rope_level ? qsa_rope_yarn_need(*sts[0], cells) : 0)) +
+           qsa_slots_need(sts, cells);
 }
 
 
@@ -220,7 +228,9 @@ int64_t session_slot_need(const SessionState& s, int64_t cells) {
     if (s.slot_cells < 0) return 0;
     std::vector<const QsaState*> sts;
     for (int64_t j = 0; j < s.qsa_alloc; ++j) sts.push_back(&s.qsa_states[s.qsa_ord0 + j]);
-    return qsa_slots_need(sts, std::min<int64_t>(std::max<int64_t>(cells, 1), s.max_cells));
+    cells = std::min<int64_t>(std::max<int64_t>(cells, 1), s.max_cells);
+    return (sts.empty() ? 0 : qsa_rope_need(*sts[0], cells) + (s.rope_level ? qsa_rope_yarn_need(*sts[0], cells) : 0)) +
+           qsa_slots_need(sts, cells);
 }
 
 uint64_t session_slot_backed(const SessionState& s) {
@@ -239,6 +249,7 @@ void session_release(SessionState& s) {
     for (int64_t j = 0; s.qsa_states != nullptr && j < s.qsa_alloc; ++j)
         if (s.qsa_states[j].owns_rope) {
             strata::kernels::rope_table_release(s.qsa_states[j].cos_tab);
+            qsa_rope_release(s.qsa_states[j].cos_tab);
             s.qsa_states[j].owns_rope = false;
         }
 }
@@ -252,6 +263,7 @@ namespace strata::core {
 #endif
 
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream) {
+    s.rope_level = 0;   // a fresh conversation starts plain (STRATA_YARN_ELASTIC)
 #if defined(STRATA_GPU_METAL)
     // the running state lives in the Metal decode window; the session's own device buffers are not read there
     (void) g; (void) R_init; (void) stream;
