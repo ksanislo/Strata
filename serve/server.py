@@ -424,12 +424,30 @@ class EngineOutOfVram(EngineNonFinite):
     non-finite end (sent once more when nothing was produced yet, a 503 otherwise)."""
 
 
+class EngineOutOfRam(EngineOutOfVram):
+    """A DONE / BDONE that said `ram`, or an ERR / BRE that says "no RAM is left": the conversation's context could not be
+    pinned in RAM (KV streaming's host copy) after the engine parked its idle conversations.  Handled as no VRAM: sent
+    once more when nothing was produced yet, a 503 otherwise.  The engine goes on, and the conversation keeps what it
+    had (a shorter next turn, or fewer long conversations at once, fits)."""
+
+
+RAM_SHORT = ("no RAM is left to pin the context of this conversation (the engine goes on; it parked every idle "
+             "conversation first): fewer long conversations at once, or a shorter one")
+
+
+def engine_refusal(message: str) -> ValueError:
+    """The engine's ERR / BRE text as the exception the request ends with: no RAM is the server's (503), not the request's."""
+    return EngineOutOfRam(f"{RAM_SHORT} - {message}") if message.startswith("no RAM is left") else ValueError(message)
+
+
 def raise_bad_finish(finish) -> None:
-    """The request's end the engine reported as a failure of its own: #879's non-finite logits, or no VRAM."""
+    """The request's end the engine reported as a failure of its own: #879's non-finite logits, no VRAM, or no RAM."""
     if finish == "nonfinite":
         raise EngineNonFinite("the engine's logits became non-finite (#879)")
     if finish == "vram":
         raise EngineOutOfVram("the GPU had no free memory for this request (the engine goes on); try it again")
+    if finish == "ram":
+        raise EngineOutOfRam(RAM_SHORT)
 
 
 class SessionRefused(ValueError):
@@ -1694,7 +1712,7 @@ class StrataEngine:
                 self._last_done = line
             elif line.startswith("BADM "):
                 f = line.split()
-                self._ctl_result = ("badm", len(f) >= 3 and f[2] == "1")
+                self._ctl_result = ("badm", len(f) >= 3 and f[2] == "1", f[3] if len(f) >= 4 else None)
                 return
             elif line.startswith("BQ "):                 # STRATA_SLOT_ADMIT: 1 = read beside the slots, on its own lines
                 if line.split()[2:3] == ["1"]:
@@ -1706,7 +1724,7 @@ class StrataEngine:
                     self._yielded = (int(f[1]), int(f[2]))
             elif line.startswith("ERR"):
                 self._ctl_erred = True                   # #1059: the engine refused it and is idle: no DONE follows
-                raise ValueError(line[4:].strip())
+                raise engine_refusal(line[4:].strip())
             if line.startswith("DONE") and self._ctl_mode == "solo":
                 self._ctl_result = ("done", None)
                 return
@@ -1970,6 +1988,7 @@ class StrataEngine:
         phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
         stop_sent = False
         yields, solo_again, refused = 0, 0, 0
+        to_solo = False     # an admission the slot had no RAM for goes on in the solo session
         admit_wait, admit_since, admit_said = False, 0.0, False   # #1603: waiting for a slot, since when, said
         try:
             while True:   # a request in a slot that is left alone goes back to the solo path
@@ -2194,9 +2213,32 @@ class StrataEngine:
                         yield t
                     if not cont:
                         raise_bad_finish(self._done_finish())   # #879 / no VRAM
+                    if not cont and self._ctl_result and self._ctl_result[2:3] == ("ram",):
+                        # no RAM for the slot to hold it, but the solo session does: on there when nothing else
+                        # decodes (it reads nothing again), else the request ends with the 503 that says why
+                        with self.slot_cv:
+                            alone = not any(v for b, v in enumerate(self.slot_busy) if b != slot) and self.waiting == 0
+                        if not alone or cancel.is_set() or int(max_new) - len(out) <= 1:
+                            raise_bad_finish("ram")
+                        print(f"[strata] slot {slot} has no RAM for this conversation: it goes on in the solo session",
+                              flush=True)
+                        carry_leg(carry, self.last)
+                        self.slot_live[slot] = None
+                        with self.slot_cv:
+                            self.slot_busy[slot] = False
+                            self.slot_claims.discard(slot)
+                            self.slot_cv.notify_all()
+                        slot, gen0 = None, None
+                        prompt, left = list(ids) + out, int(max_new) - len(out)
+                        solo_again += 1
+                        to_solo = True
+                        break
                     if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
                         continue                            # gave way: again once the shorter request is in
                     break
+                if to_solo:
+                    to_solo = False
+                    continue
                 if holding:
                     self.ctl.release()
                     holding = False
@@ -2246,6 +2288,8 @@ class StrataEngine:
                         if f[3:4] in (["nonfinite"], ["vram"]):  # #879 / no VRAM: the engine dropped the slot's state
                             self.slot_held[slot] = []
                             raise_bad_finish(f[3])
+                        if f[3:4] == ["ram"]:                    # no RAM: the slot keeps what it holds
+                            raise_bad_finish("ram")
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
                                 and not (out and out[-1] in EOS_IDS)):
                             # the solo path continues it: the engine copies the slot's sessions back (all but the
@@ -2368,7 +2412,7 @@ class StrataEngine:
                                     "decode_ms": 0.0, "finish": "length", "reused": reused,
                                     "prompt_read": max(0, n - reused)}}
             elif line.startswith("BRE "):
-                raise ValueError(" ".join(f[2:]) or "the engine refused the admission")
+                raise engine_refusal(" ".join(f[2:]) or "the engine refused the admission")
 
     slot_groups = 1         # --batch-groups (set when the engine starts)
     SLOT_PREFIX_MIN = 512   # a held prefix shorter than this is not worth unbalancing the pipeline's groups
@@ -2546,7 +2590,7 @@ class StrataEngine:
                     return
                 elif line.startswith("ERR"):
                     done = True
-                    raise ValueError(line[4:].strip())
+                    raise engine_refusal(line[4:].strip())
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
                 if self.can_stop:
