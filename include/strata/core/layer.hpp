@@ -331,6 +331,12 @@ bool qsa_host_pin_failed();
 /// STRATA_KV_HOST_ELASTIC: an elastic state's host copy pinned for its first `cells` cells (whole steps of
 /// STRATA_KV_HOST_STEP cells); false: RAM or the driver refused (nothing of the failed step stays pinned).
 bool qsa_host_grow(const QsaState& st, int64_t cells);
+/// STRATA_ROPE_GROW: the RoPE table `st` reads (its own or the one it shares) backed for `cells` positions, from its
+/// card's slot budget; true when it already is or is not grown.  `need`: the budget chunks that takes.
+bool qsa_rope_grow(const QsaState& st, int64_t cells);
+int64_t qsa_rope_need(const QsaState& st, int64_t cells);
+/// Frees a grown RoPE table (session_release, with the table's owner).
+void qsa_rope_release(const float* cos_tab);
 /// ... unpinned (and its pages given back) past the steps `cells` cells need, keeping the first step; the state's
 /// device is synchronized first.  Returns the bytes given back.
 uint64_t qsa_host_trim(const QsaState& st, int64_t cells);
