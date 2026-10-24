@@ -8946,8 +8946,8 @@ int main(int argc, char** argv) {
             return strata::program::split_lend_slots(xc.slots(), xc.bytes(), xc.slot_offsets(),
                                                      (uint64_t) strata::kernels::cpu::expert_layout().max_blob, need);
         };
-        auto part_slots = [&](const PfPart& p, int64_t c) -> int64_t {
-            return cache_slots_for(*p.cache, strata::prefill::Prefill::bytes_needed(g, *p.ses, c, srcp != nullptr));
+        auto part_slots = [&](const PfPart& p, int64_t c, int64_t stage_cells = 0) -> int64_t {
+            return cache_slots_for(*p.cache, strata::prefill::Prefill::bytes_needed(g, *p.ses, c, srcp != nullptr, stage_cells));
         };
         auto part_bytes = [&](const PfPart& p, int32_t first) -> uint64_t {
             strata::core::ExpertCache& xc = *p.cache;
@@ -14193,7 +14193,15 @@ int main(int argc, char** argv) {
             return o.prefill_head_alias ? o.prefill_chunk
                  : split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small) : want_full;
         };
-        auto lend = [&](int64_t tokens, std::string& e, int64_t exact) -> bool {
+        // a participant's K/V staging covers reads reaching `reach` cells (0: the whole context; nothing staged: always)
+        auto stage_covers = [&](const PfPart& p, int64_t reach) {
+            const int64_t have = p.sp->stage_cells();
+            if (have <= 0) return true;
+            const int64_t need = strata::prefill::Prefill::stage_cells_for(*p.ses, reach);
+            return have >= (need > 0 ? need : p.ses->qsa_states[p.ses->qsa_primary()].max_cells);
+        };
+        // `reach`: the furthest cell the reads on this loan go to (0: any - the K/V staging covers the whole context)
+        auto lend = [&](int64_t tokens, std::string& e, int64_t exact, int64_t reach = 0) -> bool {
             seg_lend = 0;
             if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
             const auto t_ln = Clock::now();
@@ -14213,8 +14221,9 @@ int main(int argc, char** argv) {
             bool any = false;
             for (PfPart& p : pf_parts) {
                 if (p.first < 0) continue;
+                const int64_t cells = o.prefill_head_alias ? 0 : strata::prefill::Prefill::stage_cells_for(*p.ses, reach);
                 if (!p.lent.empty()) {
-                    if (want <= p.lent_chunk) continue;            // its current loan already covers this
+                    if (want <= p.lent_chunk && stage_covers(p, reach)) continue;   // its current loan already covers this
                     // ONLY this participant's loan goes back: `refill` would return the other participants'
                     // loans too, and their buffers are still laid out in their caches - marking those slots
                     // resident again would hand the next window a prompt buffer in place of an expert
@@ -14230,12 +14239,12 @@ int main(int argc, char** argv) {
                     // a request's smaller chunk can need MORE slots than the auto chunk's region (p.first) holds.  The
                     // loan starts where the chunk itself needs it (the 128-slot floor aside); a chunk that cannot be
                     // lent even then is halved until it can, instead of ending the engine.
-                    int64_t need_p = part_slots(p, want_p);
+                    int64_t need_p = part_slots(p, want_p, cells);
                     // STRATA_ELASTIC_SLOTS_GIVE: a loan stays above the slots the cache may give the batch slots
                     const int64_t room_p = give_on ? p.cache->slots() - give_top(p.cache) : p.cache->slots();
                     while ((need_p <= 0 || need_p + 128 > p.cache->slots() || (give_on && need_p > room_p)) && want_p > 256) {
                         want_p = std::max<int64_t>(256, want_p / 2 / 256 * 256);
-                        need_p = part_slots(p, want_p);
+                        need_p = part_slots(p, want_p, cells);
                     }
                     if (need_p <= 0 || need_p + 128 > p.cache->slots() || (give_on && need_p > room_p)) {
                         e = "prefill: no chunk of this request fits the slots that can be lent (#2090)";
@@ -14251,8 +14260,13 @@ int main(int argc, char** argv) {
                                      (long long) need_p, (long long) (p.cache->slots() - p.first));
                     first = (int32_t) (p.cache->slots() - need_p);
                 }
-                if (want_p != p.sp->chunk() || first != p.first_now) {
-                    if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
+                if (want_p != p.sp->chunk() || first != p.first_now || (!o.prefill_head_alias && !stage_covers(p, reach))) {
+                    const int64_t had = p.sp->stage_cells();
+                    if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e, cells)) return false;
+                    if (p.sp->stage_cells() != had && p.sp->stage_cells() > 0)
+                        std::fprintf(stderr, "strata serve: CUDA%d: the prompt path's K/V staging holds %lld cells (a loan of "
+                                     "%lld slots, chunk %lld)\n", p.dev < 0 ? 0 : p.dev, (long long) p.sp->stage_cells(),
+                                     (long long) (p.cache->slots() - first), (long long) want_p);
                     p.first_now = first;
                 }
                 for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
@@ -14500,10 +14514,16 @@ int main(int argc, char** argv) {
         };
         bool share_block = false;   // a run of queued reads (STRATA_SLOT_ADMIT_MULTI) is under way
         auto read_share_now = [&] { return rt_share && !share_block && !batch_on() && !pipe_inflight(); };
-        auto adm_lend_covers = [&](int64_t tokens) {
+        auto adm_lend_covers = [&](int64_t tokens, int64_t reach = 0) {
             const int64_t want = lend_want(tokens);
             for (const PfPart& p : pf_parts)
-                if (p.first >= 0 && (p.lent.empty() || want > p.lent_chunk)) return false;
+                if (p.first >= 0 && (p.lent.empty() || want > p.lent_chunk || (!o.prefill_head_alias && !stage_covers(p, reach))))
+                    return false;
+            return true;
+        };
+        auto lent_reaches = [&](int64_t reach) {
+            for (const PfPart& p : pf_parts)
+                if (p.first >= 0 && !o.prefill_head_alias && !stage_covers(p, reach)) return false;
             return true;
         };
         auto stage_prefill = [&](size_t k) -> strata::prefill::Prefill& { return k == 0 ? sp : stages[k - 1]->sp; };
@@ -14727,11 +14747,11 @@ int main(int argc, char** argv) {
             }
             const int64_t read_n = adm_loan(n - 1 - j.at);
             std::string e;
-            if (read_n > 0 && !adm_lend_covers(read_n)) {   // the loan changes only with no window in flight
+            if (read_n > 0 && !adm_lend_covers(read_n, n)) {   // the loan changes only with no window in flight
                 const auto tf = Clock::now();
                 if (!pipe_drain()) return AdmEnd::fatal;
                 if (!adapt_tick(true)) { std::printf("ERR an adaptive refill failed\n"); return AdmEnd::fatal; }
-                if (!lend(read_n, e, 0)) {
+                if (!lend(read_n, e, 0, n)) {
                     std::printf("ERR lending the prompt path its slots failed: %s\n", e.c_str());
                     return AdmEnd::fatal;
                 }
@@ -15271,14 +15291,19 @@ int main(int argc, char** argv) {
             const int64_t piece = std::max<int64_t>(1, adm_loan(o.prefill_chunk));
             // STRATA_BATCH_READS_CHUNK=N: a loan of N tokens' chunk for the shared chunks (a read's piece stays `piece`)
             const int64_t br_lend = br_max > 0 && br_chunk > piece ? std::min(br_chunk, o.prefill_chunk) : 0;
-            if (!pf_parts.empty() && !adm_lend_covers(br_lend > 0 ? br_lend : piece)) {
+            // the K/V staging reaches as far as the held reads go (STRATA_READ_YIELD: a read set up later that goes
+            // further yields the run, and the next one lends for it); without held reads to go on, the whole context
+            int64_t run_reach = cy_on ? 1 : 0;
+            for (const auto& j : cy_held) if (run_reach > 0) run_reach = std::max(run_reach, j->n);
+            if (!pf_parts.empty() && !adm_lend_covers(br_lend > 0 ? br_lend : piece, run_reach)) {
                 const auto tf = Clock::now();
                 std::string e;
                 if (!pipe_drain()) return false;
                 if (!adapt_tick(true)) { std::printf("ERR an adaptive refill failed\n"); return false; }
                 // (STRATA_READ_YIELD: the whole chunk's loan, so a request served while reads are held needs no other;
                 // STRATA_SLOT_ADMIT_CHUNK caps it: the slots decoding beside the read keep the rest of the cache)
-                if (!lend(br_lend > 0 ? br_lend : piece, e, br_lend > 0 ? br_lend : cy_on && adm_chunk_cap == 0 ? o.prefill_chunk : 0)) { std::printf("ERR lending the prompt path its slots failed: %s\n", e.c_str()); return false; }
+                if (!lend(br_lend > 0 ? br_lend : piece, e, br_lend > 0 ? br_lend : cy_on && adm_chunk_cap == 0 ? o.prefill_chunk : 0,
+                          run_reach)) { std::printf("ERR lending the prompt path its slots failed: %s\n", e.c_str()); return false; }
                 adm_fence_ms += std::chrono::duration<double, std::milli>(Clock::now() - tf).count();
                 if (cy_on && cy_held_n > 0)
                     std::fprintf(stderr, "strata batch: STRATA_READ_YIELD: the loan was lent again under held reads\n");
@@ -15554,7 +15579,8 @@ int main(int argc, char** argv) {
                     AdmJob* starved = nullptr;
                     for (auto& jj : live) {
                         AdmJob& j = *jj;
-                        if (!j.queued || cy_done(j) || std::find(fed.begin(), fed.end(), j.r.slot) != fed.end()) continue;
+                        if (!j.queued || cy_done(j) || !lent_reaches(j.n) || std::find(fed.begin(), fed.end(), j.r.slot) != fed.end())
+                            continue;
                         if (sp.jobs_queued_for(bslot_ss[0][(size_t) j.r.slot].get()) > 0) { ++waiting; continue; }
                         if (cy_starve_s > 0.0 && std::chrono::duration<double>(now - j.t_fed).count() >= cy_starve_s &&
                             (starved == nullptr || j.t_fed < starved->t_fed))
@@ -15585,7 +15611,7 @@ int main(int argc, char** argv) {
                     AdmJob* starved = nullptr;
                     for (auto& jj : live) {
                         AdmJob& j = *jj;
-                        if (!j.queued || cy_done(j)) continue;
+                        if (!j.queued || cy_done(j) || !lent_reaches(j.n)) continue;   // (past the staging: the run yields)
                         if (cy_starve_s > 0.0 && std::chrono::duration<double>(now - j.t_fed).count() >= cy_starve_s &&
                             (starved == nullptr || j.t_fed < starved->t_fed))
                             starved = &j;
@@ -15626,7 +15652,15 @@ int main(int argc, char** argv) {
                     if (!fl_take(l) && !take(l)) return false;
                 // yield at the next piece boundary: nothing more fed, the pieces stage 0 has not started taken back
                 // (they never ran), the ones in flight finish; a run that went on from held reads feeds one piece first
-                if (other && !yielding && !live.empty() && (resumed == 0 || cy_fed > 0)) {
+                // a read set up past the loan's K/V staging: held with the others, the next run lends for it
+                bool far = false;
+                for (const auto& j : live)
+                    far = far || (cy_on && j->set_up.load(std::memory_order_acquire) && j->setup_ok && !cy_done(*j) &&
+                                  !lent_reaches(j->n));
+                if (far && !yielding)
+                    std::fprintf(stderr, "strata batch: a read reaches past the loan's K/V staging: the reads stop at their "
+                                         "next piece boundary and the loan is lent again for it\n");
+                if (((other && (resumed == 0 || cy_fed > 0)) || far) && !yielding && !live.empty()) {
                     yielding = true;
                     const auto back = sp.withdraw([](const strata::prefill::PromptJob&) { return true; });
                     for (const auto& pj : back)
@@ -18540,7 +18574,7 @@ int main(int argc, char** argv) {
                 // another, and the loan decides which experts are read in place: bits)
                 const int64_t plan_lend = resume_plan.chunk > 0 && at == resume_plan_at && to == resume_plan_end
                                               ? resume_plan.lend : 0;
-                if (!win && !lend(to - at, err, plan_lend)) {
+                if (!win && !lend(to - at, err, plan_lend, to)) {
                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
                     return 1;
                 }
