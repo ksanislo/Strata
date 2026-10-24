@@ -14790,7 +14790,8 @@ int main(int argc, char** argv) {
             j.at = j.resume;
             if (yarn_rows) {   // the level it reads on at (a move runs at the set-up, with the slot's state restored)
                 const int from = j.resume == 0 ? 0 : j.ck != nullptr ? j.ck->rope_level : bslot_ss[0][(size_t) b]->rope_level;
-                const bool want = n + j.r.max_new > yarn_thr;
+                // (a picture conversation is not moved: its cells sit at other positions than their index)
+                const bool want = n + j.r.max_new > yarn_thr && (j.resume == 0 || !j.r.img);
                 j.yarn_to = j.resume == 0 ? (want ? 1 : 0) : (from == 0 && want ? 1 : from);
                 j.yarn_mv = j.resume > 0 && from == 0 && j.yarn_to == 1;
                 if (j.yarn_to == 1)
@@ -18390,7 +18391,8 @@ int main(int argc, char** argv) {
                 if (want || ss.rope_level == 1)
                     std::fprintf(stderr, "strata serve: STRATA_YARN_ELASTIC: request reaches %lld, reads from %lld at level %d%s\n",
                                  (long long) reach, (long long) read_from, ss.rope_level, admit_slot >= 0 ? " (for a slot)" : "");
-                if (read_from > 0 && ss.rope_level == 0 && want) {
+                // (a picture's cells sit at other positions than their index: such a conversation is not moved)
+                if (read_from > 0 && ss.rope_level == 0 && want && req_imgs.empty() && live_imgs.empty()) {
                     std::string ye;
                     if (!yarn_move(sx, use_mtp ? &mtp.kv_state() : nullptr, read_from, &checks, "the solo conversation", ye)) {
                         std::printf("ERR %s\n", ye.c_str());
