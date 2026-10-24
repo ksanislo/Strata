@@ -224,6 +224,11 @@ public:
     bool commit_slot_prefixes(const int* keep, std::string& err);
     /// --batch-mtp: slot rotation makes many row layouts, so bound the captured batch graph pairs (LRU). 0 = unbounded.
     void set_batch_graph_limit(size_t n) { batch_graph_limit_ = n; }
+    size_t batch_graph_limit() const { return batch_graph_limit_; }
+    /// The VRAM a batch layout's graph pair took when captured (measured, the mean; 0 before the first), and the layouts
+    /// held now: what the server keeps free for the layouts still to come.
+    uint64_t batch_graph_bytes() const { return bgraph_n_ ? bgraph_bytes_ / bgraph_n_ : 0; }
+    size_t batch_layouts() const { return exec_bm_.size(); }
 
     // ---- The stages of a layer split as a PIPELINE.  A batch window over the slot GROUP
     // [base, base + S) is launched on ONE stage with its commit right behind it on the stage's stream (a batch window
@@ -234,6 +239,19 @@ public:
     /// 1 = this stage's window and commit are done (the last stage's picks are in batch_out), 0 = still running,
     /// -1 = an error (err).  Serves every layer that has rung so far.
     int batch_poll(PoolMultiFn pool, void* user, std::string& err);
+    /// STRATA_PIPED_MTP: the same over explicit `rows` (a slot's rows contiguous: its token, then its draft) at hand-off
+    /// rows [hbase, hbase + S).  `defer`: no commit is queued; commit_deferred(hbase, ...) queues it once the host knows
+    /// each slot's accepted prefix.  Another window launched here first saves the pending window's commit inputs.
+    bool batch_launch_rows(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, bool defer,
+                           std::string& err);
+    /// Queues the deferred commit of the window launched at `hbase` (keep[slot] rows of each of its slots) on this
+    /// stage's stream, without waiting.  No-op when none is pending there.
+    bool commit_deferred(int hbase, const int* keep, std::string& err);
+    /// Room to save the commit inputs of `n` deferred windows (one per pipelined group), allocated now.
+    bool reserve_deferred(int n, std::string& err);
+    bool deferred_pending() const { return !dwin_.empty(); }
+    /// The group at `hbase` can be launched here without waiting: its last deferred commit has run.
+    bool batch_launch_ready(int hbase);
     bool batch_busy() const { return b_running_.load(std::memory_order_acquire); }
     /// Serves the layers of this stage's window that have rung (the CPU pool and the flags), with no CUDA call: 1 once
     /// every layer is served (or the window raises no host doorbells), 0 while one is still to ring.  batch_poll
@@ -242,6 +260,20 @@ public:
     /// for its doorbell, #31); batch_poll then makes no CUDA call before every layer is served.
     int batch_serve(PoolMultiFn pool, void* user);
     void set_external_serve(bool on) { ext_serve_.store(on, std::memory_order_release); }
+    /// STRATA_STAGE_SERVE: another thread serves the doorbells of this verifier's run() and pipelined windows
+    /// (serve_external); `wake` is called at each such launch, `served` on the launching thread once every layer of a
+    /// window is served (the server's dispatch is idle then).  The launching thread only waits and checks.  Unset:
+    /// the windows serve themselves.  Not for windows with --remote-expert-opt, the PCIe balance or an adaptive gate.
+    /// `runs` false: run() windows serve themselves (on the calling thread), only the pipelined ones go to the server.
+    void set_external_server(std::function<void()> wake, std::function<void()> served, bool runs = true) {
+        xwake_ = std::move(wake);
+        xserved_ = std::move(served);
+        x_runs_ = runs;
+    }
+    bool external_busy() const { return x_running_.load(std::memory_order_acquire); }
+    /// Serves the layers of the external window in flight that have rung, with no CUDA call: 1 when none is in flight
+    /// or every layer is served, 0 while one is still to ring, -1 on a failure (the launching thread reports it).
+    int serve_external(PoolMultiFn pool, void* user);
     /// A slot's sampling (temperature / top_p / top_k / min_p / seed; penalties are not applied in batch windows):
     /// its row is drawn again on the last stage with Philox(seed, position), as a solo window draws it.  Greedy by
     /// default.  Set on the first stage, it reaches the last.
@@ -381,10 +413,13 @@ private:
     std::map<std::vector<int>, uint64_t> bm_used_;   ///< last use of each captured layout (LRU)
     uint64_t bm_tick_ = 0;
     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph (0.1.39); N: LRU-evict beyond N layouts
+    uint64_t bgraph_bytes_ = 0, bgraph_n_ = 0, bgraph_evictions_ = 0;   ///< batch_graph_bytes; evictions (and reliefs) so far
     int last_rows_[8] = {};                ///< the slots of the last batch window's rows
+    int row_level(int slot) const;
     std::vector<int> bkey(const int* rows, int S, int hbase) const {   // #871: the doorbell variant has its own graphs
         std::vector<int> k = batch_key(rows, S, hbase);
         k.push_back(ar_off_ ? 1 : 0);
+        for (int t = 0; t < S; ++t) k.push_back(row_level(rows[t]));   // (the slots' RoPE levels are baked in too)
         return k;
     }
     static std::vector<int> batch_key(const int* rows, int S, int hbase) {
@@ -410,6 +445,25 @@ private:
             std::chrono::steady_clock::duration(b_last_.load(std::memory_order_acquire)));
     }
     std::chrono::steady_clock::time_point ext_checked_{};   ///< batch_poll's last check with external serving
+    // set_external_server: the window the server thread serves (run() or pl_launch).  The launching thread writes the
+    // shape, then x_running_; the server writes x_k_ (and clears x_running_ before it publishes the last layer)
+    std::function<void()> xwake_, xserved_;
+    std::atomic<bool> x_running_{false}, x_failed_{false}, x_nopool_{false};
+    std::atomic<int64_t> x_k_{0};
+    int64_t x_total_ = 0;
+    int x_T_ = 0, x_G_ = 1;
+    bool x_ple_ = false;
+    std::vector<uint32_t> x_ple_rows_;
+    std::string x_err_;
+    std::chrono::steady_clock::time_point x_since_{};   ///< (the server's) the last layer served, for ms_wait
+    bool x_runs_ = true;    ///< set_external_server's `runs`
+    bool fl_ext_ = false;   ///< the pipelined window in flight is served externally
+    bool external_window() const;
+    void start_external(int T, int G, int64_t total, bool ple, const uint32_t* ple_rows);
+    /// The launching thread's checks while the server serves: a graph that ended (or failed) with a layer still to
+    /// ring (`query`: the graph's state, asked at most every millisecond), no ring for 20 s, the server's failure.
+    /// 0: keep waiting; -1: `err`, and the window is no longer served.
+    int check_external(const std::function<cudaError_t()>& query, std::string& err);
     int32_t b_out_[8] = {};
     std::vector<strata::kernels::SamplerParams> slot_sp_;
     bool sample_rows(int S, std::string& err);   ///< the sampled slots' rows of the last batch window
@@ -441,6 +495,29 @@ private:
     double fl_since_ms_ = 0, fl_flush_ms_ = 0, fl_launch_ms_ = 0;
     int32_t pl_prev_[2] = {-1, -1};
     std::vector<uint32_t> pl_ple_rows_;   ///< the window's PLE rows (T x PLE_N_HEADS), gathered when layer 0 is served
+    // STRATA_PIPED_MTP: windows launched with their commit deferred, by hbase; the arena rows of at most one of them
+    // are live (arena_holds_), the others are copied to dsave_ before another window overwrites them
+    struct DeferredWin {
+        std::vector<int> key;
+        int rows[8] = {};
+        int S = 0;
+        int32_t tok[8] = {};
+        int64_t pos[8] = {};
+        int save = -1;   ///< its dsave_ buffer once saved
+    };
+    std::map<int, DeferredWin> dwin_;
+    int arena_holds_ = -1;
+    std::vector<float*> dsave_;
+    std::vector<bool> dsave_used_;
+    std::map<int, cudaEvent_t> dcommit_ev_;   ///< by hbase: after its last deferred commit (live while in the map's set)
+    std::map<int, bool> dcommit_live_;
+    size_t deferred_floats() const;
+    bool deferred_copy(float* save, int S, bool to_save, std::string& err);
+    bool deferred_save_live(std::string& err);
+    bool pinned_layout(const std::vector<int>& key) const {
+        for (const auto& kv : dwin_) if (kv.second.key == key) return true;
+        return false;
+    }
     bool capture_commit_batch(const int* rows, int S, int hbase, std::string& err);
     bool stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, std::string& err);
     strata::kernels::SamplerParams sampling_ = [] {
@@ -529,6 +606,7 @@ private:
     VerifyHits hits_;
     const NativeHead* head_ = nullptr;
     int max_t_ = 0;
+    int64_t cb_ = 0;                       ///< a slot's batch commit record (init_slots)
     float* ple_key_ = nullptr;   ///< STRATA_PLE_BATCH: the window rows' PLE key / value projections
     float* ple_val_ = nullptr;
     int last_t_ = 0;
@@ -544,9 +622,11 @@ private:
     cudaStream_t df_side_[2] = {};
     cudaEvent_t df_fork_ = nullptr;
     cudaEvent_t df_join_[2] = {};
-    cudaGraphExec_t exec_[9] = {};
-    cudaGraphExec_t exec_nr_[9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
-    bool launched_[9] = {}, launched_nr_[9] = {};   ///< this graph has been launched once (early_ple_flag: a cold first launch raises the PLE flag first)
+    // [level]: the graphs bake the session's RoPE level (the indexer's position base, STRATA_YARN_ELASTIC): a set per level
+    cudaGraphExec_t exec_[2][9] = {};
+    cudaGraphExec_t exec_nr_[2][9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
+    bool launched_[2][9] = {}, launched_nr_[2][9] = {};   ///< this graph has been launched once (early_ple_flag: a cold first launch raises the PLE flag first)
+    int lv() const;   ///< the level of the session the solo graphs run on (0 plain, 1 YaRN)
     // fork 34a35db (STRATA_SIDE_MIXER=1): the GDN gates and the QSA indexer on a branch of the window's graph beside the
     // mixer's projections, joined before the recurrence / the attention
     cudaStream_t side_ = nullptr;
@@ -554,7 +634,7 @@ private:
     // fork b063c13 (STRATA_SIDE_MIXER=2): a second branch for the GDN gate projection and the QSA queries' chain
     cudaStream_t side2_ = nullptr;
     cudaEvent_t pfork_ = nullptr, pjoin_ = nullptr;
-    cudaGraphExec_t commit_exec_ = nullptr;
+    cudaGraphExec_t commit_exec_[2] = {};   // [level]
 
     // mapped staging (host pointer, device alias)
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T

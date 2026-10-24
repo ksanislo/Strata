@@ -2,6 +2,7 @@
 
 #include "strata/core/conversation_cache.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/kernels/split_copy.hpp"
 
 #include <cuda_runtime.h>
 
@@ -41,7 +42,7 @@ inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes, bo
     cudaStream_t s = nullptr;
     cudaError_t e = private_stream(s);
     if (e != cudaSuccess) return e;
-    e = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, s);
+    e = strata::kernels::memcpy_async_split(dst, src, bytes, cudaMemcpyDefault, s);   // (STRATA_KV_HOST_ELASTIC)
     if (e != cudaSuccess || queued) return e;
     e = cudaStreamSynchronize(s);
     core::progress_beat();   // #2049: a parked conversation is many of these; each one that lands is progress
