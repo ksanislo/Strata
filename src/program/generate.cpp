@@ -20,6 +20,7 @@
 #include "strata/platform/numa.hpp"
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/nv_defaults.hpp"
+#include "strata/kernels/rope.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/batch_telemetry.hpp"
 #include "strata/core/dma_batch.hpp"
@@ -3647,6 +3648,10 @@ int main(int argc, char** argv) {
     // NaN angle inside one of the twelve QSA layers.  Only the RANGES are checked - the config itself is
     // resolved after the model file has had its say, right before session_init.
     strata::kernels::RopeScaling rope_cfg;   // type filled here; the rest at the resolution below
+    // STRATA_YARN_ELASTIC=1 (with --rope-scaling yarn): the RoPE tables hold plain RoPE (yarn_off, level 0) until a
+    // request reaches past the original context, then the configured YaRN (level 1); -1: off
+    int yarn_level = -1;
+    strata::kernels::RopeScaling yarn_off;
     {
         using RST = strata::kernels::RopeScalingType;
         // an absent --rope-scaling (the empty default) leaves the type to the model file's rope keys,
@@ -4068,6 +4073,21 @@ int main(int argc, char** argv) {
             return 2;
         }
         strata::kernels::rope_scaling_set(rope_cfg);
+        if (const char* ye = std::getenv("STRATA_YARN_ELASTIC"); ye != nullptr && ye[0] == '1') {
+            if (rope_cfg.type != RST::YaRN || (o.kv != "int8" && o.kv != "k8v4" && o.kv != "f16") ||
+                (std::getenv("STRATA_KV_INT8_ROT") != nullptr && std::getenv("STRATA_KV_INT8_ROT")[0] == '1')) {
+                std::fprintf(stderr, "strata generate: STRATA_YARN_ELASTIC needs --rope-scaling yarn and INT8/K8V4/FP16 K "
+                                     "without a rotation: the configured scaling stays in force\n");
+            } else {
+                yarn_off.type = RST::None;
+                yarn_off.freq_base = rope_cfg.freq_base;
+                strata::kernels::rope_table_force(true);   // every kernel reads the tables: a step rewrites only them
+                strata::kernels::rope_content_set(yarn_off);
+                yarn_level = 0;
+                std::fprintf(stderr, "strata generate: STRATA_YARN_ELASTIC: plain RoPE until a request reaches past %.0f "
+                                     "tokens, then YaRN factor %.6g\n", rope_cfg.orig_ctx, rope_cfg.factor);
+            }
+        }
         if (rope_cfg.type != RST::None) {
             const char* tn = rope_cfg.type == RST::YaRN ? "yarn" : "linear";
             std::fprintf(stderr,
@@ -10135,9 +10155,10 @@ int main(int argc, char** argv) {
                 c.mtp_window = o.mtp.empty() ? -1 : o.mtp_window;
                 const char* rot = std::getenv("STRATA_KV_ROT");
                 c.kv_rot = rot != nullptr && rot[0] == '1';
-                c.rope = {(int64_t) rope_cfg.type, rope_cfg.freq_base, rope_cfg.factor, rope_cfg.freq_scale(),
-                          rope_cfg.orig_ctx, rope_cfg.ext_factor, rope_cfg.attn_factor, rope_cfg.beta_fast,
-                          rope_cfg.beta_slow};
+                // (STRATA_YARN_ELASTIC: the level the tables hold now; a step resets config_fp)
+                const strata::kernels::RopeScaling& rc = strata::kernels::rope_content();
+                c.rope = {(int64_t) rc.type, rc.freq_base, rc.factor, rc.freq_scale(), rc.orig_ctx, rc.ext_factor,
+                          rc.attn_factor, rc.beta_fast, rc.beta_slow};
                 c.cvec = cvec_digest;
                 c.switches = {
                     {"no_ple", o.no_ple}, {"native_bf16", o.native_bf16}, {"native_bf16_extra", o.native_bf16_extra},
@@ -16211,6 +16232,82 @@ int main(int argc, char** argv) {
             });
         struct ReliefOff { ~ReliefOff() { strata::core::set_vram_relief(nullptr); } } relief_off;
         for (size_t k = 0; eslots_on && k < bslot_ss.size(); ++k) vram_floor(k);   // the floor before the first window
+        // ---- STRATA_YARN_ELASTIC: the RoPE level moved between requests, with nothing in flight.  The live solo
+        // session and every slot holding a conversation keep their K/V (moved to the new level); what was parked at the
+        // old level (checkpoints, parked conversations, session files) is read again instead
+        static const double yarn_down_s = [] {
+            const char* v = std::getenv("STRATA_YARN_ELASTIC_DOWN_S");
+            return v != nullptr ? std::atof(v) : 600.0;
+        }();
+        Clock::time_point yarn_long_at{};
+        auto yarn_step = [&](int to) -> bool {
+            const auto t0 = Clock::now();
+            if (!pipe_drain()) return false;
+            std::vector<std::pair<const strata::core::QsaState*, int64_t>> sts;
+            auto add = [&](const strata::core::SessionState& u, int64_t cells) {
+                if (cells <= 0 || u.qsa_states == nullptr) return;
+                for (int64_t j = 0; j < u.qsa_alloc; ++j) sts.push_back({&u.qsa_states[u.qsa_ord0 + j], cells});
+                if (u.host_follow != nullptr) sts.push_back({u.host_follow, cells});
+            };
+            // a picture's cells sit at other positions than their index: such a conversation is read again
+            if (live_ok && !live_imgs.empty()) live_ok = false;
+            if (live_ok)
+                for (size_t k = 0; k <= stages.size(); ++k) add(k == 0 ? ss : stages[k - 1]->ss, (int64_t) live.size());
+            int kept = 0, dropped = 0;
+            for (size_t b = 0; b < bs.size(); ++b) {
+                BSlot& sl = bs[b];
+                if (!sl.active && !sl.reading && !sl.cached && !sl.partial) continue;
+                if (sl.img) {   // (a running picture conversation finishes at the old level and is not kept)
+                    if (sl.active || sl.reading) sl.tainted = true;
+                    else { sl.cached = false; sl.ids.clear(); }
+                    ++dropped;
+                    continue;
+                }
+                const int64_t cells = std::max<int64_t>(sl.p, (int64_t) sl.ids.size());
+                for (size_t k = 0; k < bslot_ss.size(); ++k) add(*bslot_ss[k][b], cells);
+                ++kept;
+            }
+            const strata::kernels::RopeScaling& from = yarn_level == 0 ? yarn_off : rope_cfg;
+            const strata::kernels::RopeScaling& to_s = to == 0 ? yarn_off : rope_cfg;
+            if (!strata::core::qsa_rope_level(from, to_s, strata::core::qsa_shapes(g), sts)) {
+                std::printf("ERR STRATA_YARN_ELASTIC: moving the K/V to the new RoPE level failed\n");
+                return false;
+            }
+            if (ckpt_pool.on())
+                for (ConvCheckpoint& c : checks) ckpt_pool.give(std::move(c));
+            checks.clear();
+            tail_ckpt_len = -1;
+            const size_t n_parked = conversations.clear();
+            (void) conversations.take_reuse();
+            for (BSlot& sl : bs) {
+                if (ckpt_pool.on())
+                    for (ConvCheckpoint& c : sl.checks) ckpt_pool.give(std::move(c));
+                sl.checks.clear();
+            }
+            config_fp.reset();
+            yarn_level = to;
+            std::fprintf(stderr, "strata serve: STRATA_YARN_ELASTIC: RoPE level %s (%zu states, %d slot conversations and "
+                                 "%s solo session moved, %d picture ones not; %zu parked conversations dropped) in %.0f ms\n",
+                         to == 0 ? "plain" : "YaRN", sts.size(), kept, live_ok ? "the" : "no", dropped, n_parked,
+                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+            return true;
+        };
+        // before a request: its reach (prompt + max_new) and the conversations the slots run or read decide the level
+        auto yarn_check = [&](const std::string& l, long long max_new) -> bool {
+            if (yarn_level < 0 || !(l.rfind("GEN", 0) == 0 || l.rfind("BGEN", 0) == 0)) return true;
+            const int64_t thr = (int64_t) rope_cfg.orig_ctx;
+            const int64_t need = (int64_t) std::count(l.begin(), l.end(), ',') + 1 + std::max<long long>(max_new, 0);
+            int64_t held = 0;
+            for (const BSlot& sl : bs)
+                if (sl.active || sl.reading) held = std::max<int64_t>(held, std::max<int64_t>(sl.p, (int64_t) sl.ids.size()));
+            const auto now = Clock::now();
+            if (need > thr || held > thr) yarn_long_at = now;
+            if (yarn_level == 0 && (need > thr || held > thr)) return yarn_step(1);
+            if (yarn_level == 1 && need <= thr && held <= thr &&
+                std::chrono::duration<double>(now - yarn_long_at).count() >= yarn_down_s)
+                return yarn_step(0);
+            return true;
+        };
         for (;;) {
             line_drain_ms = 0.0;
             bool adm_direct = false;   // STRATA_SLOT_ADMIT: this BGEN is read beside the slots (adm_run)
@@ -16227,6 +16324,13 @@ int main(int argc, char** argv) {
                 if (!cy_held.empty()) {
                     if (!yield_line || cy_served >= cy_max_lines) {
                         cy_served = 0;
+                        // (STRATA_YARN_ELASTIC: a held read reaching past the original context moves the level first)
+                        int64_t far = 0;
+                        for (const auto& j : cy_held) far = std::max<int64_t>(far, j->n + std::max<long long>(j->r.max_new, 0));
+                        if (yarn_level == 0 && far > (int64_t) rope_cfg.orig_ctx) {
+                            yarn_long_at = Clock::now();
+                            if (!yarn_step(1)) return 1;
+                        }
                         if (!adm_run(std::string())) return 1;
                         continue;
                     }
@@ -16343,6 +16447,17 @@ int main(int argc, char** argv) {
                 admit_max_new = mn;
                 adm_drain_ms = line_drain_ms;
                 line = std::string(bimg ? "GENI 1" : "GEN 1") + e2;
+            }
+            if (yarn_level >= 0 && line != "QUIT") {
+                long long mn = admit_slot >= 0 ? admit_max_new : 0;
+                const bool bg = line.rfind("BGEN", 0) == 0;
+                if (admit_slot < 0 && (bg || line.rfind("GEN", 0) == 0)) {   // GEN[I] <max_new> / BGEN[I] <slot> <max_new>
+                    const char* q = line.c_str() + line.find(' ');
+                    char* e = nullptr;
+                    if (bg) (void) std::strtol(q, &e, 10), q = e;
+                    mn = std::strtoll(q, &e, 10);
+                }
+                if (!yarn_check(line, mn)) return 1;
             }
             // #477: every --expert-profile-save-every minutes, before the next request (at QUIT: after the loop)
             if (!heat.empty() && line != "QUIT" && o.expert_profile_save_min > 0 &&
