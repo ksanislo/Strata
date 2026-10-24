@@ -84,6 +84,11 @@ public:
         arena_bytes_ = ((nmax_ + kChunk - 1) / kChunk) * kChunk * slot_bytes_;
         arena_ = (uint8_t*) os::range_reserve(arena_bytes_);
         if (arena_ == nullptr) return false;
+        // several NUMA nodes: the arena interleaved over them (DS4_STORE_INTERLEAVE=0: where the first touch puts it).  The CPU lane's
+        // threads span the sockets, so a slot on one node is read at that node's controller alone - measured on 2 x Xeon E5-2660 v2:
+        // the expert rows 17.1 -> 25.1 GB/s, decode 9.55 -> 10.78 tok/s
+        if (!(std::getenv("DS4_STORE_INTERLEAVE") != nullptr && std::atoi(std::getenv("DS4_STORE_INTERLEAVE")) == 0))
+            nodes_ = os::interleave_nodes(arena_, arena_bytes_);
         slots_.reset(new Slot[nmax_]);
         where_.resize(geo_.size());
         heat_.resize(geo_.size());
@@ -115,6 +120,7 @@ public:
     }
 
     size_t slot_bytes() const { return slot_bytes_; }
+    int nodes() const { return nodes_; }   // the NUMA nodes the arena is interleaved over (1: none)
     size_t slots_allocated() const { return nalloc_; }
     size_t slots_max() const { return nmax_; }
     const Stats& stats() const { return st_; }
@@ -514,6 +520,7 @@ private:
     std::vector<os::fd_t> dfds_, pfds_;
     size_t slot_bytes_ = 0, nmax_ = 0, nalloc_ = 0, free_hint_ = 0, arena_bytes_ = 0;
     uint8_t* arena_ = nullptr;
+    int nodes_ = 1;
     size_t shrunk_ = 0;
     std::unique_ptr<Slot[]> slots_;
     std::vector<std::pair<void*, size_t>> chunks_;

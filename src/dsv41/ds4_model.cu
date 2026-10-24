@@ -4532,9 +4532,10 @@ struct Model::Impl {
         if (std::getenv("DS4_AHEAD") == nullptr) ahead_mode = 0;
         for (Layer& l : L)
             if (l.il < g.nl && want_zc) l.zc.assign((size_t) l.n_exp, 0);
-        std::fprintf(stderr, "ds4: RAM store: up to %zu slots of %.1f MB (%.1f GB), policy %d, %d reader threads, %s reads\n",
+        std::fprintf(stderr, "ds4: RAM store: up to %zu slots of %.1f MB (%.1f GB), policy %d, %d reader threads, %s reads%s\n",
                      store->slots_max(), store->slot_bytes() / 1e6, store->slots_max() * (double) store->slot_bytes() / 1e9,
-                     (int) cfg.policy, cfg.threads, direct ? "unbuffered" : "BUFFERED (no direct handle)");
+                     (int) cfg.policy, cfg.threads, direct ? "unbuffered" : "BUFFERED (no direct handle)",
+                     store->nodes() > 1 ? (", interleaved over " + std::to_string(store->nodes()) + " NUMA nodes").c_str() : "");
         if (want_zc) {
             if (!store->gpu_mapped()) {
                 std::fprintf(stderr, "ds4: RAM store: the arena could not be mapped for the GPU: zero-copy off\n");
