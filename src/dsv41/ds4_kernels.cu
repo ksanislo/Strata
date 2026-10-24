@@ -454,6 +454,39 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_kernel(const float* __restr
     if (lane == 0) y[(size_t) t * ldy + row] = acc;
 }
 
+// the same over kRouteT tokens a block: each weight float4 read once for all of them, every token's fmaf chain the one-token
+// kernel's (the same lane stride and order), so each token's logits are its bits.  A prompt chunk re-read the router's 6.3 MB
+// of F32 weights for every token (4x T4: ~29 ms a layer for 1.2K tokens)
+constexpr int kRouteT = 8;
+__global__ void __launch_bounds__(kThreads) gemv_f32_rows_kernel(const float* __restrict__ W, const float* __restrict__ x,
+                                                                 int n, int k, int T, float* __restrict__ y, int ldy) {
+    const int row = blockIdx.x * (kThreads / 32) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31, t0 = blockIdx.y * kRouteT, nt = min(kRouteT, T - t0);
+    if (row >= n) return;
+    const float4* w = (const float4*) (W + (size_t) row * k);
+    float acc[kRouteT];
+#pragma unroll
+    for (int t = 0; t < kRouteT; ++t) acc[t] = 0.0f;
+    for (int c = lane; c < k / 4; c += 32) {
+        const float4 a = w[c];
+#pragma unroll
+        for (int t = 0; t < kRouteT; ++t)
+            if (t < nt) {
+                const float4 b = ((const float4*) (x + (size_t) (t0 + t) * k))[c];
+                acc[t] = fmaf(a.x, b.x, acc[t]);
+                acc[t] = fmaf(a.y, b.y, acc[t]);
+                acc[t] = fmaf(a.z, b.z, acc[t]);
+                acc[t] = fmaf(a.w, b.w, acc[t]);
+            }
+    }
+#pragma unroll
+    for (int t = 0; t < kRouteT; ++t)
+        if (t < nt) {
+            const float a = warp_sum(acc[t]);
+            if (lane == 0) y[(size_t) (t0 + t) * ldy + row] = a;
+        }
+}
+
 // ---------------------------------------------------------------- the router
 __global__ void __launch_bounds__(512) route_kernel(const float* __restrict__ logits, const float* __restrict__ bias,
                                                     int n, int k, float route_scale, int* idx, float* w,
@@ -1929,7 +1962,8 @@ void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
 }
 
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s) {
-    if (T > 0) gemv_f32_kernel<<<dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s>>>(W, x, n, k, y, ldy);
+    if (T > 1) gemv_f32_rows_kernel<<<dim3(cdiv(n, kThreads / 32), cdiv(T, kRouteT)), kThreads, 0, s>>>(W, x, n, k, T, y, ldy);
+    else if (T > 0) gemv_f32_kernel<<<dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s>>>(W, x, n, k, y, ldy);
 }
 
 void route(const float* logits, const float* bias, int n, int k, int T, float route_scale, int* idx, float* w,

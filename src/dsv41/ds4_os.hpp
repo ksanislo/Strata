@@ -409,7 +409,15 @@ inline void* anon_alloc(size_t bytes, int node, int nodes) {
 #else
     void* m = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (m == MAP_FAILED) return nullptr;
-    madvise(m, bytes, MADV_HUGEPAGE);
+    // STRATA_NO_LARGEPAGES=1 / DS4_NO_HUGEPAGES=1: no MADV_HUGEPAGE - with THP's defrag on madvise and the RAM full of page
+    // cache, every fault of a huge-page range compacts memory first (2 x Xeon E5-2660 v2, 251 GB: a 102 GB copy fell to
+    // 54 MB/s, kcompactd at 100%)
+    static const bool no_huge = [] {
+        for (const char* k : {"STRATA_NO_LARGEPAGES", "DS4_NO_HUGEPAGES"})
+            if (const char* v = std::getenv(k); v != nullptr && v[0] != '\0' && v[0] != '0') return true;
+        return false;
+    }();
+    if (!no_huge) madvise(m, bytes, MADV_HUGEPAGE);
     if (node >= 0 && nodes > 1) {
         unsigned long mask[4] = {0, 0, 0, 0};
         mask[node / 64] = 1ul << (node % 64);
@@ -420,6 +428,33 @@ inline void* anon_alloc(size_t bytes, int node, int nodes) {
 }
 /// An address range of `bytes` reserved (no memory behind it yet), and pieces of it made real: the store's arena is one range so a
 /// kernel can tell its pointers by [lo, hi).  nullptr: it could not be had.
+/// Linux with several NUMA nodes: the range's pages spread over every online node, a page each in turn (MPOL_INTERLEAVE), so
+/// threads on both sockets read it at both memory controllers' rate.  Returns the nodes used (1: nothing done).
+inline int interleave_nodes(void* p, size_t bytes) {
+#if defined(__linux__)
+    std::FILE* f = std::fopen("/sys/devices/system/node/online", "r");
+    if (f == nullptr) return 1;
+    char buf[256] = {};
+    const bool got = std::fgets(buf, sizeof buf, f) != nullptr;
+    std::fclose(f);
+    if (!got) return 1;
+    unsigned long mask[4] = {0, 0, 0, 0};
+    int n = 0;
+    for (char* q = buf; *q != '\0' && *q != '\n';) {   // "0-1" / "0,2-3"
+        char* e = nullptr;
+        const long a = std::strtol(q, &e, 10);
+        long b = a;
+        if (*e == '-') b = std::strtol(e + 1, &e, 10);
+        for (long k = a; k <= b && k < 256; ++k, ++n) mask[k / 64] |= 1ul << (k % 64);
+        q = *e == ',' ? e + 1 : e;
+    }
+    if (n < 2) return 1;
+    return syscall(SYS_mbind, p, bytes, 3 /* MPOL_INTERLEAVE */, mask, 256, 0) == 0 ? n : 1;
+#else
+    (void) p; (void) bytes;
+    return 1;
+#endif
+}
 inline void* range_reserve(size_t bytes) {
 #if defined(_WIN32)
     return VirtualAlloc(nullptr, bytes, MEM_RESERVE, PAGE_READWRITE);

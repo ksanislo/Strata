@@ -66,6 +66,10 @@ public:
         // a new chunk of the arena for the GPU to read in place: returns the device address of `host` (null: not visible)
         std::function<void*(void* host, size_t bytes)> map_chunk;
         std::function<void(void* host)> unmap_chunk;
+        // a new chunk page-locked for the GPUs' copy engines (the prompt's stream DMAs a slot from where it lies; no kernel reads
+        // it, so nothing becomes visible): true when it is
+        std::function<bool(void* host, size_t bytes)> pin_chunk;
+        std::function<void(void* host)> unpin_chunk;
         size_t reserve = 192;              // slots kept evictable (not visible) for the window's demand and guesses
         int vis_percent = 100;             // the share of experts the GPU may take (by a fixed hash): the rest stay the CPU lane's, so both lanes work
     };
@@ -84,6 +88,11 @@ public:
         arena_bytes_ = ((nmax_ + kChunk - 1) / kChunk) * kChunk * slot_bytes_;
         arena_ = (uint8_t*) os::range_reserve(arena_bytes_);
         if (arena_ == nullptr) return false;
+        // several NUMA nodes: the arena interleaved over them (DS4_STORE_INTERLEAVE=0: where the first touch puts it).  The CPU lane's
+        // threads span the sockets, so a slot on one node is read at that node's controller alone - measured on 2 x Xeon E5-2660 v2:
+        // the expert rows 17.1 -> 25.1 GB/s, decode 9.55 -> 10.78 tok/s
+        if (!(std::getenv("DS4_STORE_INTERLEAVE") != nullptr && std::atoi(std::getenv("DS4_STORE_INTERLEAVE")) == 0))
+            nodes_ = os::interleave_nodes(arena_, arena_bytes_);
         slots_.reset(new Slot[nmax_]);
         where_.resize(geo_.size());
         heat_.resize(geo_.size());
@@ -98,7 +107,7 @@ public:
         // the decode is running waited on it for good on Linux (H100, driver 580): registering all chunks before the first
         // kernel avoids it
 #if defined(__linux__)
-        const bool pregrow = cfg_.map_chunk && !(std::getenv("DS4_STORE_PREGROW") != nullptr && std::atoi(std::getenv("DS4_STORE_PREGROW")) == 0);   // (Linux: on with the GPU mapping)
+        const bool pregrow = (cfg_.map_chunk || cfg_.pin_chunk) && !(std::getenv("DS4_STORE_PREGROW") != nullptr && std::atoi(std::getenv("DS4_STORE_PREGROW")) == 0);   // (Linux: on with the GPU mapping or pinning)
 #else
         const bool pregrow = std::getenv("DS4_STORE_PREGROW") != nullptr && std::atoi(std::getenv("DS4_STORE_PREGROW")) != 0;
 #endif
@@ -109,12 +118,15 @@ public:
     }
     ~ExpertStore() {
         io_.reset();
-        for (size_t i = 0; i < chunks_.size(); ++i)
+        for (size_t i = 0; i < chunks_.size(); ++i) {
             if (cfg_.unmap_chunk && chunk_dev_[i] != nullptr) cfg_.unmap_chunk(chunks_[i].first);
+            if (cfg_.unpin_chunk && i < chunk_pin_.size() && chunk_pin_[i]) cfg_.unpin_chunk(chunks_[i].first);
+        }
         os::range_release(arena_, arena_bytes_);
     }
 
     size_t slot_bytes() const { return slot_bytes_; }
+    int nodes() const { return nodes_; }   // the NUMA nodes the arena is interleaved over (1: none)
     size_t slots_allocated() const { return nalloc_; }
     size_t slots_max() const { return nmax_; }
     const Stats& stats() const { return st_; }
@@ -264,6 +276,13 @@ public:
         if (s >= 0) slots_[(size_t) s].tick = ++clock_;
     }
     bool gpu_mapped() const { return !chunk_dev_.empty() && chunk_dev_[0] != nullptr; }
+    /// Every chunk page-locked (pin_chunk) and the whole arena grown: a slot can be DMA'd from where it lies.
+    bool dma_pinned() const {
+        if (chunk_pin_.empty() || nalloc_ < nmax_) return false;
+        for (const bool b : chunk_pin_)
+            if (!b) return false;
+        return true;
+    }
     /// The arena's address range (the device sees its host pointers as they are when the mapping is the identity)
     unsigned long long arena_lo() const { return (unsigned long long) (uintptr_t) arena_; }
     unsigned long long arena_hi() const { return (unsigned long long) (uintptr_t) (arena_ + arena_bytes_); }
@@ -349,9 +368,11 @@ public:
                 sp.base = nullptr;
             }
             if (cfg_.unmap_chunk && chunk_dev_[c] != nullptr) cfg_.unmap_chunk(chunks_[c].first);
+            if (cfg_.unpin_chunk && c < chunk_pin_.size() && chunk_pin_[c]) cfg_.unpin_chunk(chunks_[c].first);
             os::range_decommit(chunks_[c].first, chunks_[c].second);
             chunks_.pop_back();
             chunk_dev_.pop_back();
+            if (c < chunk_pin_.size()) chunk_pin_.pop_back();
             nalloc_ = first;
             free_hint_ = std::min(free_hint_, first);
             ++done;
@@ -473,6 +494,7 @@ private:
         chunks_.push_back({p, bytes});
         void* dev = cfg_.map_chunk ? cfg_.map_chunk(p, bytes) : nullptr;
         chunk_dev_.push_back(dev);
+        chunk_pin_.push_back(cfg_.pin_chunk ? cfg_.pin_chunk(p, bytes) : false);
         for (size_t i = 0; i < n; ++i) slots_[nalloc_ + i].base = (uint8_t*) p + i * slot_bytes_ + kSlack;
         nalloc_ += n;
         return true;
@@ -514,10 +536,12 @@ private:
     std::vector<os::fd_t> dfds_, pfds_;
     size_t slot_bytes_ = 0, nmax_ = 0, nalloc_ = 0, free_hint_ = 0, arena_bytes_ = 0;
     uint8_t* arena_ = nullptr;
+    int nodes_ = 1;
     size_t shrunk_ = 0;
     std::unique_ptr<Slot[]> slots_;
     std::vector<std::pair<void*, size_t>> chunks_;
     std::vector<void*> chunk_dev_;
+    std::vector<bool> chunk_pin_;   // (pin_chunk's answer, a chunk)
     std::vector<std::vector<int>> where_;
     std::vector<std::vector<float>> heat_;
     std::vector<uint64_t> hits_in_layer_;
