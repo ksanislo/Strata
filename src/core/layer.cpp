@@ -676,6 +676,16 @@ bool host_elastic_on() {
     }();
     return on;
 }
+// STRATA_KV_HOST_MIB=N: the K/V host copies pin at most N MiB in all (0: what the OS gives); past it a step fails as
+// when the RAM is out
+uint64_t host_cap() {
+    static const uint64_t cap = [] {
+        const char* v = std::getenv("STRATA_KV_HOST_MIB");
+        const long long n = v != nullptr ? std::atoll(v) : 0;
+        return n > 0 ? (uint64_t) n << 20 : (uint64_t) 0;
+    }();
+    return cap;
+}
 int64_t host_step_pages(int64_t page_size) {
     static const int64_t cells = [] {
         const char* v = std::getenv("STRATA_KV_HOST_STEP");
@@ -741,13 +751,16 @@ bool qsa_host_grow(const QsaState& st, int64_t cells) {
         while (p.pinned[i] < want) {
             uint8_t* a = p.base + p.off[i] + (uint64_t) p.pinned[i] * kHostPiece;
             void* d = nullptr;
-            const cudaError_t e = cudaHostRegister(a, (size_t) kHostPiece, cudaHostRegisterPortable | cudaHostRegisterMapped);
+            const bool capped = host_cap() > 0 && g_kv_host_bytes.load() + kHostPiece > host_cap();
+            const cudaError_t e = capped ? cudaErrorMemoryAllocation
+                                         : cudaHostRegister(a, (size_t) kHostPiece, cudaHostRegisterPortable | cudaHostRegisterMapped);
             if (e != cudaSuccess || cudaHostGetDevicePointer(&d, a, 0) != cudaSuccess || d != (void*) a) {
                 if (e == cudaSuccess) (void) cudaHostUnregister(a);   // (the device address is not the host's)
                 (void) cudaGetLastError();
                 g_host_failed = true;
                 std::fprintf(stderr, "strata: KV streaming: pinning more of a slot's host copy failed (%s; %.2f GiB pinned "
-                                     "for K/V in all)\n", cudaGetErrorString(e), (double) g_kv_host_bytes.load() / 1073741824.0);
+                                     "for K/V in all)\n", capped ? "STRATA_KV_HOST_MIB reached" : cudaGetErrorString(e),
+                             (double) g_kv_host_bytes.load() / 1073741824.0);
                 for (size_t j = 0; j < p.per.size(); ++j)
                     for (; p.pinned[j] > had[j]; --p.pinned[j]) {
                         uint8_t* q = p.base + p.off[j] + (uint64_t) (p.pinned[j] - 1) * kHostPiece;
