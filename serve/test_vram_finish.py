@@ -6,7 +6,7 @@ import threading
 import unittest
 from pathlib import Path
 
-from serve.server import EngineNonFinite, EngineOutOfVram, StrataEngine, raise_bad_finish
+from serve.server import EngineNonFinite, EngineOutOfRam, EngineOutOfVram, StrataEngine, engine_refusal, raise_bad_finish
 
 
 class BadFinish(unittest.TestCase):
@@ -20,6 +20,16 @@ class BadFinish(unittest.TestCase):
         with self.assertRaises(EngineNonFinite) as c:
             raise_bad_finish("nonfinite")
         self.assertNotIsInstance(c.exception, EngineOutOfVram)
+
+    def test_ram_is_the_servers_error(self):
+        with self.assertRaises(EngineOutOfRam) as c:
+            raise_bad_finish("ram")
+        self.assertIsInstance(c.exception, EngineOutOfVram)   # the same retry-once, then 503
+        self.assertIn("no RAM is left", str(c.exception))
+        e = engine_refusal("no RAM is left to pin 300000 cells of context in slot 2")
+        self.assertIsInstance(e, EngineOutOfRam)
+        self.assertIn("300000 cells", str(e))
+        self.assertNotIsInstance(engine_refusal("a token id is outside the vocabulary"), EngineNonFinite)
 
     def test_ordinary_finishes_pass(self):
         for f in ("stop", "length", "cancel", None):
