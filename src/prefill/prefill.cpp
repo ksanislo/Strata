@@ -1979,7 +1979,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         proj(mixed, mixed_h, w_k, Kc, nb, KV, Nn, 0);
         proj(mixed, mixed_h, w_v, Vc, nb, KV, Nn, 0);
         rms_rows(Kc, w_kn, nb * g.n_head_kv, g.head_dim, g.head_dim, EPS, m.cs);
-        rope(Kc, nb, g.n_head_kv, g.head_dim, KV, c0, strata::kernels::rope_scaling(), m.cs);
+        rope(Kc, nb, g.n_head_kv, g.head_dim, KV, c0 + (m.ss->rope_level ? strata::kernels::kRopeYarnOff : 0), strata::kernels::rope_scaling(), m.cs);
         if (st.kv_rot) {   // rotated as the drafter's own decode stores them (mtp.cpp)
             strata::kernels::fwht256_inplace_cuda(Kc, nb * g.n_head_kv, m.cs);
             strata::kernels::fwht256_inplace_cuda(Vc, nb * g.n_head_kv, m.cs);
@@ -3541,6 +3541,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // against its own session; the projections above and below run over the whole chunk
                     for (const RunSeg& sg : segv) {
                         const int64_t T = sg.n, p0 = sg.p0, r0 = sg.r0;
+                        // the rotary positions start here (STRATA_YARN_ELASTIC: offset for a YaRN conversation)
+                        const int32_t yb = sg.ss->rope_level ? strata::kernels::kRopeYarnOff : 0;
+                        const int64_t rp0 = p0 + yb;
                         const core::QsaState& st = sg.ss->qsa_states[qsa_index];
                         float *const Kc = m.Kc + r0 * 512, *const Vc = m.Vc + r0 * 512, *const Qf = m.Qf + r0 * 12288;
                         float *const q = m.q + r0 * ZV, *const idx_raw = m.idx_raw + r0 * 128, *const q_idx = m.q_idx + r0 * 512;
@@ -3549,7 +3552,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const int32_t* const steps_dev = m.steps_dev + r0 * strata::kernels::kStepCount;
                         const int32_t* const steps_host = m.steps_host.data() + r0 * strata::kernels::kStepCount;
                         rms_rows(Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.cs);
-                        rope(Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), m.cs);
+                        rope(Kc, T, 2, 256, 512, rp0, strata::kernels::rope_scaling(), m.cs);
                         // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
                         // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks
                         const bool staged = st.kv_mode == 1;
@@ -3612,10 +3615,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (staged) pf_step("reading the prompt (batched, step sync): the K/V append at layer", l);
                         split_q(Qf, q, T, m.cs);
                         rms_rows(q, (const float*) wqn->data, T * 24, 256, 256, EPS, m.cs);
-                        rope(q, T, 24, 256, 6144, p0, strata::kernels::rope_scaling(), m.cs);
+                        rope(q, T, 24, 256, 6144, rp0, strata::kernels::rope_scaling(), m.cs);
                         if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(q, T * 24, m.cs);
                         rms_rows(q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, m.cs);
-                        rope(q_idx, T, 4, 128, 512, p0, strata::kernels::rope_scaling(), m.cs);
+                        rope(q_idx, T, 4, 128, 512, rp0, strata::kernels::rope_scaling(), m.cs);
                         // the indexer appends, token by token; then scores + selection for many queries at once:
                         // a query reads completed blocks (final once completed) and `dead` for its own tail block
                         const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
@@ -3625,13 +3628,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         try {
                             static const bool per_token = std::getenv("STRATA_INDEXER_PER_TOKEN") != nullptr;
                             if (!per_token) {
-                                strata::kernels::native_qsa_indexer_append_batch(idx_raw, T, p0, 0, (const float*) wikn->data,
+                                strata::kernels::native_qsa_indexer_append_batch(idx_raw, T, p0, yb, (const float*) wikn->data,
                                                                                  EPS, ib, s, st.max_cells,
                                                                                  strata::kernels::rope_scaling(), m.cs);
                             }
                             for (int64_t t = 0; per_token && t < T; ++t) {
                                 const int32_t* step_t = steps_dev + t * strata::kernels::kStepCount;
-                                strata::kernels::native_qsa_indexer_append(idx_raw + t * 128, step_t + strata::kernels::kStepPos, 0,
+                                strata::kernels::native_qsa_indexer_append(idx_raw + t * 128, step_t + strata::kernels::kStepPos, yb,
                                                                            (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                                                            strata::kernels::rope_scaling(), m.cs);
                             }

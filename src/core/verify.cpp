@@ -1647,13 +1647,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (dec_batch && !g_no_batch_kv && !batch_rec_) {
                         const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                         native_qsa_indexer_append_steps(idx_raw + tb * ID, step_ + tb * kStepCount + kStepPos, kStepCount,
-                                                        n, 0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                        n, ss.rope_level ? strata::kernels::kRopeYarnOff : 0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                                         rope_scaling(), ns);
                     } else {
                         for (int t = tb; t < te; ++t) {
                             const QsaState& sx = slot_ss(t).qsa_states[qi];
                             const QsaIndexerBuffers ib{sx.idx_tail, sx.idx_dead, sx.idx_pooled, sx.idx_block_pos};
-                            native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
+                            native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos,
+                                                      slot_ss(t).rope_level ? strata::kernels::kRopeYarnOff : 0,
                                                       (const float*) wikn->data, EPS, ib, s, sx.max_cells,
                                                       rope_scaling(), ns, row_rope ? pos_thw + t * 3 : nullptr);
                         }
@@ -2665,7 +2666,7 @@ bool Verifier::capture_commit(std::string& err) {
             }
             if (ok && fits && nq > 0) {
                 native_qsa_indexer_append_steps_layers(idx_raw_L_ + (size_t) qsa_index * MT * ID, MT * ID, commit_ + 2, 1,
-                                                       (int) MT, 0, EPS, il, nq, s, mc, rope_scaling(), cs_);
+                                                       (int) MT, ss.rope_level ? strata::kernels::kRopeYarnOff : 0, EPS, il, nq, s, mc, rope_scaling(), cs_);
                 qsa_batched = true;
             }
         }
@@ -2694,11 +2695,13 @@ bool Verifier::capture_commit(std::string& err) {
                 copy_from_mapped(st.idx_tail, tail_snap_ + (size_t) qsa_index * TS, TS, cs_);
                 const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                 if (!g_no_batch_kv) {
-                    native_qsa_indexer_append_steps(idx_raw_L_ + (size_t) qsa_index * MT * ID, commit_ + 2, 1, (int) MT, 0,
+                    native_qsa_indexer_append_steps(idx_raw_L_ + (size_t) qsa_index * MT * ID, commit_ + 2, 1, (int) MT,
+                                                    ss.rope_level ? strata::kernels::kRopeYarnOff : 0,
                                                     (const float*) wikn->data, EPS, ib, s, st.max_cells, rope_scaling(), cs_);
                 } else {
                     for (int64_t t = 0; t < MT; ++t)
-                        native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commit_ + 2 + t, 0,
+                        native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commit_ + 2 + t,
+                                                  ss.rope_level ? strata::kernels::kRopeYarnOff : 0,
                                                   (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                                   rope_scaling(), cs_);
                 }
@@ -2734,7 +2737,8 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     for (int t = 0; t < T; ++t) {
         h_tok_[t] = tokens[t];
         qsa_step_fill(h_step_ + t * kStepCount, pos0 + t, s);
-        const int32_t pos_t = (int32_t) (pos0 + t);
+        // the rotary position (STRATA_YARN_ELASTIC: a YaRN conversation's offset by kRopeYarnOff); the step keeps the cell
+        const int32_t pos_t = (int32_t) (pos0 + t) + (ss_->rope_level ? strata::kernels::kRopeYarnOff : 0);
         for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = pos_t;
         for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = pos_t;
         for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = pos_t;
@@ -3662,7 +3666,8 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                     for (int u = first; u < t; ++u)
                         native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + u) * ID,
                                                   commitb_ + (size_t) rows[first] * CB + 2 + (u - first),
-                                                  0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                  slots_[(size_t) rows[first]]->rope_level ? strata::kernels::kRopeYarnOff : 0,
+                                                  (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                                   rope_scaling(), cs_,
                                                   CB > 2 + MT ? commitb_ + (size_t) rows[first] * CB + 2 + MT + 3 * (u - first)
                                                               : nullptr);
@@ -3835,6 +3840,10 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
             int32_t* o = pthw + t * 3;
             o[0] = o[1] = o[2] = (int32_t) b0;
             if (rr[t]) rr[t]->at(b0, o);
+        }
+        if (slots_[(size_t) rows[t]]->rope_level) {   // STRATA_YARN_ELASTIC: this row's conversation is at YaRN
+            rp += strata::kernels::kRopeYarnOff;
+            if (row_rope) for (int c3 = 0; c3 < 3; ++c3) pthw[t * 3 + c3] += strata::kernels::kRopeYarnOff;
         }
         for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = rp;
         int32_t* pk = h_pos_ + (size_t) max_t_ * g.n_head;

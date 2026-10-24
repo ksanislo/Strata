@@ -2,6 +2,7 @@
 #include "strata/kernels/yarn_step.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/kv_q8.hpp"
+#include "strata/kernels/rope_scaling.hpp"
 
 #include <cuda_runtime.h>
 
@@ -87,6 +88,15 @@ __global__ void pooled_kernel(float* __restrict__ pooled, long long r0, long lon
     pooled[r * dim + t] = y;
 }
 
+__global__ void plain_rows_kernel(float* __restrict__ tab, long long p0, float theta_scale) {
+    const int pos = (int) (p0 + blockIdx.x), pair = threadIdx.x;
+    const float theta_extrap = pos * powf(theta_scale, float(pair));
+    float c, s;
+    rope_scaled_angle(theta_extrap, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, pair, c, s);
+    tab[(size_t) blockIdx.x * HALF * 4 + pair * 4] = c;
+    tab[(size_t) blockIdx.x * HALF * 4 + pair * 4 + 1] = s;
+}
+
 // the cells of blocks [b0, b1) that [p0, p0 + n) holds
 bool cell_range(int64_t b0, int64_t b1, int64_t p0, int64_t n, int64_t page_size, int64_t& c0, int64_t& c1) {
     c0 = std::max<int64_t>(b0 * page_size, p0);
@@ -112,6 +122,12 @@ void kv_f16_rerotate(uint16_t* k_pool, const int32_t* page_table, int64_t b0, in
     f16_kernel<<<dim3((unsigned) (c1 - c0), (unsigned) s.n_head_kv), ROT, 0, (cudaStream_t) stream>>>(
         k_pool, page_table, c0, p0, tab, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size);
     check("f16");
+}
+
+void rope_plain_rows(float* tab, int64_t p0, int64_t n, float theta_scale, void* stream) {
+    if (n <= 0) return;
+    plain_rows_kernel<<<(unsigned) n, HALF, 0, (cudaStream_t) stream>>>(tab, p0, theta_scale);
+    check("plain rows");
 }
 
 void idx_pooled_rerotate(float* pooled, int64_t r0, int64_t r1, int64_t p0, int64_t n, const float* tab, int dim,

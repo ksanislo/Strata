@@ -192,8 +192,8 @@ bool rope_table_enabled() {
 }
 }  // namespace
 void rope_table_force(bool on) { g_rope_table_forced = on; }
-void rope_table_set(const float* cos_tab, const float* sin_tab, int max_pos, const RopeScaling& scaling) {
-    rope_tab[mrope_dev()] = RopeReg{RopeTab{cos_tab, sin_tab, max_pos}, scaling};
+void rope_table_set(const float* cos_tab, const float* sin_tab, int max_pos, const RopeScaling& scaling, int min_pos) {
+    rope_tab[mrope_dev()] = RopeReg{RopeTab{cos_tab, sin_tab, max_pos, min_pos}, scaling};
 }
 void rope_table_release(const float* cos_tab) {
     // every device's entry that points at it (the caller may free it from another current device)

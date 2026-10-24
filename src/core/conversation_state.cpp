@@ -179,6 +179,7 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
     const size_t layers = owned_qsa(ss);
     c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
     c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
+    c.rope_level = ss.rope_level;
     if (!copy(c.gdn.data(), ss.gdn_state, c.gdn.size(), error) ||
         !copy(c.ple.data(), ss.ple_hist, c.ple.size(), error)) return false;
     for (size_t j = 0; j < layers; ++j) {
@@ -203,6 +204,7 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     ConversationStateSizes z;
     if (!conversation_session_sizes(g, ss, z, error)) return false;
     if (!sync(error)) return false;   // the copies below no longer ride the legacy stream's implicit ordering
+    ss.rope_level = c.rope_level;
     if (!copy(ss.gdn_state, c.gdn.data(), c.gdn.size(), error) ||
         !copy(ss.ple_hist, c.ple.data(), c.ple.size(), error)) return false;
     for (size_t j = 0; j < owned_qsa(ss); ++j) {

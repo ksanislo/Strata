@@ -106,8 +106,10 @@ __device__ __forceinline__ void append_body(const float* __restrict__ raw, const
                         // through cos(0) - which is exactly what the queries are scaled by, so the top-k is unmoved.
                         float c, s;
                         const int32_t* ts = ROW ? thw + (std::size_t) step_idx * 3 : nullptr;
-                        if (!(TAB && rope_tab_cs(rt, pos == 0 ? 0 : idx_rope_pos<ROW>(mtab, ts, rope_pos, pair), pair, c, s))) {
-                            const float theta_extrap = (pos == 0 ? 0 : idx_rope_pos<ROW>(mtab, ts, rope_pos, pair)) * powf(theta_scale, float(pair));
+                        // the spare's zero angle at its conversation's level (STRATA_YARN_ELASTIC: kRopeYarnOff)
+                        const int zp = (ROW ? __ldg(ts) : pos_base) >= kRopeYarnOff ? kRopeYarnOff : 0;
+                        if (!(TAB && rope_tab_cs(rt, pos == 0 ? zp : idx_rope_pos<ROW>(mtab, ts, rope_pos, pair), pair, c, s))) {
+                            const float theta_extrap = (pos == 0 ? zp : idx_rope_pos<ROW>(mtab, ts, rope_pos, pair)) * powf(theta_scale, float(pair));
                             rope_scaled_angle(theta_extrap, freq_scale, corr_low, corr_high, ext_factor, mscale, pair, c, s);
                         }
                         const float a = values[pair], z = values[pair + ROT / 2];
@@ -169,8 +171,9 @@ __device__ __forceinline__ float pooled_value(const float* values, int d, int ro
         // today's cosf/sinf; under linear/YaRN the pooled keys move with the cache's K, and the spare's zero
         // angle carries the mscale magnitude through cos(0) exactly as the single append's does.
         float c, s;
-        if (!(TAB && rope_tab_cs(rt, zero_pos ? 0 : mrope_pos(mtab, rope_pos, pair), pair, c, s))) {
-            const float theta_extrap = (zero_pos ? 0 : mrope_pos(mtab, rope_pos, pair)) * powf(theta_scale, float(pair));
+        // (zero_pos: rope_pos is the spare's zero angle at its level, 0 or kRopeYarnOff)
+        if (!(TAB && rope_tab_cs(rt, zero_pos ? rope_pos : mrope_pos(mtab, rope_pos, pair), pair, c, s))) {
+            const float theta_extrap = (zero_pos ? rope_pos : mrope_pos(mtab, rope_pos, pair)) * powf(theta_scale, float(pair));
             rope_scaled_angle(theta_extrap, freq_scale, corr_low, corr_high, ext_factor, mscale, pair, c, s);
         }
         const float a = values[pair], z = values[pair + ROT / 2];
@@ -193,7 +196,7 @@ template <bool TAB>
 __global__ void append_first(const float* __restrict__ raw, const float* __restrict__ gamma, float epsilon,
                              float* __restrict__ dead, float* __restrict__ pooled, float theta_scale,
                              float freq_scale, float corr_low, float corr_high, float ext_factor, float mscale,
-                             const int32_t* __restrict__ mtab, RopeTab rt) {
+                             const int32_t* __restrict__ mtab, RopeTab rt, int zero_rope) {
     const int d = threadIdx.x;
     __shared__ float values[D];
     __shared__ float partials[32];
@@ -210,7 +213,7 @@ __global__ void append_first(const float* __restrict__ raw, const float* __restr
     if (d < D) values[d] = scale * mean * gamma[d];
     __syncthreads();
     if (d >= D) return;
-    const float y = pooled_value<TAB>(values, d, 0, theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale,
+    const float y = pooled_value<TAB>(values, d, zero_rope, theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale,
                                  mtab, true, rt);
     pooled[d] = y;
     dead[d] = y;
@@ -373,10 +376,10 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
     if (p0 == 0) {
         if (rt.cos != nullptr)
             append_first<true><<<1, THREADS, 0, st>>>(raw, gamma, epsilon, b.dead, b.pooled, theta_scale,
-                                                      fsf, cl, ch, ef, ms, mtab, rt);
+                                                      fsf, cl, ch, ef, ms, mtab, rt, pos_base >= kRopeYarnOff ? kRopeYarnOff : 0);
         else
             append_first<false><<<1, THREADS, 0, st>>>(raw, gamma, epsilon, b.dead, b.pooled, theta_scale,
-                                                       fsf, cl, ch, ef, ms, mtab, rt);
+                                                       fsf, cl, ch, ef, ms, mtab, rt, pos_base >= kRopeYarnOff ? kRopeYarnOff : 0);
     }
     // completed blocks: those whose last cell (4b+3) lies in [p0, p0 + n)
     const int64_t first = p0 <= R - 1 ? 0 : (p0 - (R - 1) + R - 1) / R;       // the smallest b with 4b+3 >= p0
