@@ -4587,6 +4587,31 @@ struct Model::Impl {
         const size_t n = store->preload(list, leave);
         std::fprintf(stderr, "ds4: RAM store: %zu of the profile's hottest experts read in (%.1f GB) in %.1f s\n", n,
                      (double) n * (double) L[0].blob / 1e9, (now_ms() - t0) / 1000.0);
+        // the room left: the VRAM experts too, coldest first - the cache's moves hand them to the CPU lane, which then read them
+        // from the disk in its critical path (4x T4: 1.5 misses and 8 ms a token at 180 GB of store) - and the unprofiled ones,
+        // read behind the first tokens (prefetches: the first to give way).  DS4_STORE_PRELOAD_ALL=0: not.
+        if (!(std::getenv("DS4_STORE_PRELOAD_ALL") != nullptr && std::atoi(std::getenv("DS4_STORE_PRELOAD_ALL")) == 0)) {
+            std::vector<std::pair<double, std::pair<int, int>>> vram, cold;
+            for (const Layer& l : L) {
+                if (l.il >= g.nl) continue;
+                const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
+                for (int e = 0; e < l.n_exp; ++e)
+                    if (l.slot[(size_t) e] >= 0) vram.push_back({(double) p[e] / (double) l.blob, {l.il, e}});
+                    else if (p[e] == 0) cold.push_back({0.0, {l.il, e}});
+            }
+            std::stable_sort(vram.begin(), vram.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+            const size_t room = store->slots_max() > n + leave ? store->slots_max() - n - leave : 0;
+            size_t q = 0;
+            for (const auto* v : {&vram, &cold})
+                for (const auto& c : *v)
+                    if (q < room) {
+                        store->prefetch(c.second.first, c.second.second);
+                        ++q;
+                    }
+            if (q > 0)
+                std::fprintf(stderr, "ds4: RAM store: %zu more (the VRAM experts, coldest first, then the unprofiled) read behind "
+                                     "the first tokens (%.1f GB)\n", q, (double) q * (double) L[0].blob / 1e9);
+        }
     }
     // at a window boundary: the store's ready slots become the device's (zero-copy) experts, taken back when it needs the room;
     // each touched layer's whole table is written again (VRAM slots, the store's, 0), in stream order before the next window
