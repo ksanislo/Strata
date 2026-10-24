@@ -249,15 +249,21 @@ public:
                entries_.size() < slots_ && bytes() <= budget_ - held - incoming;
     }
 
+    // plain (STRATA_YARN_ELASTIC): a request that stays at plain RoPE takes a YaRN state only where it goes on with
+    // that conversation (its live state or deepest checkpoint), never one borrowed from inside it
     template<class Token>
-    Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec) const {
+    Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec,
+               bool plain = false) const {
         Match best;
         // Ties prefer the most recently parked branch. The caller prefers its
         // already-active state when that offers the same prefix length.
         for (size_t i = entries_.size(); i-- > 0;) {
             const auto& e = *entries_[i];
             if (e.cvec != cvec) continue;
+            size_t deepest = 0;
+            for (const auto& c : e.checkpoints) deepest = std::max(deepest, c.ids.size());
             auto consider = [&](const ConversationCheckpoint& c, bool live) {
+                if (plain && c.rope_level != 0 && !live && c.ids.size() < deepest) return;
                 const int64_t n = conversation_prefix(c, prompt, images);
                 if (n > best.tokens) best = {i, n, live, serials_[i]};
             };

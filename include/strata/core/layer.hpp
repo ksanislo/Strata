@@ -345,11 +345,14 @@ void qsa_rope_release(const float* cos_tab);
 void qsa_set_rope_yarn(const strata::kernels::RopeScaling* yarn);
 bool qsa_rope_yarn_fit(const QsaState& st, int64_t cells);
 int64_t qsa_rope_yarn_need(const QsaState& st, int64_t cells);
+/// No YaRN conversation is live: every YaRN table's chunks back to its card's slot budget (or freed).  Returns them.
+int64_t qsa_rope_yarn_trim();
 /// One conversation's stored keys from plain RoPE (as the kernels computed it) to the YaRN level, its first `cells`
 /// cells per state: host copies, VRAM pools or rings, the indexer's pooled keys and spare (a streamed ring refills).
-/// The states must be quiet; `stream` runs the work (synchronized before it returns).
+/// The states must be quiet; `stream` runs the work (synchronized before it returns).  `thw` (host, [cell][3]): a
+/// picture conversation's M-RoPE positions for every cell moved (null: each cell at its index).
 bool qsa_rope_move(const strata::kernels::QsaShapes& s, const std::vector<std::pair<const QsaState*, int64_t>>& states,
-                   void* stream);
+                   void* stream, const int32_t* thw = nullptr);
 /// What a checkpoint's spare (its `dead` rotary values, angle 0) is multiplied by at the move: cos(0) at YaRN.
 float qsa_rope_yarn_spare_scale();
 /// ... unpinned (and its pages given back) past the steps `cells` cells need, keeping the first step; the state's
