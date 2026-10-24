@@ -32,6 +32,12 @@ void iq128_down_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, c
 
 /// ggml's quantize_row_q8_K (x86 runs the scalar reference), byte-identical, in SSE4.2/AVX1: the older CPUs'
 /// copy of q8k_quant_avx2 (no 256-bit integer ops, no FMA).  q8k_quant_parity checks the bytes.
+/// The DeepSeek-V4.1 CPU lane's rows (src/dsv41/ds4_gg_cpu.cpp): out[t][r] = w_r . a[t] for IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18),
+/// IQ3_S (21) and IQ2_S (22) against Q8_K, with ggml's float order, so a token's dot is ggml-cpu's AVX vec_dot bit for bit at any
+/// number of tokens.  The caller checks cpu_avx1_ok().
+bool iq128x_supported(int ggml_type) noexcept;
+void iq128x_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
+                 float* const* out, int r0, int r1);
 void q8k_quant_avx1(const float* x, void* y, int64_t n);
 
 }  // namespace strata::kernels::cpu

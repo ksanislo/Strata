@@ -13,7 +13,7 @@
 // and a multi-token row bit for bit the same kernel's single-token row for that token (#152).
 //
 // Formats: gate/up IQ3_XXS (18), IQ3_S (21), IQ2_S (22), IQ4_XS (23); down IQ4_NL (20) and Q2_0 (42, the
-// fork's type).  IQ2_XXS/IQ2_XS have no layer in the packs that need this and stay on ggml-cpu's dot.
+// fork's type).  iq128x_rows (the DeepSeek CPU lane): IQ2_XXS (16), IQ2_XS (17), IQ3_XXS, IQ3_S, IQ2_S, ggml's AVX dot bit for bit.
 //
 // This file is compiled for SSE4.2 + AVX with AVX2/FMA/F16C explicitly off (CMakeLists.txt), and the engine
 // calls it only behind cpu_avx1_ok().  No static constructors at namespace scope (#391): the tables below
@@ -151,6 +151,40 @@ inline void rows_ahead(const uint8_t* blk, int pf) {
 // scales as TWO 16-value halves (g0/g1, s0/s1, c0/c1).
 template <int TY> struct Fmt128;
 
+template <> struct Fmt128<16> {   // IQ2_XXS: d, qs[32] u16 - a 32-value chunk is 4 grid bytes + a u32 of 4 x 7-bit sign index + 4-bit scale
+    static constexpr int bytes = 66;
+    static constexpr float K = 0.125f;
+    static inline void decode(const uint8_t* b, int j, int half,
+                              __m128i& g0, __m128i& g1, __m128i& s0, __m128i& s1, __m128i& c0, __m128i& c1) {
+        const uint8_t* q = b + 2 + 8 * (2 * j + half);
+        g0 = _mm_set_epi64x((long long) iq2xxs_grid[q[1]], (long long) iq2xxs_grid[q[0]]);
+        g1 = _mm_set_epi64x((long long) iq2xxs_grid[q[3]], (long long) iq2xxs_grid[q[2]]);
+        const uint32_t w = u32(q + 4);
+        s0 = _mm_set_epi64x((long long) even_signs.v[(w >> 7) & 127], (long long) even_signs.v[w & 127]);
+        s1 = _mm_set_epi64x((long long) even_signs.v[(w >> 21) & 127], (long long) even_signs.v[(w >> 14) & 127]);
+        c0 = c1 = _mm_set1_epi16((short) (2 * (int) (w >> 28) + 1));
+    }
+};
+
+template <> struct Fmt128<17> {   // IQ2_XS: d, qs[32] u16 (9-bit grid index + 7-bit sign index), scales[8] (a nibble per 16 values)
+    static constexpr int bytes = 74;
+    static constexpr float K = 0.125f;
+    static inline void decode(const uint8_t* b, int j, int half,
+                              __m128i& g0, __m128i& g1, __m128i& s0, __m128i& s1, __m128i& c0, __m128i& c1) {
+        const int c = 2 * j + half;
+        const uint64_t q = u64(b + 2 + 8 * c);
+        const uint32_t q0 = (uint32_t) q & 0xffff, q1 = (uint32_t) (q >> 16) & 0xffff;
+        const uint32_t q2 = (uint32_t) (q >> 32) & 0xffff, q3 = (uint32_t) (q >> 48);
+        g0 = _mm_set_epi64x((long long) iq2xs_grid[q1 & 511], (long long) iq2xs_grid[q0 & 511]);
+        g1 = _mm_set_epi64x((long long) iq2xs_grid[q3 & 511], (long long) iq2xs_grid[q2 & 511]);
+        s0 = _mm_set_epi64x((long long) even_signs.v[q1 >> 9], (long long) even_signs.v[q0 >> 9]);
+        s1 = _mm_set_epi64x((long long) even_signs.v[q3 >> 9], (long long) even_signs.v[q2 >> 9]);
+        const uint8_t sb = b[66 + c];
+        c0 = _mm_set1_epi16((short) (2 * (sb & 15) + 1));
+        c1 = _mm_set1_epi16((short) (2 * (sb >> 4) + 1));
+    }
+};
+
 template <> struct Fmt128<18> {   // IQ3_XXS: d, qs[64] grid bytes, 8 x u32 (4 x 7-bit sign index + 4-bit scale)
     static constexpr int bytes = 98;
     static constexpr float K = 0.25f;
@@ -236,6 +270,8 @@ inline __m128i madd_add(__m128i acc, __m128i g, __m128i sgn, __m128i yv, __m128i
     return _mm_add_epi32(acc, _mm_madd_epi16(_mm_maddubs_epi16(g, _mm_sign_epi8(yv, sgn)), sc));
 }
 
+constexpr int kXTok = 4;   // tokens a pass of iq128x_rows (more spill the 16 xmm registers)
+
 // ---- the row kernels (iq_avx2_rows.inl's row_dot in 128-bit lanes)
 template <int TY, int NT>
 inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
@@ -291,6 +327,70 @@ inline void dot_rows(const uint8_t* w, size_t row_bytes, int n, const void* cons
     for (int r = r0; r < r1; ++r) {
         row_dot<TY, NT>(w + (size_t) r * row_bytes, n / QK_K, y, res);
         for (int t = 0; t < NT; ++t) out[t][r] = res[t];
+    }
+}
+
+// ---- the DeepSeek-V4.1 CPU lane's rows (iq128x_rows): row_dot's integer sums (the same lanes as ggml's AVX dot: the first
+// and second 16 values of every 32-value chunk) with ggml's float order - acc = f16(d) * y.d * float(lanes) + acc in 256-bit
+// floats, no FMA, then K * hsum_float_8 - so each token's dot is ggml-cpu's AVX vec_dot bit for bit at any number of tokens
+template <int TY, int NT>
+inline void row_dot_x(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
+    const int pf = prefetch_distance();
+    __m256 accf[NT];
+    for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
+    for (int i = 0; i < nblocks; ++i) {
+        const uint8_t* blk = row + (size_t) i * Fmt128<TY>::bytes;
+        rows_ahead(blk, pf);
+        __m128i acci[NT][2];
+        for (int t = 0; t < NT; ++t) acci[t][0] = acci[t][1] = _mm_setzero_si128();
+        for (int j = 0; j < 4; ++j)
+            for (int half = 0; half < 2; ++half) {
+                __m128i g0, g1, s0, s1, c0, c1;
+                Fmt128<TY>::decode(blk, j, half, g0, g1, s0, s1, c0, c1);
+                const int off = 64 * j + 32 * half;
+                for (int t = 0; t < NT; ++t) {
+                    const uint8_t* q8 = (const uint8_t*) (y[t][i].qs + off);
+                    acci[t][0] = madd_add(acci[t][0], g0, s0, _mm_loadu_si128((const __m128i*) q8), c0);
+                    acci[t][1] = madd_add(acci[t][1], g1, s1, _mm_loadu_si128((const __m128i*) (q8 + 16)), c1);
+                }
+            }
+        const float dx = h2f(u16(blk));
+        for (int t = 0; t < NT; ++t) {
+            const __m256 f = _mm256_cvtepi32_ps(_mm256_insertf128_si256(_mm256_castsi128_si256(acci[t][0]), acci[t][1], 1));
+            accf[t] = _mm256_add_ps(_mm256_mul_ps(_mm256_set1_ps(dx * y[t][i].d), f), accf[t]);
+        }
+    }
+    for (int t = 0; t < NT; ++t) {
+        __m128 s = _mm_add_ps(_mm256_extractf128_ps(accf[t], 1), _mm256_castps256_ps128(accf[t]));   // ggml's hsum_float_8
+        s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+        s = _mm_add_ss(s, _mm_movehdup_ps(s));
+        res[t] = Fmt128<TY>::K * _mm_cvtss_f32(s);
+    }
+}
+
+template <int TY, int NT>
+void x_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0, int r1) {
+    const block_q8_K* y[NT];
+    for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
+    float res[NT];
+    for (int r = r0; r < r1; ++r) {
+        row_dot_x<TY, NT>(w + (size_t) r * row_bytes, n / QK_K, y, res);
+        for (int t = 0; t < NT; ++t) out[t][r] = res[t];
+    }
+}
+
+template <int TY>
+void x_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0, int r1) {
+    for (int t0 = 0; t0 < nt; t0 += kXTok) {
+        const int k = nt - t0 < kXTok ? nt - t0 : kXTok;
+        const void* const* a = act + t0;
+        float* const* o = out + t0;
+        switch (k) {
+            case 1: x_rows<TY, 1>(w, row_bytes, n, a, o, r0, r1); break;
+            case 2: x_rows<TY, 2>(w, row_bytes, n, a, o, r0, r1); break;
+            case 3: x_rows<TY, 3>(w, row_bytes, n, a, o, r0, r1); break;
+            default: x_rows<TY, 4>(w, row_bytes, n, a, o, r0, r1); break;
+        }
     }
 }
 
@@ -399,6 +499,20 @@ bool iq128_supported(int type) noexcept {
     // gate/up rows.  Its down rows (IQ4_NL/Q2_0) still take iq128_down_rows.  The kernel itself stays built
     // and parity-tested.
     return type == 18 || type == 21 || type == 22;
+}
+
+bool iq128x_supported(int type) noexcept { return type == 16 || type == 17 || type == 18 || type == 21 || type == 22; }
+
+void iq128x_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
+                 int r0, int r1) {
+    switch (type) {
+        case 16: x_rows_nt<16>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 17: x_rows_nt<17>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 18: x_rows_nt<18>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 21: x_rows_nt<21>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 22: x_rows_nt<22>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        default: break;
+    }
 }
 
 bool iq128_down_supported(int type) noexcept {
