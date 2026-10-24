@@ -297,9 +297,18 @@ __device__ __forceinline__ void decode_b(const uint8_t* __restrict__ b, int ib, 
         const uint8_t* qs = b + 48 + 32 * (ib >> 1);
         const uint8_t* qh = b + 16;
         const int sh = 4 * (ib & 1);
+        if ((((uintptr_t) b) & 15) == 0) {   // (176-byte blocks: every block 16-aligned when the row is) four 16-byte loads, not
+            const uint4 a0 = ((const uint4*) qs)[0], a1 = ((const uint4*) qs)[1];   // sixteen 4-byte ones - the same codes
+            const uint4 h0 = ((const uint4*) qh)[0], h1 = ((const uint4*) qh)[1];
+            const uint32_t qw[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+            const uint32_t hw[8] = {h0.x, h0.y, h0.z, h0.w, h1.x, h1.y, h1.z, h1.w};
 #pragma unroll
-        for (int t = 0; t < 8; ++t)
-            s.q[t] = (int) (((ld4(qs + 4 * t) >> sh) & 0x0f0f0f0fu) | (((ld4(qh + 4 * t) >> ib) & 0x01010101u) << 4));
+            for (int t = 0; t < 8; ++t) s.q[t] = (int) (((qw[t] >> sh) & 0x0f0f0f0fu) | (((hw[t] >> ib) & 0x01010101u) << 4));
+        } else {
+#pragma unroll
+            for (int t = 0; t < 8; ++t)
+                s.q[t] = (int) (((ld4(qs + 4 * t) >> sh) & 0x0f0f0f0fu) | (((ld4(qh + 4 * t) >> ib) & 0x01010101u) << 4));
+        }
         s.s0 = s.s1 = sc;
         s.d = h2f(b);
         s.m0 = s.m1 = h2f(b + 2) * (float) m;
