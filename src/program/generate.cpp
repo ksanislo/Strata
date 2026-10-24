@@ -3603,6 +3603,15 @@ int main(int argc, char** argv) {
     // past the original context (yarn_thr), then the configured YaRN (rope_cfg) for the rest of its life
     bool yarn_rows = false;
     int64_t yarn_thr = 0;
+    // how far a request reaches: a max_new that is the server's "the rest of the context" (no max_tokens sent) counts
+    // as 32768 (STRATA_YARN_ELASTIC_OUT), else every such request would reach past yarn_thr on a long context
+    const int64_t yarn_out = [] {
+        const char* e = std::getenv("STRATA_YARN_ELASTIC_OUT");
+        return e != nullptr && std::atoll(e) > 0 ? (int64_t) std::atoll(e) : (int64_t) 32768;
+    }();
+    auto yarn_reach = [&](int64_t n, int64_t max_new) {
+        return n + (n + max_new + 64 >= o.max_context ? std::min(max_new, yarn_out) : max_new);
+    };
     {
         using RST = strata::kernels::RopeScalingType;
         // an absent --rope-scaling (the empty default) leaves the type to the model file's rope keys,
@@ -12849,13 +12858,14 @@ int main(int argc, char** argv) {
         // sessions `sess` (every stage) and the drafter's K/V `draft` (null: none), holding `have` cells at plain: to
         // YaRN.  `cks`: the conversation's checkpoints (those of these cells move with them)
         auto yarn_move = [&](const std::vector<strata::core::SessionState*>& sess, const strata::core::QsaState* draft,
-                             int64_t have, std::vector<ConvCheckpoint>* cks, const char* who, std::string& e) -> bool {
+                             int64_t have, std::vector<ConvCheckpoint>* cks, const char* who, std::string& e,
+                             const int32_t* thw = nullptr) -> bool {
             const auto t0 = Clock::now();
             std::vector<std::pair<const strata::core::QsaState*, int64_t>> sts;
             for (const auto* u : sess)
                 for (int64_t j = 0; j < u->qsa_alloc; ++j) sts.push_back({&u->qsa_states[u->qsa_ord0 + j], have});
             if (draft != nullptr) sts.push_back({draft, have});
-            if (!strata::core::qsa_rope_move(strata::core::qsa_shapes(g), sts, nullptr)) {
+            if (!strata::core::qsa_rope_move(strata::core::qsa_shapes(g), sts, nullptr, thw)) {
                 e = "STRATA_YARN_ELASTIC: moving the conversation's K/V to YaRN failed";
                 return false;
             }
@@ -12882,6 +12892,14 @@ int main(int argc, char** argv) {
                          (long long) have, sts.size(), moved,
                          std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
             return true;
+        };
+        // a conversation went (back) to plain: with no session left at YaRN, the YaRN rows go back to the budget
+        auto yarn_trim = [&] {
+            if (!yarn_rows || ss.rope_level) return;
+            for (const auto& st : stages) if (st->ss.rope_level) return;
+            for (const auto& v : bslot_ss)
+                for (const auto& u : v) if (u->rope_level) return;
+            strata::core::qsa_rope_yarn_trim();
         };
         auto stage_verifier = [&](int k) -> strata::core::Verifier& { return k == 0 ? ver : stages[(size_t) k - 1]->ver; };
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
@@ -14780,9 +14798,13 @@ int main(int argc, char** argv) {
             }
             if (o.prompt_cache > 0 && !nan_flush && !sl.tainted && !sl.img && sl.cvec == cvec_cached) {
                 if (sl.cached && !fresh && pre(sl.ids)) j.resume = (int64_t) sl.ids.size();
+                // (STRATA_YARN_ELASTIC: one that stays plain skips a YaRN checkpoint below the slot's deepest)
+                const bool plain = yarn_rows && yarn_reach(n, j.r.max_new) <= yarn_thr;
+                size_t deepest = 0;
+                for (const ConvCheckpoint& c : sl.checks) deepest = std::max(deepest, c.ids.size());
                 for (const ConvCheckpoint& c : sl.checks)
                     if (c.imgs.empty() && c.stage_parts.size() == stages.size() && (int64_t) c.ids.size() > j.resume &&
-                        pre(c.ids)) {
+                        !(plain && c.rope_level != 0 && c.ids.size() < deepest) && pre(c.ids)) {
                         j.resume = (int64_t) c.ids.size();
                         j.ck = &c;
                     }
@@ -14791,12 +14813,12 @@ int main(int argc, char** argv) {
             if (yarn_rows) {   // the level it reads on at (a move runs at the set-up, with the slot's state restored)
                 const int from = j.resume == 0 ? 0 : j.ck != nullptr ? j.ck->rope_level : bslot_ss[0][(size_t) b]->rope_level;
                 // (a picture conversation is not moved: its cells sit at other positions than their index)
-                const bool want = n + j.r.max_new > yarn_thr && (j.resume == 0 || !j.r.img);
+                const bool want = yarn_reach(n, j.r.max_new) > yarn_thr && (j.resume == 0 || !j.r.img);
                 j.yarn_to = j.resume == 0 ? (want ? 1 : 0) : (from == 0 && want ? 1 : from);
                 j.yarn_mv = j.resume > 0 && from == 0 && j.yarn_to == 1;
                 if (j.yarn_to == 1)
                     std::fprintf(stderr, "strata batch: STRATA_YARN_ELASTIC: slot %d reaches %lld, resumes %lld at level %d -> 1\n",
-                                 b, (long long) (n + j.r.max_new), (long long) j.resume, from);
+                                 b, (long long) yarn_reach(n, j.r.max_new), (long long) j.resume, from);
                 for (size_t k = 0; j.yarn_to == 1 && k < bslot_ss.size(); ++k)
                     if (!yarn_fit(k, *bslot_ss[k][(size_t) b], n + 1, false)) {
                         if (adm_quiet && !adm_quiet()) return AdmEnd::fatal;
@@ -14971,6 +14993,7 @@ int main(int argc, char** argv) {
                                 return false;
                         } else {
                             for (auto* u : sx) u->rope_level = j.yarn_to;
+                            if (j.yarn_to == 0) yarn_trim();
                         }
                     }
                     j.ck = nullptr;
@@ -15495,6 +15518,7 @@ int main(int argc, char** argv) {
                                                who.c_str(), e2);
                             } else {
                                 for (auto* u : sx) u->rope_level = jr.yarn_to;
+                                if (jr.yarn_to == 0) yarn_trim();
                             }
                         }
                         strata::core::SessionState& x0 = *bslot_ss[0][b];
@@ -17025,10 +17049,18 @@ int main(int argc, char** argv) {
             }
             int64_t resume = 0;
             bool from_live = false;
+            // STRATA_YARN_ELASTIC: a request that stays plain resumes a YaRN state only where it goes on with that
+            // conversation (its live state, its deepest checkpoint), not from a shared start inside it
+            const bool yarn_plain = yarn_rows && yarn_reach(n, admit_slot >= 0 ? admit_max_new : max_new) <= yarn_thr;
+            auto yarn_skip = [&](const ConvCheckpoint& c, const std::vector<ConvCheckpoint>& all) {
+                if (!yarn_plain || c.rope_level == 0) return false;
+                for (const ConvCheckpoint& d : all) if (d.ids.size() > c.ids.size()) return true;
+                return false;
+            };
             if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
                 if (live_ok && starts_with(live, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
                 for (const ConvCheckpoint& c : checks)
-                    if ((int64_t) c.ids.size() > resume && starts_with(c.ids, c.imgs)) {
+                    if ((int64_t) c.ids.size() > resume && !yarn_skip(c, checks) && starts_with(c.ids, c.imgs)) {
                         resume = (int64_t) c.ids.size();
                         from_live = false;
                     }
@@ -17044,7 +17076,8 @@ int main(int argc, char** argv) {
                     if (bs[(size_t) b].cvec != cvec_cached || bs[(size_t) b].tainted) continue;   // (#879)
                     for (const ConvCheckpoint& c : bs[(size_t) b].checks) {
                         const int64_t L = (int64_t) c.ids.size();
-                        if (L > resume && L <= (int64_t) live.size() && starts_with(c.ids, c.imgs) &&
+                        if (L > resume && L <= (int64_t) live.size() && !yarn_skip(c, bs[(size_t) b].checks) &&
+                            starts_with(c.ids, c.imgs) &&
                             std::equal(c.ids.begin(), c.ids.end(), live.begin()) && imgs_below(live_imgs, L) == c.imgs) {
                             resume = L;
                             from_live = false;
@@ -17079,7 +17112,8 @@ int main(int argc, char** argv) {
                         slot_ck = nullptr;
                     }
                     for (const ConvCheckpoint& c : sl.checks)
-                        if ((int64_t) c.ids.size() > std::max(resume, slot_tokens) && starts_with(c.ids, c.imgs)) {
+                        if ((int64_t) c.ids.size() > std::max(resume, slot_tokens) && !yarn_skip(c, sl.checks) &&
+                            starts_with(c.ids, c.imgs)) {
                             slot_source = b;
                             slot_tokens = (int64_t) c.ids.size();
                             slot_ck = &c;
@@ -17123,12 +17157,12 @@ int main(int argc, char** argv) {
             int64_t from_disk = 0;
             if (sdir && o.prompt_cache > 0) {
                 for (auto& im : sdir->take_preloaded()) conversations.put(std::move(im));
-                const auto held_best = conversations.best(ids, req_imgs, want_cvec);
+                const auto held_best = conversations.best(ids, req_imgs, want_cvec, yarn_plain);
                 const std::vector<int32_t> ids32(ids.begin(), ids.end());   // the files hold 32-bit token ids
                 fetched = sdir->fetch(ids32, req_imgs, want_cvec, std::max({resume, slot_tokens, held_best.tokens}),
                                       from_disk);
             }
-            const auto parked = conversations.best(ids, req_imgs, want_cvec);
+            const auto parked = conversations.best(ids, req_imgs, want_cvec, yarn_plain);
             std::optional<strata::core::SavedConversation> incoming;
             int64_t incoming_tokens = 0;
             bool incoming_live = false;
@@ -18386,15 +18420,17 @@ int main(int argc, char** argv) {
                 std::vector<strata::core::SessionState*> sx{&ss};
                 for (auto& st : stages) sx.push_back(&st->ss);
                 // (a BGEN read the old way: the slot's own max_new, not the GEN 1 it was turned into)
-                const int64_t reach = n + (admit_slot >= 0 ? admit_max_new : max_new);
+                const int64_t reach = yarn_reach(n, admit_slot >= 0 ? admit_max_new : max_new);
                 const bool want = reach > yarn_thr;
                 if (want || ss.rope_level == 1)
                     std::fprintf(stderr, "strata serve: STRATA_YARN_ELASTIC: request reaches %lld, reads from %lld at level %d%s\n",
                                  (long long) reach, (long long) read_from, ss.rope_level, admit_slot >= 0 ? " (for a slot)" : "");
-                // (a picture's cells sit at other positions than their index: such a conversation is not moved)
-                if (read_from > 0 && ss.rope_level == 0 && want && req_imgs.empty() && live_imgs.empty()) {
+                // (a picture conversation's cells move at their (t, h, w), the positions this request just built)
+                const int32_t* thw = !mrope_identity && (int64_t) mrope_host.size() >= read_from * 3 ? mrope_host.data() : nullptr;
+                if (read_from > 0 && ss.rope_level == 0 && want && (thw != nullptr || (req_imgs.empty() && live_imgs.empty()))) {
                     std::string ye;
-                    if (!yarn_move(sx, use_mtp ? &mtp.kv_state() : nullptr, read_from, &checks, "the solo conversation", ye)) {
+                    if (!yarn_move(sx, use_mtp ? &mtp.kv_state() : nullptr, read_from, &checks,
+                                   thw != nullptr ? "the solo picture conversation" : "the solo conversation", ye, thw)) {
                         std::printf("ERR %s\n", ye.c_str());
                         return 1;
                     }
@@ -18402,6 +18438,7 @@ int main(int argc, char** argv) {
                 } else if (read_from == 0) {
                     for (auto* u : sx) u->rope_level = want ? 1 : 0;
                 }
+                if (ss.rope_level == 0) yarn_trim();
                 if (ss.rope_level == 1 && solo_vram_fit && !solo_vram_fit(n + 1)) {
                     std::printf("ERR no VRAM for the YaRN RoPE rows\n");
                     return 1;

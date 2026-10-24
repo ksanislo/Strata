@@ -1358,17 +1358,58 @@ int64_t qsa_rope_yarn_need(const QsaState& st, int64_t cells) {
     return r == nullptr || rope_target(*r, cells) <= r->cells ? 0 : rope_need(*r, cells);
 }
 
-bool qsa_rope_move(const QsaShapes& s, const std::vector<std::pair<const QsaState*, int64_t>>& states, void* stream) {
-    const int64_t P = 32768;   // positions per pass
+int64_t qsa_rope_yarn_trim() {
+    std::lock_guard<std::mutex> lk(g_rope_mu);
+    int64_t n = 0;
+    for (const RopeOwner& o : g_rope_owners) {
+        RopeGrow* r = o.yarn;
+        if (r == nullptr || r->cells == 0) continue;
+        const int dev = r->cos.device();
+        const strata::core::OnDevice on(dev);
+        cudaDeviceSynchronize();   // (a step that read the rows has finished)
+        const bool budget = qsa_slot_budget_chunks(dev, nullptr, nullptr) > 0;
+        for (strata::core::VmmRange* v : {&r->cos, &r->sin})
+            for (int64_t c = 0; c < v->chunks(); ++c)
+                if (const strata::core::VmmChunk h = v->unmap(c); h != 0) {
+                    if (budget) qsa_slot_budget_give(dev, h);
+                    else strata::core::vmm_chunk_free(h);
+                    ++n;
+                }
+        std::fprintf(stderr, "strata: CUDA%d's YaRN RoPE table given back (%lld positions; no YaRN conversation is live)\n",
+                     dev, (long long) r->cells);
+        r->cells = 0;
+    }
+    return n;
+}
+
+bool qsa_rope_move(const QsaShapes& s, const std::vector<std::pair<const QsaState*, int64_t>>& states, void* stream,
+                   const int32_t* thw) {
+    const int64_t P = 32768;   // cells per pass
     const size_t half = (size_t) (s.n_rot / 2);
     int64_t reach = 0;
     for (const auto& [st, cells] : states) reach = std::max(reach, cells);
     if (reach <= 0) return true;
+    // a pass's positions [pb, pb + m): its cells' own, or the span of a picture conversation's (t, h, w)
+    auto span = [&](int64_t p0, int64_t n, int64_t& pb) {
+        if (thw == nullptr) { pb = p0; return n; }
+        int64_t lo = INT64_MAX, hi = -1;
+        for (int64_t k = p0 * 3; k < (p0 + n) * 3; ++k) { lo = std::min<int64_t>(lo, thw[k]); hi = std::max<int64_t>(hi, thw[k]); }
+        pb = lo;
+        return hi - lo + 1;
+    };
+    int64_t M = 0;
+    for (int64_t p0 = 0, pb = 0; p0 < reach; p0 += P) M = std::max(M, span(p0, std::min(P, reach - p0), pb));
     float* tab = nullptr;
     float* tab_dev = nullptr;
-    if (cudaHostAlloc((void**) &tab, (size_t) P * half * 4 * sizeof(float), cudaHostAllocMapped | cudaHostAllocPortable) !=
-            cudaSuccess || cudaHostGetDevicePointer((void**) &tab_dev, tab, 0) != cudaSuccess) {
+    int32_t* pthw = nullptr;
+    int32_t* pthw_dev = nullptr;
+    if (cudaHostAlloc((void**) &tab, (size_t) M * half * 4 * sizeof(float), cudaHostAllocMapped | cudaHostAllocPortable) !=
+            cudaSuccess || cudaHostGetDevicePointer((void**) &tab_dev, tab, 0) != cudaSuccess ||
+        (thw != nullptr && (cudaHostAlloc((void**) &pthw, (size_t) P * 3 * sizeof(int32_t),
+                                          cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                            cudaHostGetDevicePointer((void**) &pthw_dev, pthw, 0) != cudaSuccess))) {
         std::fprintf(stderr, "strata: STRATA_YARN_ELASTIC: no pinned memory for the re-rotation table\n");
+        if (tab != nullptr) cudaFreeHost(tab);
         return false;
     }
     auto dev_of = [](const void* p) {
@@ -1377,13 +1418,16 @@ bool qsa_rope_move(const QsaShapes& s, const std::vector<std::pair<const QsaStat
     };
     const float theta_scale = powf((float) strata::kernels::rope_scaling().freq_base, -2.0f / (float) s.n_rot);
     cudaStream_t cs = (cudaStream_t) stream;
-    std::vector<float> nc((size_t) P * half), ns((size_t) P * half);
+    std::vector<float> nc((size_t) M * half), ns((size_t) M * half);
     bool ok = true;
     for (int64_t p0 = 0; ok && p0 < reach; p0 += P) {
         const int64_t n = std::min(P, reach - p0);
+        int64_t pb = 0;
+        const int64_t m = span(p0, n, pb);
+        if (pthw != nullptr) std::memcpy(pthw, thw + p0 * 3, (size_t) n * 3 * sizeof(int32_t));
         // the old rows exactly as the kernels computed them (plain), the new ones as the YaRN table holds them
-        strata::kernels::build_rope_table_range((int) s.n_rot, g_rope_yarn, (int) p0, (int) (p0 + n), nc.data(), ns.data());
-        for (size_t k = 0; k < (size_t) n * half; ++k) { tab[k * 4 + 2] = nc[k]; tab[k * 4 + 3] = ns[k]; }
+        strata::kernels::build_rope_table_range((int) s.n_rot, g_rope_yarn, (int) pb, (int) (pb + m), nc.data(), ns.data());
+        for (size_t k = 0; k < (size_t) m * half; ++k) { tab[k * 4 + 2] = nc[k]; tab[k * 4 + 3] = ns[k]; }
         int last = -1;
         for (const auto& [stp, cells] : states) {
             const QsaState& st = *stp;
@@ -1392,23 +1436,23 @@ bool qsa_rope_move(const QsaShapes& s, const std::vector<std::pair<const QsaStat
             if (dev < 0) { ok = false; break; }
             const strata::core::OnDevice on(dev);
             if (dev != last) {   // (the plain rows are written into the mapped table from this device, once a pass)
-                strata::kernels::rope_plain_rows(tab_dev, p0, n, theta_scale, cs);
+                strata::kernels::rope_plain_rows(tab_dev, pb, m, theta_scale, cs);
                 if (cudaStreamSynchronize(cs) != cudaSuccess) { ok = false; break; }
                 last = dev;
             }
             const int64_t nb = (cells + s.page_size - 1) / s.page_size;
             const int64_t lim = std::min<int64_t>(n, cells - p0);
-            if (st.host.k_q != nullptr) strata::kernels::kv_q8_rerotate(st.host.k_q, st.host.k_scale, nullptr, 0, nb, p0, lim, tab_dev, s, cs);
-            else if (st.host.k_pool != nullptr) strata::kernels::kv_f16_rerotate(st.host.k_pool, nullptr, 0, nb, p0, lim, tab_dev, s, cs);
+            if (st.host.k_q != nullptr) strata::kernels::kv_q8_rerotate(st.host.k_q, st.host.k_scale, nullptr, 0, nb, p0, lim, tab_dev, s, cs, pthw_dev, pb);
+            else if (st.host.k_pool != nullptr) strata::kernels::kv_f16_rerotate(st.host.k_pool, nullptr, 0, nb, p0, lim, tab_dev, s, cs, pthw_dev, pb);
             if (st.kv_mode != 1) {   // a streamed state's VRAM refills from its host copy (reset below)
                 const int64_t b0 = st.kv_mode == 2 ? std::max<int64_t>(0, nb - st.n_slots) : 0;
-                if (st.k_q != nullptr) strata::kernels::kv_q8_rerotate(st.k_q, st.k_scale, st.page_table, b0, nb, p0, lim, tab_dev, s, cs);
-                else if (st.k_pool != nullptr) strata::kernels::kv_f16_rerotate(st.k_pool, st.page_table, b0, nb, p0, lim, tab_dev, s, cs);
+                if (st.k_q != nullptr) strata::kernels::kv_q8_rerotate(st.k_q, st.k_scale, st.page_table, b0, nb, p0, lim, tab_dev, s, cs, pthw_dev, pb);
+                else if (st.k_pool != nullptr) strata::kernels::kv_f16_rerotate(st.k_pool, st.page_table, b0, nb, p0, lim, tab_dev, s, cs, pthw_dev, pb);
             }
             if (st.idx_pooled_rows > 2 && st.idx_pooled != nullptr) {
                 strata::kernels::idx_pooled_rerotate(st.idx_pooled, 0, std::min<int64_t>(cells / s.idx_block, st.idx_pooled_rows),
-                                                     p0, lim, tab_dev, (int) s.idx_dim, cs);
-                if (p0 == 0) strata::kernels::idx_pooled_rerotate(st.idx_dead, 0, 1, 0, 1, tab_dev, (int) s.idx_dim, cs);
+                                                     p0, lim, tab_dev, (int) s.idx_dim, cs, pthw_dev, pb);
+                if (p0 == 0) strata::kernels::idx_pooled_rerotate(st.idx_dead, 0, 1, 0, 1, tab_dev, (int) s.idx_dim, cs, nullptr, pb);
             }
             if (cudaStreamSynchronize(cs) != cudaSuccess) { ok = false; break; }
         }
@@ -1429,6 +1473,7 @@ bool qsa_rope_move(const QsaShapes& s, const std::vector<std::pair<const QsaStat
         ok = ok && cudaStreamSynchronize(cs) == cudaSuccess;
     }
     cudaFreeHost(tab);
+    if (pthw != nullptr) cudaFreeHost(pthw);
     return ok;
 }
 
