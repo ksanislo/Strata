@@ -3599,19 +3599,11 @@ int main(int argc, char** argv) {
     // NaN angle inside one of the twelve QSA layers.  Only the RANGES are checked - the config itself is
     // resolved after the model file has had its say, right before session_init.
     strata::kernels::RopeScaling rope_cfg;   // type filled here; the rest at the resolution below
-    // STRATA_YARN_ELASTIC=1 (with --rope-scaling yarn): each conversation runs plain RoPE until a request of it reaches
-    // past the original context (yarn_thr), then the configured YaRN (rope_cfg) for the rest of its life
+    // STRATA_YARN_ELASTIC=1 (with --rope-scaling yarn): each conversation runs plain RoPE until it is about to write past
+    // the original context (yarn_thr) - a prompt that long, or a reply crossing it - then the configured YaRN (rope_cfg)
+    // for the rest of its life
     bool yarn_rows = false;
     int64_t yarn_thr = 0;
-    // how far a request reaches: a max_new that is the server's "the rest of the context" (no max_tokens sent) counts
-    // as 32768 (STRATA_YARN_ELASTIC_OUT), else every such request would reach past yarn_thr on a long context
-    const int64_t yarn_out = [] {
-        const char* e = std::getenv("STRATA_YARN_ELASTIC_OUT");
-        return e != nullptr && std::atoll(e) > 0 ? (int64_t) std::atoll(e) : (int64_t) 32768;
-    }();
-    auto yarn_reach = [&](int64_t n, int64_t max_new) {
-        return n + (n + max_new + 64 >= o.max_context ? std::min(max_new, yarn_out) : max_new);
-    };
     {
         using RST = strata::kernels::RopeScalingType;
         // an absent --rope-scaling (the empty default) leaves the type to the model file's rope keys,
@@ -12840,8 +12832,8 @@ int main(int argc, char** argv) {
             }
             return true;
         };
-        // ---- STRATA_YARN_ELASTIC: a conversation's RoPE level, decided as a request of it starts reading.  It starts at
-        // the level its reach (prompt + max_new) needs; one at plain whose request reaches past yarn_thr is moved once
+        // ---- STRATA_YARN_ELASTIC: a conversation's RoPE level.  It starts at the level its prompt needs; one at plain is
+        // moved once - before a prompt past yarn_thr is read, or before its reply's window that would write past it -
         // (yarn_move: its K/V re-rotated, its checkpoints' spare rescaled) and stays at YaRN.
         // card k's YaRN rows backed for `cells` (the expert cache gives when the budget is short and `quiet` allows)
         auto yarn_fit = [&](size_t k, const strata::core::SessionState& u, int64_t cells, bool quiet) -> bool {
@@ -12901,6 +12893,47 @@ int main(int argc, char** argv) {
                 for (const auto& u : v) if (u->rope_level) return;
             strata::core::qsa_rope_yarn_trim();
         };
+        // slot b's next window writes below `need` (none of it in flight): a plain slot that would pass yarn_thr moves
+        // first, a YaRN one has its rows backed.  0: ready; 2: wait for a busy card; 1: it ended (no VRAM for the rows)
+        auto slot_yarn = [&](int b, int64_t need, const std::function<bool(size_t)>& quiet) -> int {
+            BSlot& sl = bs[(size_t) b];
+            const bool cross = bslot_ss[0][(size_t) b]->rope_level == 0;
+            if (!yarn_rows || (cross && need <= yarn_thr)) return 0;
+            const char* why = nullptr;
+            for (size_t k = 0; k < bslot_ss.size() && why == nullptr; ++k) {
+                const strata::core::SessionState& u = *bslot_ss[k][(size_t) b];
+                if (yarn_fit(k, u, need, false)) continue;
+                if (give_on && !quiet(k)) return 2;
+                if (!yarn_fit(k, u, need, true)) why = "no VRAM for its YaRN RoPE rows";
+            }
+            if (why == nullptr && cross) {
+                std::vector<strata::core::SessionState*> sx;
+                for (size_t k = 0; k < bslot_ss.size(); ++k) sx.push_back(bslot_ss[k][(size_t) b].get());
+                // (a picture conversation's cells move at the positions its windows read: the slot's own, else the index)
+                std::vector<int32_t> thw;
+                if (const auto rr = strata::kernels::slot_rope_enabled() ? strata::kernels::slot_rope_get(b) : nullptr) {
+                    thw.resize((size_t) sl.p * 3);
+                    for (int64_t c = 0; c < sl.p; ++c) rr->at(c, thw.data() + c * 3);
+                }
+                strata::core::MtpDrafter* dr = batch_mtp ? slot_mtp[(size_t) b].get() : nullptr;
+                const std::string who = "slot " + std::to_string(b) + "'s reply";
+                std::string e;
+                if (!yarn_move(sx, dr != nullptr ? &dr->kv_state() : nullptr, sl.p, &sl.checks, who.c_str(), e,
+                               thw.empty() ? nullptr : thw.data())) {
+                    std::fprintf(stderr, "strata batch: %s\n", e.c_str());
+                    why = "its move to YaRN failed";
+                    sl.tainted = true;
+                }
+            }
+            if (why == nullptr) return 0;
+            std::fprintf(stderr, "strata batch: STRATA_YARN_ELASTIC: slot %d ends at %lld tokens: %s\n", b, (long long) sl.p, why);
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+            std::printf("BDONE %d %lld length %.1f\n", b, (long long) sl.produced, ms);
+            std::fflush(stdout);
+            sl.active = false;
+            sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
+            return 1;
+        };
         auto stage_verifier = [&](int k) -> strata::core::Verifier& { return k == 0 ? ver : stages[(size_t) k - 1]->ver; };
         // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
         // so it keeps the conversation it holds
@@ -12922,11 +12955,15 @@ int main(int argc, char** argv) {
                 return false;
             }
             std::vector<uint8_t> e_hold(bs.size(), 0);
-            if (eslots_on) {
-                const std::function<bool(size_t)> none = [](size_t) { return false; };
+            const std::function<bool(size_t)> none = [](size_t) { return false; };
+            if (eslots_on)
                 for (size_t k = 0; k < bslot_ss.size(); ++k) elastic_idle(k, !in_prompt_read, -1);
+            for (int b = 0; b < (int) bs.size(); ++b)
+                if (bs[(size_t) b].active)
+                    e_hold[(size_t) b] = slot_yarn(b, bs[(size_t) b].p + (batch_mtp ? 3 : 2), in_prompt_read ? none : all_quiet) == 2;
+            if (eslots_on) {
                 for (int b = 0; b < (int) bs.size(); ++b)
-                    if (bs[(size_t) b].active)
+                    if (bs[(size_t) b].active && !e_hold[(size_t) b])
                         e_hold[(size_t) b] = slot_grow_or_end(b, bs[(size_t) b].p + (batch_mtp ? 3 : 2),
                                                               in_prompt_read ? none : all_quiet) == 2;
             }
@@ -13859,14 +13896,23 @@ int main(int argc, char** argv) {
                     }
                     if (pick < 0) continue;
                     rr = pick + 1;
-                    if (eslots_on) {   // its rows' slots backed on every stage before the window starts (pad rows: cell 0)
-                        bool wait = false;   // (STRATA_PIPED_MTP: a slot's window may also write its drafts' cells)
+                    // its rows' slots backed on every stage before the window starts (pad rows: cell 0)
+                    // (STRATA_PIPED_MTP: a slot's window may also write its drafts' cells; STRATA_FAST_LANE: a lane
+                    // slot's whole window)
+                    auto g_need = [&](int t) {
+                        const BSlot& sl = bs[(size_t) gm(pick, t)];
+                        return sl.p + 2 + (sl.lane ? (int) strata::kernels::kVerifyMaxT : piped_mtp ? pm_drafts : 0);
+                    };
+                    if (yarn_rows) {
+                        bool wait = false;
                         for (int t = 0; t < GS; ++t)
-                            if (bs[(size_t) gm(pick, t)].active)   // (STRATA_FAST_LANE: a lane slot's whole window)
-                                wait = slot_grow_or_end(gm(pick, t), bs[(size_t) gm(pick, t)].p + 2 +
-                                                        (bs[(size_t) gm(pick, t)].lane ? (int) strata::kernels::kVerifyMaxT
-                                                         : piped_mtp ? pm_drafts : 0),
-                                                        stage_quiet) == 2 || wait;
+                            if (bs[(size_t) gm(pick, t)].active) wait = slot_yarn(gm(pick, t), g_need(t), stage_quiet) == 2 || wait;
+                        if (wait || !group_active(pick)) continue;
+                    }
+                    if (eslots_on) {
+                        bool wait = false;
+                        for (int t = 0; t < GS; ++t)
+                            if (bs[(size_t) gm(pick, t)].active) wait = slot_grow_or_end(gm(pick, t), g_need(t), stage_quiet) == 2 || wait;
                         if (wait || !group_active(pick)) continue;   // (a card to give room is busy: the group starts later)
                     }
                     PGroup& G = pg[(size_t) pick];
@@ -14799,7 +14845,7 @@ int main(int argc, char** argv) {
             if (o.prompt_cache > 0 && !nan_flush && !sl.tainted && !sl.img && sl.cvec == cvec_cached) {
                 if (sl.cached && !fresh && pre(sl.ids)) j.resume = (int64_t) sl.ids.size();
                 // (STRATA_YARN_ELASTIC: one that stays plain skips a YaRN checkpoint below the slot's deepest)
-                const bool plain = yarn_rows && yarn_reach(n, j.r.max_new) <= yarn_thr;
+                const bool plain = yarn_rows && n <= yarn_thr;
                 size_t deepest = 0;
                 for (const ConvCheckpoint& c : sl.checks) deepest = std::max(deepest, c.ids.size());
                 for (const ConvCheckpoint& c : sl.checks)
@@ -14813,12 +14859,12 @@ int main(int argc, char** argv) {
             if (yarn_rows) {   // the level it reads on at (a move runs at the set-up, with the slot's state restored)
                 const int from = j.resume == 0 ? 0 : j.ck != nullptr ? j.ck->rope_level : bslot_ss[0][(size_t) b]->rope_level;
                 // (a picture conversation is not moved: its cells sit at other positions than their index)
-                const bool want = yarn_reach(n, j.r.max_new) > yarn_thr && (j.resume == 0 || !j.r.img);
+                const bool want = n > yarn_thr && (j.resume == 0 || !j.r.img);
                 j.yarn_to = j.resume == 0 ? (want ? 1 : 0) : (from == 0 && want ? 1 : from);
                 j.yarn_mv = j.resume > 0 && from == 0 && j.yarn_to == 1;
                 if (j.yarn_to == 1)
-                    std::fprintf(stderr, "strata batch: STRATA_YARN_ELASTIC: slot %d reaches %lld, resumes %lld at level %d -> 1\n",
-                                 b, (long long) yarn_reach(n, j.r.max_new), (long long) j.resume, from);
+                    std::fprintf(stderr, "strata batch: STRATA_YARN_ELASTIC: slot %d's prompt is %lld tokens, resumes %lld at level %d -> 1\n",
+                                 b, (long long) n, (long long) j.resume, from);
                 for (size_t k = 0; j.yarn_to == 1 && k < bslot_ss.size(); ++k)
                     if (!yarn_fit(k, *bslot_ss[k][(size_t) b], n + 1, false)) {
                         if (adm_quiet && !adm_quiet()) return AdmEnd::fatal;
@@ -17051,7 +17097,7 @@ int main(int argc, char** argv) {
             bool from_live = false;
             // STRATA_YARN_ELASTIC: a request that stays plain resumes a YaRN state only where it goes on with that
             // conversation (its live state, its deepest checkpoint), not from a shared start inside it
-            const bool yarn_plain = yarn_rows && yarn_reach(n, admit_slot >= 0 ? admit_max_new : max_new) <= yarn_thr;
+            const bool yarn_plain = yarn_rows && n <= yarn_thr;
             auto yarn_skip = [&](const ConvCheckpoint& c, const std::vector<ConvCheckpoint>& all) {
                 if (!yarn_plain || c.rope_level == 0) return false;
                 for (const ConvCheckpoint& d : all) if (d.ids.size() > c.ids.size()) return true;
@@ -18416,15 +18462,36 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: pin=%lld: the cache has no checkpoint there to pin (it resumed from "
                                  "%lld)\n", (long long) req_pin, (long long) read_from);
             }
+            // STRATA_YARN_ELASTIC: the YaRN rows for every cell this request can reach (as the plain ones were backed)
+            auto solo_yarn_rows = [&]() -> bool {
+                const int64_t cells = std::min<int64_t>(o.max_context, n + max_new + 64);
+                if (solo_vram_fit) return solo_vram_fit(cells);
+                bool ok = true;
+                for (size_t k = 0; k <= stages.size(); ++k) {
+                    const strata::core::SessionState& u = k == 0 ? ss : stages[k - 1]->ss;
+                    if (u.qsa_alloc > 0) ok = ok && strata::core::qsa_rope_yarn_fit(u.qsa_states[u.qsa_ord0], cells);
+                }
+                return ok;
+            };
+            // a plain reply about to write past yarn_thr moves first: its `p` cells (between windows: none in flight)
+            auto yarn_cross = [&](int64_t p, std::string& e) -> bool {
+                std::vector<strata::core::SessionState*> sx{&ss};
+                for (auto& st : stages) sx.push_back(&st->ss);
+                const int32_t* thw = !mrope_identity && (int64_t) mrope_host.size() >= p * 3 ? mrope_host.data() : nullptr;
+                if (!yarn_move(sx, use_mtp ? &mtp.kv_state() : nullptr, p, &checks,
+                               thw != nullptr ? "the solo picture reply" : "the solo reply", e, thw))
+                    return false;
+                conversations.limit_reuse(0);
+                if (!solo_yarn_rows()) { e = "no VRAM for the YaRN RoPE rows"; return false; }
+                return true;
+            };
             if (yarn_rows) {   // STRATA_YARN_ELASTIC: the level this request reads on at
                 std::vector<strata::core::SessionState*> sx{&ss};
                 for (auto& st : stages) sx.push_back(&st->ss);
-                // (a BGEN read the old way: the slot's own max_new, not the GEN 1 it was turned into)
-                const int64_t reach = yarn_reach(n, admit_slot >= 0 ? admit_max_new : max_new);
-                const bool want = reach > yarn_thr;
+                const bool want = n > yarn_thr;   // (a reply that crosses it moves as it does: yarn_cross)
                 if (want || ss.rope_level == 1)
-                    std::fprintf(stderr, "strata serve: STRATA_YARN_ELASTIC: request reaches %lld, reads from %lld at level %d%s\n",
-                                 (long long) reach, (long long) read_from, ss.rope_level, admit_slot >= 0 ? " (for a slot)" : "");
+                    std::fprintf(stderr, "strata serve: STRATA_YARN_ELASTIC: prompt of %lld tokens, reads from %lld at level %d%s\n",
+                                 (long long) n, (long long) read_from, ss.rope_level, admit_slot >= 0 ? " (for a slot)" : "");
                 // (a picture conversation's cells move at their (t, h, w), the positions this request just built)
                 const int32_t* thw = !mrope_identity && (int64_t) mrope_host.size() >= read_from * 3 ? mrope_host.data() : nullptr;
                 if (read_from > 0 && ss.rope_level == 0 && want && (thw != nullptr || (req_imgs.empty() && live_imgs.empty()))) {
@@ -18439,7 +18506,7 @@ int main(int argc, char** argv) {
                     for (auto* u : sx) u->rope_level = want ? 1 : 0;
                 }
                 if (ss.rope_level == 0) yarn_trim();
-                if (ss.rope_level == 1 && solo_vram_fit && !solo_vram_fit(n + 1)) {
+                if (ss.rope_level == 1 && !solo_yarn_rows()) {
                     std::printf("ERR no VRAM for the YaRN RoPE rows\n");
                     return 1;
                 }
@@ -18933,7 +19000,9 @@ int main(int argc, char** argv) {
             const bool pl_want = pipe && pl_pw >= 2 && pl_snap_ok;
             const char* pl_serial = !pl_want ? nullptr
                                   : hist_n > 0 ? "repetition penalties (penalty_last_n)"
-                                  : mtp.coupled() ? "coupled draft sampling" : nullptr;
+                                  : mtp.coupled() ? "coupled draft sampling"
+                                  : yarn_rows && ss.rope_level == 0 && n + max_new > yarn_thr
+                                      ? "a plain conversation that may pass the YaRN threshold (STRATA_YARN_ELASTIC)" : nullptr;
             if (pl_serial != nullptr) {   // said once per reason
                 static std::set<std::string> said;
                 if (said.insert(pl_serial).second)
@@ -19618,6 +19687,10 @@ int main(int argc, char** argv) {
                 const bool timed_round = !first_window;
                 const Clock::time_point round0 = Clock::now();
                 if (p + T > o.max_context) break;
+                if (yarn_rows && ss.rope_level == 0 && p + T > yarn_thr && !yarn_cross(p, err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
                 window[0] = x;
                 for (int i = 1; i < T_mtp; ++i)
                     window[(size_t) i] = merged     ? (int32_t) ids[(size_t) (p + i)]
