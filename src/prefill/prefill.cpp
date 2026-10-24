@@ -1025,6 +1025,7 @@ struct Prefill::Impl {
     PrefillStats* stats = nullptr;
     // KV streaming: one layer's whole K/V, staged from the host copy per layer and chunk (identity layout)
     strata::kernels::KvHostPools stage;
+    int64_t stage_want = 0, stage_cells = 0;   // the staging's cells to lay out (0: every page) and laid out
     int32_t* ident_table = nullptr;
     cudaStream_t kv_copy = nullptr;
     cudaEvent_t kv_released = nullptr, kv_ready = nullptr;
@@ -1058,15 +1059,24 @@ namespace {
 // streamed run lends the prompt path exactly the slots a resident one does (a lent expert runs on the CPU, which
 // rounds differently: without this an A/B compares two expert placements as well as two KV placements)
 bool stage_own() { static const bool v = std::getenv("STRATA_KV_STAGE_OWN") != nullptr; return v; }
+// STRATA_KV_STAGE_REACH=0: every loan stages the whole --max-context (0.2's), not the read's reach
+bool stage_reach_off() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_KV_STAGE_REACH"); return e && e[0] == '0'; }();
+    return v;
+}
+// `cells`: the pages it holds cover this many cells (0: every page of the layer)
+int64_t stage_pages(const core::QsaState& q0, const strata::kernels::QsaShapes& s, int64_t cells) {
+    return cells <= 0 ? q0.n_pages : std::min<int64_t>(q0.n_pages, (cells + s.page_size - 1) / s.page_size);
+}
 void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::kernels::QsaShapes& s,
-                strata::kernels::KvHostPools& st, bool& ok) {
+                strata::kernels::KvHostPools& st, bool& ok, int64_t cells) {
     const core::QsaState& q0 = ss.qsa_states[ss.qsa_primary()];
     if (q0.kv_mode != 1) return;
     if (stage_own() && o_borrowed.count_only) return;
     Alloc own;
     own.owned = o_borrowed.owned;
     Alloc& o = stage_own() ? own : o_borrowed;
-    const size_t rows = (size_t) q0.n_pages * s.n_head_kv * s.page_size;
+    const size_t rows = (size_t) stage_pages(q0, s, cells) * s.n_head_kv * s.page_size;
     if (q0.kv_hybrid) {   // K8V4: the three runs of kKvHybrid; pools_of() then reads as the hybrid pools (mode 3)
         st.k_q = o.take<int8_t>(rows * s.head_dim, ok);
         st.k_scale = o.take<uint16_t>(rows * (s.head_dim / 64), ok);
@@ -1756,13 +1766,18 @@ bool Prefill::carve(size_t T, void* alloc) {
     }
     m.ple_emb = o.take<float>(T * N, ok);
     m.ple_norm = o.take<float>((size_t) strata::kernels::NG_HC_DIM, ok);
-    take_stage(o, ss, s, m.stage, ok);
+    take_stage(o, ss, s, m.stage, ok, m.stage_want);
+    {
+        const core::QsaState& q0 = ss.qsa_states[ss.qsa_primary()];
+        m.stage_cells = q0.kv_mode == 1 ? stage_pages(q0, s, m.stage_want) * s.page_size : 0;
+    }
     m.T = (int64_t) T;
     return ok;
 }
 
-bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err) {
+bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err, int64_t stage_cells) {
     Impl& m = *impl_;
+    m.stage_want = stage_cells;
     if (m.borrow_spill) {
         err = "prefill: a hybrid borrowed/owned layout cannot be changed between requests";
         return false;
@@ -1798,6 +1813,13 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 }
 
 int64_t Prefill::chunk() const { return impl_->T; }
+int64_t Prefill::stage_cells() const { return impl_->stage_cells; }
+int64_t Prefill::stage_cells_for(const core::SessionState& ss, int64_t reach) {
+    const int64_t full = ss.qsa_states[ss.qsa_primary()].max_cells;
+    if (reach <= 0 || stage_reach_off()) return 0;
+    const int64_t base = 262144, step = 131072;
+    return reach <= base ? std::min(full, base) : std::min(full, (reach + step - 1) / step * step);
+}
 
 void Prefill::set_session(core::SessionState& ss) { if (impl_ != nullptr) impl_->ss = &ss; }
 core::SessionState& Prefill::session() const { return *impl_->ss; }
@@ -2422,8 +2444,9 @@ int64_t Prefill::chain_experts_cpu() const {
     return sum;
 }
 
-uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool src) {
-    return bytes_needed_impl(g, ss, chunk, false, src);
+uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool src,
+                               int64_t stage_cells) {
+    return bytes_needed_impl(g, ss, chunk, false, src, stage_cells);
 }
 
 // What `init` really allocates when the prompt path owns its buffers (no loan): every cudaMalloc rounds up to a 2 MiB
@@ -2434,7 +2457,7 @@ uint64_t Prefill::bytes_needed_owned(const core::ModelGeometry& g, const core::S
 }
 
 uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
-                                    bool owned_pages, bool src) {
+                                    bool owned_pages, bool src, int64_t stage_cells) {
     // the same allocation sequence as `init` (`carve`), counted - with the MoE layout `carve` picks for the same source
     const size_t T = (size_t) chunk;
     bool ok = true;
@@ -2484,7 +2507,7 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     f(T * N);
     f((size_t) strata::kernels::NG_HC_DIM);
     strata::kernels::KvHostPools stage;
-    take_stage(o, ss, s, stage, ok);
+    take_stage(o, ss, s, stage, ok, stage_cells);
     return o.used + (8u << 20);   // alignment slack
 }
 
@@ -3069,6 +3092,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         for (int64_t t = 0; t < T; ++t) { prev[0] = prev[1]; prev[1] = (int32_t) tokens[c0 + t]; }
         // the chunk's segments: the run itself, or a batch's prompts (each its own positions and sequence state)
         const std::vector<RunSeg> segv = bat ? bsegs : std::vector<RunSeg>{RunSeg{&ss, 0, T, p0, {prev[0], prev[1]}}};
+        // the K/V staging holds the cells its loan was laid out for: a segment reaching past them is refused, never read
+        for (const RunSeg& sg : segv)
+            if (m.stage_cells > 0 && sg.ss->qsa_states[sg.ss->qsa_primary()].kv_mode == 1 && sg.p0 + sg.n > m.stage_cells) {
+                err = "prefill: the K/V staging holds " + std::to_string(m.stage_cells) + " cells, the chunk reaches " +
+                      std::to_string(sg.p0 + sg.n) + " (its loan was laid out for a shorter read)";
+                return false;
+            }
         // ---- the QSA step records of every position in the chunk
         for (const RunSeg& sg : segv)
             for (int64_t t = sg.r0; t < sg.r0 + sg.n; ++t)
