@@ -3597,6 +3597,7 @@ int main(int argc, char** argv) {
     // NaN angle inside one of the twelve QSA layers.  Only the RANGES are checked - the config itself is
     // resolved after the model file has had its say, right before session_init.
     strata::kernels::RopeScaling rope_cfg;   // type filled here; the rest at the resolution below
+    constexpr int64_t kSoloPinAhead = 32768;   // STRATA_KV_HOST_ELASTIC: the solo reply's cells pinned ahead of it
     {
         using RST = strata::kernels::RopeScalingType;
         // an absent --rope-scaling (the empty default) leaves the type to the model file's rope keys,
@@ -5963,6 +5964,15 @@ int main(int argc, char** argv) {
     // STRATA_KV_VRAM_ELASTIC: the solo session's VRAM pools and pooled keys for `cells` (every stage), the expert cache
     // giving the budget room when it is short; set where the elastic slots' give is (null: nothing to grow)
     std::function<bool(int64_t)> solo_vram_fit;
+    // no RAM left to pin a conversation's context: one idle conversation parked (its pinned copy given back), else the
+    // RAM conversation cache's oldest dropped.  0: room was made, try again; 1: nothing left to give; 2: not now (a read
+    // or windows in flight).  `keep`: the slot asking (-1: the solo session).  Set with the batch slots
+    std::function<int(int)> ram_reclaim;
+    auto solo_host_fit_r = [&](int64_t cells) -> bool {
+        while (!solo_host_fit(cells))
+            if (!strata::core::qsa_host_pin_failed() || !ram_reclaim || ram_reclaim(-1) != 0) return false;
+        return true;
+    };
     // (the host copies only: the VRAM ring's residency map may name any of its slots, so the solo session's VRAM pools
     // keep what they grew to - a slot trims its own only with its state reset)
     auto solo_host_trim = [&](int64_t cells) {
@@ -12678,23 +12688,31 @@ int main(int argc, char** argv) {
         // a decoding slot whose next window would need memory the budget does not have ends there (`length`); its state
         // is whole (no window of it is in flight), so it stays a cache
         // 0: backed; 2: wait for a busy card (the caller tries again later); 1: it ended
+        bool ram_short = false;   // a slot waits for RAM an idle conversation can give once nothing is in flight
         auto slot_grow_or_end = [&](int b, int64_t need, const std::function<bool(size_t)>& quiet) -> int {
             BSlot& sl = bs[(size_t) b];
             bool backed = true;
             for (const auto& v : bslot_ss) backed = backed && (v[(size_t) b]->slot_cells < 0 || need <= v[(size_t) b]->slot_cells);
             if (backed) return 0;
-            const int r = slot_fit(b, need, false, quiet);
+            int r = slot_fit(b, need, false, quiet);
+            while (r == 1 && strata::core::qsa_host_pin_failed() && ram_reclaim) {   // RAM: idle conversations give theirs
+                const int q = ram_reclaim(b);
+                if (q == 2) { ram_short = true; return 2; }   // (no group starts until the pipeline drains)
+                if (q == 1) break;
+                r = slot_fit(b, need, false, quiet);
+            }
             if (r == 0) {
                 std::fprintf(stderr, "strata batch: elastic slot %d grows at %lld cells: %s\n", b, (long long) need,
                              slot_mem_note(b).c_str());
                 return 0;
             }
             if (r == 2) return 2;
+            const bool ram = strata::core::qsa_host_pin_failed();
             std::fprintf(stderr, "strata batch: elastic slot %d ends at %lld tokens: %s\n", b, (long long) sl.p,
-                         strata::core::qsa_host_pin_failed() ? "no RAM is left to pin its context (STRATA_KV_HOST_ELASTIC)"
-                                                             : "the slot budget has no room to grow (STRATA_ELASTIC_SLOTS_MIB)");
+                         ram ? "no RAM is left to pin its context, and no idle conversation is left to give it (STRATA_KV_HOST_ELASTIC)"
+                             : "the slot budget has no room to grow (STRATA_ELASTIC_SLOTS_MIB)");
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
-            std::printf("BDONE %d %lld length %.1f\n", b, (long long) sl.produced, ms);
+            std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, ram ? "ram" : "length", ms);
             std::fflush(stdout);
             sl.active = false;
             sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
@@ -13731,6 +13749,7 @@ int main(int argc, char** argv) {
                     if (pick < 0) continue;
                 } else {
                     if (!may_start || share_live) continue;   // (a read holds the pools: STRATA_SHORT_READS)
+                    if (ram_short && pipe_inflight()) continue;   // (a slot waits for RAM: the groups drain first)
                     // (STRATA_FAST_LANE: a group with a lane read first)
                     auto lane_in = [&](int gi) {
                         for (int t = 0; t < GS; ++t)
@@ -15989,6 +16008,63 @@ int main(int argc, char** argv) {
             kmem_note();
             return true;
         };
+        ram_reclaim = [&](int keep) -> int {
+            if (conc_serving || in_prompt_read || share_live || cy_held_n > 0 || adm_active || pipe_inflight()) return 2;
+            ram_short = false;
+            // the idle conversation used longest ago that holds more than its first cells
+            int j = -1;
+            for (int b = 0; b < (int) bs.size(); ++b) {
+                const BSlot& sl = bs[(size_t) b];
+                if (b == keep || b == admit_slot || sl.active || sl.reading || sl.partial || adm_queued[(size_t) b] ||
+                    adm_paused[(size_t) b] || adm_reading == b || adm_stop_of[(size_t) b] != nullptr)
+                    continue;
+                bool big = false;
+                for (const auto& v : bslot_ss) big = big || v[(size_t) b]->slot_cells > 1;
+                if (big && (j < 0 || sl.t0 < bs[(size_t) j].t0)) j = b;
+            }
+            const double pinned0 = (double) strata::core::qsa_kv_host_bytes() / 1073741824.0;
+            if (j >= 0) {
+                BSlot& sj = bs[(size_t) j];
+                const size_t held = sj.ids.size();
+                if (sj.cached) (void) persist_slot(j, false, {}, false, "it gives its pinned RAM to another conversation", true);
+                for (size_t k = 0; k < bslot_ss.size(); ++k) {
+                    strata::core::SessionState& u = *bslot_ss[k][(size_t) j];
+                    if (u.slot_cells < 0) continue;
+                    const strata::core::OnDevice on_k(eslot_dev(k));
+                    (void) strata::core::session_slot_fit(u, 1, true);
+                    strata::core::session_zero(u, g, nullptr, nullptr);   // its K/V map named the page slots given back
+                    if (strata::core::device_sync() != cudaSuccess) return 1;
+                }
+                sj.cached = false;
+                if (ckpt_pool.on())
+                    for (ConvCheckpoint& c : sj.checks) ckpt_pool.give(std::move(c));
+                sj.checks.clear();
+                std::fprintf(stderr, "strata batch: no RAM to pin %s's context: idle slot %d parks its %zu tokens and gives "
+                                     "its pinned RAM back (%.2f -> %.2f GiB pinned for K/V)\n",
+                             keep < 0 ? "the solo session" : ("slot " + std::to_string(keep)).c_str(), j, held, pinned0,
+                             (double) strata::core::qsa_kv_host_bytes() / 1073741824.0);
+                std::printf("BIDLE %d\n", j);   // (the server: the slot holds nothing now)
+                std::fflush(stdout);
+                for (size_t k = 0; k < bslot_ss.size(); ++k) elastic_idle(k, true, -1);
+                return 0;
+            }
+            // no idle conversation pinned: the RAM conversation cache gives its oldest (written to --session-dir first)
+            if (conversations.size() > 0) {
+                if (sdir) sdir->flush();
+                if (conversations.evict_oldest()) {
+                    std::fprintf(stderr, "strata serve: no RAM to pin %s's context: the conversation cache drops its oldest "
+                                         "(%zu still parked, %zu MiB)\n",
+                                 keep < 0 ? "the solo session" : ("slot " + std::to_string(keep)).c_str(), conversations.size(),
+                                 conversations.bytes() >> 20);
+                    return 0;
+                }
+            }
+            return 1;
+        };
+        struct RamReclaimScope {   // (its captures end with this scope)
+            std::function<int(int)>& f;
+            ~RamReclaimScope() { f = nullptr; }
+        } ram_reclaim_scope{ram_reclaim};
         // an allocation that fails for lack of VRAM (a window graph, the drafter's records) asks for it here: the card's
         // budget spare, and its expert cache when this thread asks and the card is quiet (any other thread: the spare)
         const std::thread::id serve_thread = std::this_thread::get_id();
@@ -16465,7 +16541,7 @@ int main(int argc, char** argv) {
                         }
                     }
                     if (stage_invalid) { refuse(err); continue; }
-                    if (!solo_host_fit((int64_t) image.live.ids.size() + 256) ||   // STRATA_KV_HOST_ELASTIC: its cells pinned
+                    if (!solo_host_fit_r((int64_t) image.live.ids.size() + 256) ||   // STRATA_KV_HOST_ELASTIC: its cells pinned
                         (solo_vram_fit && !solo_vram_fit((int64_t) image.live.ids.size() + 256))) {
                         refuse("no memory (RAM or VRAM) is left for the saved conversation's context", strata::core::SessionError::memory);
                         continue;
@@ -16733,8 +16809,11 @@ int main(int argc, char** argv) {
                             (long long) max_new, (long long) o.max_context);
                 continue;
             }
-            if (!solo_host_fit(std::min<int64_t>(o.max_context, n + max_new + 64))) {   // STRATA_KV_HOST_ELASTIC
-                std::printf("ERR no RAM is left to pin this request's context (%lld tokens)\n", (long long) (n + max_new));
+            // STRATA_KV_HOST_ELASTIC: pinned for the prompt and the first stretch of the reply (the decode pins the rest as it
+            // goes: a reply that may run to the end of a long context does not hold it all from the start)
+            int64_t solo_pin = std::min<int64_t>(o.max_context, n + (pipe ? max_new : std::min<int64_t>(max_new, kSoloPinAhead)) + 64);
+            if (!solo_host_fit_r(solo_pin)) {
+                std::printf("ERR no RAM is left to pin this request's context (%lld tokens)\n", (long long) solo_pin);
                 continue;
             }
             if (solo_vram_fit && !solo_vram_fit(std::min<int64_t>(o.max_context, n + max_new + 64))) {
@@ -17127,7 +17206,7 @@ int main(int argc, char** argv) {
                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                 }
             }
-            if (incoming && (!solo_host_fit((int64_t) incoming->live.ids.size() + 256) ||   // STRATA_KV_HOST_ELASTIC
+            if (incoming && (!solo_host_fit_r((int64_t) incoming->live.ids.size() + 256) ||   // STRATA_KV_HOST_ELASTIC
                              (solo_vram_fit && !solo_vram_fit((int64_t) incoming->live.ids.size() + 256)))) {
                 std::printf("ERR no memory (RAM or VRAM) is left for the parked conversation's context\n");
                 return 1;
@@ -17257,7 +17336,7 @@ int main(int argc, char** argv) {
                         ctx_from ? ctx_from : resume > 0 ? "gpu" : "none", (long long) resume, (long long) n);
             std::fflush(stdout);
             // STRATA_KV_HOST_ELASTIC: the same for the solo session's host copies (this request's prompt and max_new stay)
-            solo_host_trim(std::min<int64_t>(o.max_context, n + max_new + 64));
+            solo_host_trim(solo_pin);
             // the elastic K/V: the outgoing session is parked and this request rewrites every cell from `resume` on,
             // so cells past this prompt's are no longer anyone's - far more than it needs go back to the cache
             if (kvg.on) {
@@ -19379,6 +19458,16 @@ int main(int argc, char** argv) {
                 const bool timed_round = !first_window;
                 const Clock::time_point round0 = Clock::now();
                 if (p + T > o.max_context) break;
+                if (p + T + 64 > solo_pin) {   // STRATA_KV_HOST_ELASTIC: the next stretch of the reply pinned
+                    const int64_t want = std::min<int64_t>(o.max_context, std::min<int64_t>(n + max_new, p + T + kSoloPinAhead) + 64);
+                    if (!solo_host_fit_r(want)) {
+                        std::fprintf(stderr, "strata serve: no RAM is left to pin the reply past %lld tokens: it ends here\n",
+                                     (long long) p);
+                        finish = "ram";
+                        break;
+                    }
+                    solo_pin = want;
+                }
                 window[0] = x;
                 for (int i = 1; i < T_mtp; ++i)
                     window[(size_t) i] = merged     ? (int32_t) ids[(size_t) (p + i)]
@@ -19856,8 +19945,10 @@ int main(int argc, char** argv) {
                             (int64_t) live.size() == p;
                 const auto tc0 = Clock::now();
                 if (cont) persist_slot(admit_slot, slot_source == admit_slot, live, false, "it takes another conversation");
+                bool adm_ram = false;   // (BADM <slot> 0 ram: the solo session still holds it)
                 if (cont && !copy_to_slot(admit_slot, live, err)) {
                     std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
+                    adm_ram = err.rfind("no RAM is left", 0) == 0;
                     bs[(size_t) admit_slot].cached = false;   // its sessions may be half written
                     cont = false;
                 }
@@ -19952,7 +20043,7 @@ int main(int argc, char** argv) {
                                      span(tc1, tc2), span(tc3, tc4), move_best ? " (moved)" : "");
                     }
                 }
-                std::printf("BADM %d %d\n", admit_slot, cont ? 1 : 0);
+                std::printf("BADM %d %d%s\n", admit_slot, cont ? 1 : 0, adm_ram ? " ram" : "");
                 if (trace && piped && cont) {
                     rows_wait = "the admission";
                     rows_wait_t = Clock::now();
