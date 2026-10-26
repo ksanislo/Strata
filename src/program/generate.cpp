@@ -10322,8 +10322,14 @@ int main(int argc, char** argv) {
                 ~MergeBack() { if (on && !strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear(); }
             } merge_back{cs, f.checks, n_st > 0};
             const strata::core::ConversationView view{f.ids, f.imgs, n_st > 0 ? cs.stage0 : f.checks, f.cvec};
-            // (the retained K/V buffers are the main sessions' last restore: a slot's park captures fresh)
-            auto reuse = f.slot < 0 ? conversations.take_reuse() : strata::core::ConversationKvReuse{};
+            // (the retained K/V buffers are the main sessions' last restore: a slot's park captures fresh;
+            // and only for the prefix this conversation shares with the restored one, #1503)
+            const int64_t retained_n = f.slot < 0 ? conversations.retained_tokens() : 0;
+            auto reuse = f.slot < 0 ? conversations.take_reuse_for(f.ids) : strata::core::ConversationKvReuse{};
+            if (retained_n > 0 && reuse.unchanged_tokens < retained_n)
+                std::fprintf(stderr, "strata serve: conversation cache: retained K/V reused for %lld of its %lld tokens "
+                                     "(the rest is not this conversation's)\n", (long long) reuse.unchanged_tokens,
+                             (long long) retained_n);
             std::vector<strata::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
             stage_reuse.resize(n_st);
             reuse.stages.clear();
@@ -12961,6 +12967,8 @@ int main(int argc, char** argv) {
         // conversation an idle slot holds reads on from there.  Every stage, the same calls.
         // `at`: one of the slot's checkpoints - only the K/V up to it is copied and its state restored instead
         auto copy_from_slot = [&](int b, const ConvCheckpoint* at, std::string& e) -> bool {
+            // the main session's K/V is replaced by the slot's: K/V retained from a restore described the old one
+            conversations.take_reuse();
             const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
             if (at != nullptr && at->stage_parts.size() != stages.size()) { e = "a checkpoint without its stage parts"; return false; }
             if (slot_copy_direct && at == nullptr) {
@@ -17710,7 +17718,7 @@ int main(int argc, char** argv) {
                 if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr && !mapped) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
-                    conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv));
+                    conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv), live);
                 }
                 const size_t incoming_bytes = incoming->bytes();
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
